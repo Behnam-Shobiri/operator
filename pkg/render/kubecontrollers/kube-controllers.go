@@ -33,6 +33,7 @@ import (
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/controller/k8sapi"
 	"github.com/tigera/operator/pkg/render"
+	rcomp "github.com/tigera/operator/pkg/render/common/components"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
@@ -489,7 +490,7 @@ func (c *kubeControllersComponent) controllersDeployment() *appsv1.Deployment {
 
 	podSpec := corev1.PodSpec{
 		NodeSelector:       c.cfg.Installation.ControlPlaneNodeSelector,
-		Tolerations:        append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateMaster, rmeta.TolerateCriticalAddonsOnly),
+		Tolerations:        append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateCriticalAddonsAndControlPlane...),
 		ImagePullSecrets:   c.cfg.Installation.ImagePullSecrets,
 		ServiceAccountName: c.kubeControllerServiceAccountName,
 		Containers:         []corev1.Container{container},
@@ -521,6 +522,9 @@ func (c *kubeControllersComponent) controllersDeployment() *appsv1.Deployment {
 	}
 	render.SetClusterCriticalPod(&(d.Spec.Template))
 
+	if overrides := c.cfg.Installation.CalicoKubeControllersDeployment; overrides != nil {
+		rcomp.ApplyDeploymentOverrides(&d, overrides)
+	}
 	return &d
 }
 

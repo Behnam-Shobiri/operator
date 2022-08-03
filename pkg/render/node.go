@@ -27,6 +27,7 @@ import (
 	"github.com/tigera/operator/pkg/controller/k8sapi"
 	"github.com/tigera/operator/pkg/controller/migration"
 	"github.com/tigera/operator/pkg/ptr"
+	rcomp "github.com/tigera/operator/pkg/render/common/components"
 	"github.com/tigera/operator/pkg/render/common/configmap"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
@@ -416,6 +417,7 @@ func (c *nodeComponent) nodeRole() *rbacv1.ClusterRole {
 					"blockaffinities",
 					"ipamblocks",
 					"ipamhandles",
+					"ipamconfigs",
 				},
 				Verbs: []string{"get", "list", "create", "update", "delete"},
 			},
@@ -792,6 +794,10 @@ func (c *nodeComponent) nodeDaemonset(cniCfgMap *corev1.ConfigMap) *appsv1.Daemo
 	setNodeCriticalPod(&(ds.Spec.Template))
 	if c.cfg.MigrateNamespaces {
 		migration.LimitDaemonSetToMigratedNodes(&ds)
+	}
+
+	if overrides := c.cfg.Installation.CalicoNodeDaemonSet; overrides != nil {
+		rcomp.ApplyDaemonSetOverrides(&ds, overrides)
 	}
 	return &ds
 }

@@ -133,19 +133,19 @@ func (c *intrusionDetectionComponent) ResolveImages(is *operatorv1.ImageSet) err
 		if err != nil {
 			errMsgs = append(errMsgs, err.Error())
 		}
+
+		c.adDetectorsImage, err = components.GetReference(components.ComponentAnomalyDetectionJobs, reg, path, prefix, is)
+		if err != nil {
+			errMsgs = append(errMsgs, err.Error())
+		}
+
+		c.adAPIImage, err = components.GetReference(components.ComponentAnomalyDetectionAPI, reg, path, prefix, is)
+		if err != nil {
+			errMsgs = append(errMsgs, err.Error())
+		}
 	}
 
 	c.controllerImage, err = components.GetReference(components.ComponentIntrusionDetectionController, reg, path, prefix, is)
-	if err != nil {
-		errMsgs = append(errMsgs, err.Error())
-	}
-
-	c.adDetectorsImage, err = components.GetReference(components.ComponentAnomalyDetectionJobs, reg, path, prefix, is)
-	if err != nil {
-		errMsgs = append(errMsgs, err.Error())
-	}
-
-	c.adAPIImage, err = components.GetReference(components.ComponentAnomalyDetectionAPI, reg, path, prefix, is)
 	if err != nil {
 		errMsgs = append(errMsgs, err.Error())
 	}
@@ -1538,7 +1538,7 @@ func (c *intrusionDetectionComponent) getBaseADDetectorsPodTemplate(podTemplateN
 				ImagePullSecrets:   secret.GetReferenceList(c.cfg.PullSecrets),
 				RestartPolicy:      corev1.RestartPolicyOnFailure,
 				ServiceAccountName: adDetectorName,
-				Tolerations:        append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateMaster),
+				Tolerations:        append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateControlPlane...),
 				Containers: []corev1.Container{
 					relasticsearch.ContainerDecorate(container, c.cfg.ESClusterConfig.ClusterName(), ElasticsearchADJobUserSecret, c.cfg.ClusterDomain, c.SupportedOSType()),
 				},

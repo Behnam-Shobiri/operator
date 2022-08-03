@@ -3,16 +3,16 @@ module github.com/tigera/operator
 go 1.16
 
 require (
-	github.com/aws/aws-sdk-go v1.27.0
+	github.com/aws/aws-sdk-go v1.36.30
 	github.com/cloudflare/cfssl v1.6.1
 	github.com/containernetworking/cni v1.0.1
-	github.com/elastic/cloud-on-k8s v0.0.0-20210914143041-4f367c381636
+	github.com/elastic/cloud-on-k8s v0.0.0-20220627132447-8df5d6ccb7d9
 	github.com/ghodss/yaml v1.0.0
 	github.com/go-ldap/ldap v3.0.3+incompatible
-	github.com/go-logr/logr v0.4.0
+	github.com/go-logr/logr v1.2.3
 	github.com/hashicorp/go-version v1.2.1
 	github.com/olivere/elastic/v7 v7.0.6
-	github.com/onsi/ginkgo v1.16.4
+	github.com/onsi/ginkgo v1.16.5
 	github.com/onsi/gomega v1.20.0
 	github.com/openshift/api v0.0.0-20200923080607-2a18526802e3
 	github.com/openshift/library-go v0.0.0-20200924151131-575c4875cdbe
@@ -22,16 +22,16 @@ require (
 	github.com/r3labs/diff/v2 v2.8.0
 	github.com/stretchr/testify v1.8.0
 	github.com/tigera/api v0.0.0-20220325204048-b3e0b35ba256
-	go.uber.org/zap v1.19.0
+	go.uber.org/zap v1.21.0
 	golang.org/x/crypto v0.0.0-20220622213112-05595931fe9d
 	gopkg.in/inf.v0 v0.9.1
 	gopkg.in/yaml.v2 v2.4.0
-	k8s.io/api v0.22.3
-	k8s.io/apiextensions-apiserver v0.22.3
-	k8s.io/apimachinery v0.22.3
-	k8s.io/client-go v0.21.8
+	k8s.io/api v0.24.2
+	k8s.io/apiextensions-apiserver v0.24.2
+	k8s.io/apimachinery v0.24.2
+	k8s.io/client-go v0.24.2
 	k8s.io/kube-aggregator v0.21.7
-	sigs.k8s.io/controller-runtime v0.9.7
+	sigs.k8s.io/controller-runtime v0.12.2
 	sigs.k8s.io/kind v0.11.1 // Do not remove, not used by code but used by build
 )
 

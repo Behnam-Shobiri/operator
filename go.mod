@@ -33,7 +33,7 @@ require (
 	k8s.io/kube-aggregator v0.25.3
 	k8s.io/utils v0.0.0-20220728103510-ee6ede2d64ed
 	sigs.k8s.io/controller-runtime v0.13.0
-	sigs.k8s.io/kind v0.11.1 // Do not remove, not used by code but used by build
+	sigs.k8s.io/kind v0.17.0 // Do not remove, not used by code but used by build
 )
 
 replace (

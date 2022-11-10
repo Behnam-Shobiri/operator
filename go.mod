@@ -19,7 +19,7 @@ require (
 	github.com/pkg/errors v0.9.1
 	github.com/projectcalico/api v0.0.0-20220129171754-5c0717447274
 	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.52.1
-	github.com/r3labs/diff/v2 v2.8.0
+	github.com/r3labs/diff/v2 v2.15.1
 	github.com/stretchr/testify v1.8.1
 	github.com/tigera/api v0.0.0-20220913211214-c3f5117f4f40
 	go.uber.org/zap v1.23.0

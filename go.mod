@@ -4,6 +4,7 @@ go 1.16
 
 require (
 	github.com/aws/aws-sdk-go v1.44.106
+	github.com/blang/semver v3.5.1+incompatible // indirect
 	github.com/cloudflare/cfssl v1.6.2
 	github.com/containernetworking/cni v1.0.1
 	github.com/elastic/cloud-on-k8s/v2 v2.0.0-20221014162453-642f9ecd3e2e
@@ -18,7 +19,7 @@ require (
 	github.com/openshift/library-go v0.0.0-20200924151131-575c4875cdbe
 	github.com/pkg/errors v0.9.1
 	github.com/projectcalico/api v0.0.0-20220129171754-5c0717447274
-	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.52.1
+	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.60.1
 	github.com/r3labs/diff/v2 v2.8.0
 	github.com/stretchr/testify v1.8.1
 	github.com/tigera/api v0.0.0-20220913211214-c3f5117f4f40
@@ -31,7 +32,7 @@ require (
 	k8s.io/apimachinery v0.25.3
 	k8s.io/client-go v0.25.3
 	k8s.io/kube-aggregator v0.25.3
-	k8s.io/utils v0.0.0-20220728103510-ee6ede2d64ed
+	k8s.io/utils v0.0.0-20220823124924-e9cbc92d1a73
 	sigs.k8s.io/controller-runtime v0.13.0
 	sigs.k8s.io/kind v0.11.1 // Do not remove, not used by code but used by build
 )

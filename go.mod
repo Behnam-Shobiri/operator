@@ -23,7 +23,7 @@ require (
 	github.com/stretchr/testify v1.8.1
 	github.com/tigera/api v0.0.0-20220913211214-c3f5117f4f40
 	go.uber.org/zap v1.23.0
-	golang.org/x/crypto v0.1.0
+	golang.org/x/crypto v0.4.0
 	gopkg.in/inf.v0 v0.9.1
 	gopkg.in/yaml.v2 v2.4.0
 	k8s.io/api v0.25.3

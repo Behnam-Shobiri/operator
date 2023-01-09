@@ -33,12 +33,12 @@ require (
 	k8s.io/kube-aggregator v0.25.3
 	k8s.io/utils v0.0.0-20220728103510-ee6ede2d64ed
 	sigs.k8s.io/controller-runtime v0.13.0
-	sigs.k8s.io/kind v0.11.1 // Do not remove, not used by code but used by build
+	sigs.k8s.io/kind v0.17.0 // Do not remove, not used by code but used by build
 )
 
 require (
 	cloud.google.com/go/compute v1.7.0 // indirect
-	github.com/BurntSushi/toml v0.3.1 // indirect
+	github.com/BurntSushi/toml v1.0.0 // indirect
 	github.com/PuerkitoBio/purell v1.1.1 // indirect
 	github.com/PuerkitoBio/urlesc v0.0.0-20170810143723-de5bf2ad4578 // indirect
 	github.com/alessio/shellescape v1.4.1 // indirect
@@ -65,6 +65,7 @@ require (
 	github.com/google/gnostic v0.5.7-v3refs // indirect
 	github.com/google/go-cmp v0.5.9 // indirect
 	github.com/google/gofuzz v1.2.0 // indirect
+	github.com/google/safetext v0.0.0-20220905092116-b49f7bc46da2 // indirect
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect

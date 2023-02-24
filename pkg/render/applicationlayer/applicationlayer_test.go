@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,15 +17,16 @@ package applicationlayer_test
 import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render/applicationlayer"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	rtest "github.com/tigera/operator/pkg/render/common/test"
-
-	appsv1 "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
 )
 
 var _ = Describe("Tigera Secure Application Layer rendering tests", func() {
@@ -72,8 +73,39 @@ var _ = Describe("Tigera Secure Application Layer rendering tests", func() {
 		Expect(ds.Spec.Template.Spec.HostNetwork).To(BeTrue())
 		Expect(ds.Spec.Template.Spec.HostIPC).To(BeTrue())
 		Expect(ds.Spec.Template.Spec.DNSPolicy).To(Equal(corev1.DNSClusterFirstWithHostNet))
-		Expect(len(ds.Spec.Template.Spec.Containers)).To(Equal(2))
-		Expect(len(ds.Spec.Template.Spec.Tolerations)).To(Equal(3))
+		Expect(ds.Spec.Template.Spec.Containers).To(HaveLen(2))
+		Expect(ds.Spec.Template.Spec.Tolerations).To(HaveLen(3))
+
+		Expect(ds.Spec.Template.Spec.Containers).To(HaveLen(2))
+		Expect(*ds.Spec.Template.Spec.Containers[0].SecurityContext.AllowPrivilegeEscalation).To(BeFalse())
+		Expect(*ds.Spec.Template.Spec.Containers[0].SecurityContext.Privileged).To(BeFalse())
+		Expect(*ds.Spec.Template.Spec.Containers[0].SecurityContext.RunAsGroup).To(BeEquivalentTo(0))
+		Expect(*ds.Spec.Template.Spec.Containers[0].SecurityContext.RunAsNonRoot).To(BeFalse())
+		Expect(*ds.Spec.Template.Spec.Containers[0].SecurityContext.RunAsUser).To(BeEquivalentTo(0))
+		Expect(ds.Spec.Template.Spec.Containers[0].SecurityContext.Capabilities).To(Equal(
+			&corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"NET_ADMIN", "NET_RAW"},
+			},
+		))
+		Expect(ds.Spec.Template.Spec.Containers[0].SecurityContext.SeccompProfile).To(Equal(
+			&corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			}))
+		Expect(*ds.Spec.Template.Spec.Containers[1].SecurityContext.AllowPrivilegeEscalation).To(BeFalse())
+		Expect(*ds.Spec.Template.Spec.Containers[1].SecurityContext.Privileged).To(BeFalse())
+		Expect(*ds.Spec.Template.Spec.Containers[1].SecurityContext.RunAsGroup).To(BeEquivalentTo(0))
+		Expect(*ds.Spec.Template.Spec.Containers[1].SecurityContext.RunAsNonRoot).To(BeFalse())
+		Expect(*ds.Spec.Template.Spec.Containers[1].SecurityContext.RunAsUser).To(BeEquivalentTo(0))
+		Expect(ds.Spec.Template.Spec.Containers[1].SecurityContext.Capabilities).To(Equal(
+			&corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+		))
+		Expect(ds.Spec.Template.Spec.Containers[1].SecurityContext.SeccompProfile).To(Equal(
+			&corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			}))
 
 		// Ensure each volume rendered correctly.
 		dsVols := ds.Spec.Template.Spec.Volumes
@@ -194,4 +226,135 @@ var _ = Describe("Tigera Secure Application Layer rendering tests", func() {
 		}
 	})
 
+	It("should render with default l7 ALP configuration", func() {
+		expectedResources := []struct {
+			name    string
+			ns      string
+			group   string
+			version string
+			kind    string
+		}{
+			{name: applicationlayer.APLName, ns: common.CalicoNamespace, group: "", version: "v1", kind: "ServiceAccount"},
+			{name: applicationlayer.EnvoyConfigMapName, ns: common.CalicoNamespace, group: "", version: "v1", kind: "ConfigMap"},
+			{name: applicationlayer.ApplicationLayerDaemonsetName, ns: common.CalicoNamespace, group: "apps", version: "v1", kind: "DaemonSet"},
+		}
+		// Should render the correct resources.
+		component := applicationlayer.ApplicationLayer(&applicationlayer.Config{
+			PullSecrets:  nil,
+			Installation: installation,
+			OsType:       rmeta.OSTypeLinux,
+			ALPEnabled:   true,
+		})
+		resources, _ := component.Objects()
+		Expect(len(resources)).To(Equal(len(expectedResources)))
+
+		i := 0
+		for _, expectedRes := range expectedResources {
+			rtest.ExpectResource(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+			i++
+		}
+
+		ds := rtest.GetResource(resources, applicationlayer.ApplicationLayerDaemonsetName, common.CalicoNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
+
+		// Check rendering of daemonset.
+		Expect(ds.Spec.Template.Spec.HostNetwork).To(BeTrue())
+		Expect(ds.Spec.Template.Spec.HostIPC).To(BeTrue())
+		Expect(ds.Spec.Template.Spec.DNSPolicy).To(Equal(corev1.DNSClusterFirstWithHostNet))
+		Expect(len(ds.Spec.Template.Spec.Containers)).To(Equal(2))
+		Expect(len(ds.Spec.Template.Spec.Tolerations)).To(Equal(3))
+
+		// Ensure each volume rendered correctly.
+		dsVols := ds.Spec.Template.Spec.Volumes
+		expectedVolumes := []corev1.Volume{
+			{
+				Name: applicationlayer.EnvoyLogsVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+			{
+				Name: applicationlayer.EnvoyConfigMapName,
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: applicationlayer.EnvoyConfigMapName},
+					},
+				},
+			},
+			{
+				Name: applicationlayer.FelixSync,
+				VolumeSource: corev1.VolumeSource{
+					CSI: &corev1.CSIVolumeSource{
+						Driver: "csi.tigera.io",
+					},
+				},
+			},
+			{
+				Name: applicationlayer.DikastesSyncVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+		}
+		Expect(len(ds.Spec.Template.Spec.Volumes)).To(Equal(len(expectedVolumes)))
+
+		for _, expected := range expectedVolumes {
+			Expect(dsVols).To(ContainElement(expected))
+		}
+
+		// Ensure that tolerations rendered correctly.
+		dsTolerations := ds.Spec.Template.Spec.Tolerations
+		expectedToleration := rmeta.TolerateAll
+		for _, expected := range expectedToleration {
+			Expect(dsTolerations).To(ContainElement(expected))
+		}
+
+		// Check proxy container rendering.
+		proxyContainer := ds.Spec.Template.Spec.Containers[0]
+
+		proxyEnvs := proxyContainer.Env
+		expectedProxyEnvs := []corev1.EnvVar{
+			{Name: "ENVOY_UID", Value: "0"},
+			{Name: "ENVOY_GID", Value: "0"},
+		}
+		Expect(len(proxyEnvs)).To(Equal(len(expectedProxyEnvs)))
+
+		for _, expected := range expectedProxyEnvs {
+			Expect(proxyEnvs).To(ContainElement(expected))
+		}
+
+		proxyVolMounts := proxyContainer.VolumeMounts
+		expectedProxyVolMounts := []corev1.VolumeMount{
+			{Name: applicationlayer.EnvoyConfigMapName, MountPath: "/etc/envoy"},
+			{Name: applicationlayer.EnvoyLogsVolumeName, MountPath: "/tmp/"},
+			{Name: applicationlayer.DikastesSyncVolumeName, MountPath: "/var/run/dikastes"},
+		}
+		Expect(len(proxyVolMounts)).To(Equal(len(expectedProxyVolMounts)))
+
+		for _, expected := range expectedProxyVolMounts {
+			Expect(proxyVolMounts).To(ContainElement(expected))
+		}
+
+		dikastesContainer := ds.Spec.Template.Spec.Containers[1]
+
+		dikastesEnvs := dikastesContainer.Env
+		expectedDikastesEnvs := []corev1.EnvVar{
+			{Name: "LOG_LEVEL", Value: "Info"},
+			{Name: "DIKASTES_SUBSCRIPTION_TYPE", Value: "per-host-policies"},
+		}
+		Expect(len(dikastesEnvs)).To(Equal(len(expectedDikastesEnvs)))
+
+		for _, element := range expectedDikastesEnvs {
+			Expect(dikastesEnvs).To(ContainElement(element))
+		}
+
+		dikastesVolMounts := dikastesContainer.VolumeMounts
+		expectedDikastesVolMounts := []corev1.VolumeMount{
+			{Name: applicationlayer.DikastesSyncVolumeName, MountPath: "/var/run/dikastes"},
+			{Name: applicationlayer.FelixSync, MountPath: "/var/run/felix"},
+		}
+		Expect(len(dikastesVolMounts)).To(Equal(len(expectedDikastesVolMounts)))
+		for _, expected := range expectedDikastesVolMounts {
+			Expect(dikastesVolMounts).To(ContainElement(expected))
+		}
+	})
 })

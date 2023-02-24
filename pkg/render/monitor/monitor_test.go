@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -125,6 +125,7 @@ var _ = Describe("monitor rendering tests", func() {
 			{"elasticsearch-metrics", common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind},
 			{"fluentd-metrics", common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind},
 			{"tigera-api", common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind},
+			{"calico-kube-controllers-metrics", common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind},
 			{"prometheus-http-api", common.TigeraPrometheusNamespace, "", "v1", "Service"},
 			{name: monitor.TigeraPrometheusObjectName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole"},
 			{name: monitor.TigeraPrometheusObjectName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
@@ -163,6 +164,10 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(*alertmanagerObj.Spec.SecurityContext.RunAsGroup).To(BeEquivalentTo(10001))
 		Expect(*alertmanagerObj.Spec.SecurityContext.RunAsNonRoot).To(BeTrue())
 		Expect(*alertmanagerObj.Spec.SecurityContext.RunAsUser).To(BeEquivalentTo(10001))
+		Expect(alertmanagerObj.Spec.SecurityContext.SeccompProfile).To(Equal(
+			&corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			}))
 
 		// Alertmanager Service
 		serviceObj, ok := rtest.GetResource(toCreate, "calico-node-alertmanager", common.TigeraPrometheusNamespace, "", "v1", "Service").(*corev1.Service)
@@ -189,7 +194,7 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(prometheusObj.Spec.ServiceMonitorSelector.MatchLabels["team"]).To(Equal("network-operators"))
 		Expect(prometheusObj.Spec.PodMonitorSelector.MatchLabels["team"]).To(Equal("network-operators"))
 		Expect(prometheusObj.Spec.Version).To(Equal(components.ComponentCoreOSPrometheus.Version))
-		Expect(prometheusObj.Spec.Retention).To(Equal("24h"))
+		Expect(prometheusObj.Spec.Retention).To(BeEquivalentTo("24h"))
 		Expect(prometheusObj.Spec.Resources.Requests.Memory().Equal(resource.MustParse("400Mi"))).To(BeTrue())
 		Expect(prometheusObj.Spec.RuleSelector.MatchLabels["prometheus"]).To(Equal("calico-node-prometheus"))
 		Expect(prometheusObj.Spec.RuleSelector.MatchLabels["role"]).To(Equal("tigera-prometheus-rules"))
@@ -201,6 +206,10 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(*prometheusObj.Spec.SecurityContext.RunAsGroup).To(BeEquivalentTo(10001))
 		Expect(*prometheusObj.Spec.SecurityContext.RunAsNonRoot).To(BeTrue())
 		Expect(*prometheusObj.Spec.SecurityContext.RunAsUser).To(BeEquivalentTo(10001))
+		Expect(prometheusObj.Spec.SecurityContext.SeccompProfile).To(Equal(
+			&corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			}))
 
 		// Prometheus ServiceAccount
 		_, ok = rtest.GetResource(toCreate, "prometheus", common.TigeraPrometheusNamespace, "", "v1", "ServiceAccount").(*corev1.ServiceAccount)
@@ -276,9 +285,9 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames[0]).To(Equal("tigera-fluentd"))
 		Expect(servicemonitorObj.Spec.Endpoints).To(HaveLen(1))
 		Expect(servicemonitorObj.Spec.Endpoints[0].HonorLabels).To(BeTrue())
-		Expect(servicemonitorObj.Spec.Endpoints[0].Interval).To(Equal("5s"))
+		Expect(servicemonitorObj.Spec.Endpoints[0].Interval).To(BeEquivalentTo("5s"))
 		Expect(servicemonitorObj.Spec.Endpoints[0].Port).To(Equal("fluentd-metrics-port"))
-		Expect(servicemonitorObj.Spec.Endpoints[0].ScrapeTimeout).To(Equal("5s"))
+		Expect(servicemonitorObj.Spec.Endpoints[0].ScrapeTimeout).To(BeEquivalentTo("5s"))
 
 		// PrometheusRule
 		prometheusruleObj, ok := rtest.GetResource(toCreate, monitor.TigeraPrometheusDPRate, common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.PrometheusRuleKind).(*monitoringv1.PrometheusRule)
@@ -306,14 +315,14 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames[0]).To(Equal("calico-system"))
 		Expect(servicemonitorObj.Spec.Endpoints).To(HaveLen(2))
 		Expect(servicemonitorObj.Spec.Endpoints[0].HonorLabels).To(BeTrue())
-		Expect(servicemonitorObj.Spec.Endpoints[0].Interval).To(Equal("5s"))
+		Expect(servicemonitorObj.Spec.Endpoints[0].Interval).To(BeEquivalentTo("5s"))
 		Expect(servicemonitorObj.Spec.Endpoints[0].Port).To(Equal("calico-metrics-port"))
-		Expect(servicemonitorObj.Spec.Endpoints[0].ScrapeTimeout).To(Equal("5s"))
+		Expect(servicemonitorObj.Spec.Endpoints[0].ScrapeTimeout).To(BeEquivalentTo("5s"))
 		Expect(servicemonitorObj.Spec.Endpoints[0].Scheme).To(Equal("https"))
 		Expect(servicemonitorObj.Spec.Endpoints[1].HonorLabels).To(BeTrue())
-		Expect(servicemonitorObj.Spec.Endpoints[1].Interval).To(Equal("5s"))
+		Expect(servicemonitorObj.Spec.Endpoints[1].Interval).To(BeEquivalentTo("5s"))
 		Expect(servicemonitorObj.Spec.Endpoints[1].Port).To(Equal("calico-bgp-metrics-port"))
-		Expect(servicemonitorObj.Spec.Endpoints[1].ScrapeTimeout).To(Equal("5s"))
+		Expect(servicemonitorObj.Spec.Endpoints[1].ScrapeTimeout).To(BeEquivalentTo("5s"))
 		Expect(servicemonitorObj.Spec.Endpoints[1].Scheme).To(Equal("https"))
 
 		servicemonitorObj, ok = rtest.GetResource(toCreate, monitor.ElasticsearchMetrics, common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind).(*monitoringv1.ServiceMonitor)
@@ -324,9 +333,9 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames[0]).To(Equal("tigera-elasticsearch"))
 		Expect(servicemonitorObj.Spec.Endpoints).To(HaveLen(1))
 		Expect(servicemonitorObj.Spec.Endpoints[0].HonorLabels).To(BeTrue())
-		Expect(servicemonitorObj.Spec.Endpoints[0].Interval).To(Equal("5s"))
+		Expect(servicemonitorObj.Spec.Endpoints[0].Interval).To(BeEquivalentTo("5s"))
 		Expect(servicemonitorObj.Spec.Endpoints[0].Port).To(Equal("metrics-port"))
-		Expect(servicemonitorObj.Spec.Endpoints[0].ScrapeTimeout).To(Equal("5s"))
+		Expect(servicemonitorObj.Spec.Endpoints[0].ScrapeTimeout).To(BeEquivalentTo("5s"))
 		Expect(servicemonitorObj.Spec.Endpoints[0].Scheme).To(Equal("https"))
 
 		servicemonitorObj, ok = rtest.GetResource(toCreate, "fluentd-metrics", common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind).(*monitoringv1.ServiceMonitor)
@@ -337,9 +346,9 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames[0]).To(Equal("tigera-fluentd"))
 		Expect(servicemonitorObj.Spec.Endpoints).To(HaveLen(1))
 		Expect(servicemonitorObj.Spec.Endpoints[0].HonorLabels).To(BeTrue())
-		Expect(servicemonitorObj.Spec.Endpoints[0].Interval).To(Equal("5s"))
+		Expect(servicemonitorObj.Spec.Endpoints[0].Interval).To(BeEquivalentTo("5s"))
 		Expect(servicemonitorObj.Spec.Endpoints[0].Port).To(Equal("fluentd-metrics-port"))
-		Expect(servicemonitorObj.Spec.Endpoints[0].ScrapeTimeout).To(Equal("5s"))
+		Expect(servicemonitorObj.Spec.Endpoints[0].ScrapeTimeout).To(BeEquivalentTo("5s"))
 		Expect(servicemonitorObj.Spec.Endpoints[0].Scheme).To(Equal("https"))
 
 		servicemonitorObj, ok = rtest.GetResource(toCreate, "tigera-api", common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind).(*monitoringv1.ServiceMonitor)
@@ -350,9 +359,9 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames[0]).To(Equal("tigera-system"))
 		Expect(servicemonitorObj.Spec.Endpoints).To(HaveLen(1))
 		Expect(servicemonitorObj.Spec.Endpoints[0].HonorLabels).To(BeTrue())
-		Expect(servicemonitorObj.Spec.Endpoints[0].Interval).To(Equal("5s"))
+		Expect(servicemonitorObj.Spec.Endpoints[0].Interval).To(BeEquivalentTo("5s"))
 		Expect(servicemonitorObj.Spec.Endpoints[0].Port).To(Equal("queryserver"))
-		Expect(servicemonitorObj.Spec.Endpoints[0].ScrapeTimeout).To(Equal("5s"))
+		Expect(servicemonitorObj.Spec.Endpoints[0].ScrapeTimeout).To(BeEquivalentTo("5s"))
 		Expect(servicemonitorObj.Spec.Endpoints[0].Scheme).To(Equal("https"))
 		Expect(servicemonitorObj.Spec.Endpoints[0].BearerTokenFile).To(Equal("/var/run/secrets/kubernetes.io/serviceaccount/token"))
 
@@ -437,6 +446,7 @@ var _ = Describe("monitor rendering tests", func() {
 			{"elasticsearch-metrics", common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind},
 			{"fluentd-metrics", common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind},
 			{"tigera-api", common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind},
+			{"calico-kube-controllers-metrics", common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind},
 			{"prometheus-http-api", common.TigeraPrometheusNamespace, "", "v1", "Service"},
 			{monitor.TigeraPrometheusObjectName, "", "rbac.authorization.k8s.io", "v1", "ClusterRole"},
 			{monitor.TigeraPrometheusObjectName, "", "rbac.authorization.k8s.io", "v1", "ClusterRoleBinding"},
@@ -581,6 +591,7 @@ var _ = Describe("monitor rendering tests", func() {
 		DescribeTable("should render allow-tigera policy",
 			func(scenario testutils.AllowTigeraScenario) {
 				cfg.Openshift = scenario.Openshift
+				cfg.KubeControllerPort = 9094
 
 				component := monitor.MonitorPolicy(cfg)
 				resourcesToCreate, _ := component.Objects()

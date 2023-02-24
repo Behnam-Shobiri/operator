@@ -228,7 +228,7 @@ $(BINDIR)/operator-$(ARCH): $(SRC_FILES)
 	mkdir -p $(BINDIR)
 	$(CONTAINERIZED) -e CGO_ENABLED=$(CGO_ENABLED) $(CALICO_BUILD) \
 	sh -c '$(GIT_CONFIG_SSH) \
-	go build -v -i -o $(BINDIR)/operator-$(ARCH) -ldflags "-X $(PACKAGE_NAME)/version.VERSION=$(GIT_VERSION) -w" ./main.go'
+	go build -v -o $(BINDIR)/operator-$(ARCH) -ldflags "-X $(PACKAGE_NAME)/version.VERSION=$(GIT_VERSION) -w" ./main.go'
 
 .PHONY: image
 image: build $(BUILD_IMAGE)
@@ -258,7 +258,7 @@ endif
 BINDIR?=build/init/bin
 $(BINDIR)/kubectl:
 	mkdir -p $(BINDIR)
-	curl -L https://storage.googleapis.com/kubernetes-release/release/v1.22.0/bin/linux/$(ARCH)/kubectl -o $@
+	curl -L https://storage.googleapis.com/kubernetes-release/release/v1.25.6/bin/linux/$(ARCH)/kubectl -o $@
 	chmod +x $@
 
 kubectl: $(BINDIR)/kubectl
@@ -296,7 +296,7 @@ run-fvs:
 
 ## Create a local kind dual stack cluster.
 KUBECONFIG?=./kubeconfig.yaml
-K8S_VERSION?=v1.21.2
+K8S_VERSION?=v1.21.14
 cluster-create: $(BINDIR)/kubectl $(BINDIR)/kind
 	# First make sure any previous cluster is deleted
 	make cluster-destroy

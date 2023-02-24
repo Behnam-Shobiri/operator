@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -52,13 +52,13 @@ const (
 	ElasticsearchMetrics        = "elasticsearch-metrics"
 	FluentdMetrics              = "fluentd-metrics"
 	TigeraPrometheusObjectName  = "tigera-prometheus"
-	TigeraPrometheusSAName      = "prometheus"
 	TigeraPrometheusDPRate      = "tigera-prometheus-dp-rate"
 	TigeraPrometheusRole        = "tigera-prometheus-role"
 	TigeraPrometheusRoleBinding = "tigera-prometheus-role-binding"
 
 	PrometheusAPIPolicyName       = networkpolicy.TigeraComponentPolicyPrefix + "tigera-prometheus-api"
 	PrometheusClientTLSSecretName = "calico-node-prometheus-client-tls"
+	PrometheusClusterRoleName     = "prometheus"
 	PrometheusDefaultPort         = 9090
 	PrometheusHTTPAPIServiceName  = "prometheus-http-api"
 	PrometheusOperatorPolicyName  = networkpolicy.TigeraComponentPolicyPrefix + "prometheus-operator"
@@ -75,7 +75,8 @@ const (
 	calicoNodePrometheusServiceName       = "calico-node-prometheus"
 	tigeraPrometheusServiceHealthEndpoint = "/health"
 
-	bearerTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	bearerTokenFile       = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	KubeControllerMetrics = "calico-kube-controllers-metrics"
 )
 
 var alertManagerSelector = fmt.Sprintf(
@@ -111,6 +112,7 @@ type Config struct {
 	ClusterDomain            string
 	TrustedCertBundle        certificatemanagement.TrustedBundle
 	Openshift                bool
+	KubeControllerPort       int
 }
 
 type monitorComponent struct {
@@ -192,6 +194,7 @@ func (mc *monitorComponent) Objects() ([]client.Object, []client.Object) {
 		mc.serviceMonitorElasticsearch(),
 		mc.serviceMonitorFluentd(),
 		mc.serviceMonitorQueryServer(),
+		mc.serviceMonitorCalicoKubeControllers(),
 		mc.prometheusHTTPAPIService(),
 		mc.clusterRole(),
 		mc.clusterRoleBinding(),
@@ -245,7 +248,7 @@ func (mc *monitorComponent) clusterRoleBinding() client.Object {
 		Subjects: []rbacv1.Subject{
 			{
 				Kind:      "ServiceAccount",
-				Name:      TigeraPrometheusSAName,
+				Name:      PrometheusServiceAccountName,
 				Namespace: common.TigeraPrometheusNamespace,
 			},
 		},
@@ -270,11 +273,7 @@ func (mc *monitorComponent) alertmanager() *monitoringv1.Alertmanager {
 			Version:          components.ComponentCoreOSAlertmanager.Version,
 			Tolerations:      mc.cfg.Installation.ControlPlaneTolerations,
 			NodeSelector:     mc.cfg.Installation.ControlPlaneNodeSelector,
-			SecurityContext: &corev1.PodSecurityContext{
-				RunAsGroup:   &securitycontext.RunAsGroupID,
-				RunAsNonRoot: ptr.BoolToPtr(true),
-				RunAsUser:    &securitycontext.RunAsUserID,
-			},
+			SecurityContext:  securitycontext.NewNonRootPodContext(),
 		},
 	}
 }
@@ -370,57 +369,55 @@ func (mc *monitorComponent) prometheus() *monitoringv1.Prometheus {
 			Namespace: common.TigeraPrometheusNamespace,
 		},
 		Spec: monitoringv1.PrometheusSpec{
-			Image:              &mc.prometheusImage,
-			ImagePullSecrets:   secret.GetReferenceList(mc.cfg.PullSecrets),
-			ServiceAccountName: PrometheusServiceAccountName,
-			Volumes:            volumes,
-			VolumeMounts:       volumeMounts,
-			InitContainers:     initContainers,
-			Containers: []corev1.Container{
-				{
-					Name:  "authn-proxy",
-					Image: mc.prometheusServiceImage,
-					Ports: []corev1.ContainerPort{
-						{
-							ContainerPort: PrometheusProxyPort,
-						},
-					},
-					Env:          env,
-					VolumeMounts: volumeMounts,
-					ReadinessProbe: &corev1.Probe{
-						ProbeHandler: corev1.ProbeHandler{
-							HTTPGet: &corev1.HTTPGetAction{
-								Path:   tigeraPrometheusServiceHealthEndpoint,
-								Port:   intstr.FromInt(PrometheusProxyPort),
-								Scheme: "HTTPS",
+			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+				Containers: []corev1.Container{
+					{
+						Name:  "authn-proxy",
+						Image: mc.prometheusServiceImage,
+						Ports: []corev1.ContainerPort{
+							{
+								ContainerPort: PrometheusProxyPort,
 							},
 						},
-					},
-					LivenessProbe: &corev1.Probe{
-						ProbeHandler: corev1.ProbeHandler{
-							HTTPGet: &corev1.HTTPGetAction{
-								Path:   tigeraPrometheusServiceHealthEndpoint,
-								Port:   intstr.FromInt(PrometheusProxyPort),
-								Scheme: "HTTPS",
+						Env:          env,
+						VolumeMounts: volumeMounts,
+						ReadinessProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path:   tigeraPrometheusServiceHealthEndpoint,
+									Port:   intstr.FromInt(PrometheusProxyPort),
+									Scheme: "HTTPS",
+								},
+							},
+						},
+						LivenessProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								HTTPGet: &corev1.HTTPGetAction{
+									Path:   tigeraPrometheusServiceHealthEndpoint,
+									Port:   intstr.FromInt(PrometheusProxyPort),
+									Scheme: "HTTPS",
+								},
 							},
 						},
 					},
 				},
+				Image:            &mc.prometheusImage,
+				ImagePullSecrets: secret.GetReferenceList(mc.cfg.PullSecrets),
+				InitContainers:   initContainers,
+				// ListenLocal makes the Prometheus server listen on loopback, so that it
+				// does not bind against the Pod IP. This forces traffic to go through the authn-proxy.
+				ListenLocal:            true,
+				NodeSelector:           mc.cfg.Installation.ControlPlaneNodeSelector,
+				PodMonitorSelector:     &metav1.LabelSelector{MatchLabels: map[string]string{"team": "network-operators"}},
+				Resources:              corev1.ResourceRequirements{Requests: corev1.ResourceList{"memory": resource.MustParse("400Mi")}},
+				SecurityContext:        securitycontext.NewNonRootPodContext(),
+				ServiceAccountName:     PrometheusServiceAccountName,
+				ServiceMonitorSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"team": "network-operators"}},
+				Tolerations:            mc.cfg.Installation.ControlPlaneTolerations,
+				Version:                components.ComponentCoreOSPrometheus.Version,
+				VolumeMounts:           volumeMounts,
+				Volumes:                volumes,
 			},
-			// ListenLocal makes the Prometheus server listen on loopback, so that it
-			// does not bind against the Pod IP. This forces traffic to go through the authn-proxy.
-			ListenLocal:            true,
-			ServiceMonitorSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"team": "network-operators"}},
-			PodMonitorSelector:     &metav1.LabelSelector{MatchLabels: map[string]string{"team": "network-operators"}},
-			Version:                components.ComponentCoreOSPrometheus.Version,
-			Retention:              "24h",
-			Resources:              corev1.ResourceRequirements{Requests: corev1.ResourceList{"memory": resource.MustParse("400Mi")}},
-			RuleSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
-				"prometheus": CalicoNodePrometheus,
-				"role":       "tigera-prometheus-rules",
-			}},
-			Tolerations:  mc.cfg.Installation.ControlPlaneTolerations,
-			NodeSelector: mc.cfg.Installation.ControlPlaneNodeSelector,
 			Alerting: &monitoringv1.AlertingSpec{
 				Alertmanagers: []monitoringv1.AlertmanagerEndpoints{
 					{
@@ -431,11 +428,11 @@ func (mc *monitorComponent) prometheus() *monitoringv1.Prometheus {
 					},
 				},
 			},
-			SecurityContext: &corev1.PodSecurityContext{
-				RunAsGroup:   &securitycontext.RunAsGroupID,
-				RunAsNonRoot: ptr.BoolToPtr(true),
-				RunAsUser:    &securitycontext.RunAsUserID,
-			},
+			Retention: "24h",
+			RuleSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+				"prometheus": CalicoNodePrometheus,
+				"role":       "tigera-prometheus-rules",
+			}},
 		},
 	}
 }
@@ -452,10 +449,8 @@ func (mc *monitorComponent) prometheusServiceAccount() *corev1.ServiceAccount {
 
 func (mc *monitorComponent) prometheusClusterRole() *rbacv1.ClusterRole {
 	return &rbacv1.ClusterRole{
-		TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "prometheus",
-		},
+		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: PrometheusClusterRoleName},
 		Rules: []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{""},
@@ -492,10 +487,8 @@ func (mc *monitorComponent) prometheusClusterRole() *rbacv1.ClusterRole {
 
 func (mc *monitorComponent) prometheusClusterRoleBinding() *rbacv1.ClusterRoleBinding {
 	return &rbacv1.ClusterRoleBinding{
-		TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "prometheus",
-		},
+		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: PrometheusClusterRoleName},
 		Subjects: []rbacv1.Subject{
 			{
 				Kind:      "ServiceAccount",
@@ -506,7 +499,7 @@ func (mc *monitorComponent) prometheusClusterRoleBinding() *rbacv1.ClusterRoleBi
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "ClusterRole",
-			Name:     "prometheus",
+			Name:     PrometheusClusterRoleName,
 		},
 	}
 }
@@ -896,6 +889,14 @@ func allowTigeraPrometheusPolicy(cfg *Config) *v3.NetworkPolicy {
 			Action:   v3.Allow,
 			Protocol: &networkpolicy.TCPProtocol,
 			Destination: v3.EntityRule{
+				// Egress access for Kube controller port metrics.
+				Ports: networkpolicy.Ports(uint16(cfg.KubeControllerPort)),
+			},
+		},
+		{
+			Action:   v3.Allow,
+			Protocol: &networkpolicy.TCPProtocol,
+			Destination: v3.EntityRule{
 				Selector: alertManagerSelector,
 				Ports:    networkpolicy.Ports(AlertmanagerPort),
 			},
@@ -989,6 +990,31 @@ func allowTigeraPrometheusOperatorPolicy(cfg *Config) *v3.NetworkPolicy {
 			Selector: "operator == 'prometheus'",
 			Types:    []v3.PolicyType{v3.PolicyTypeEgress},
 			Egress:   egressRules,
+		},
+	}
+}
+
+func (mc *monitorComponent) serviceMonitorCalicoKubeControllers() *monitoringv1.ServiceMonitor {
+	return &monitoringv1.ServiceMonitor{
+		TypeMeta: metav1.TypeMeta{Kind: monitoringv1.ServiceMonitorsKind, APIVersion: MonitoringAPIVersion},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      KubeControllerMetrics,
+			Namespace: common.TigeraPrometheusNamespace,
+			Labels:    map[string]string{"team": "network-operators"},
+		},
+		Spec: monitoringv1.ServiceMonitorSpec{
+			Selector:          metav1.LabelSelector{MatchLabels: map[string]string{"k8s-app": "calico-kube-controllers"}},
+			NamespaceSelector: monitoringv1.NamespaceSelector{MatchNames: []string{"calico-system"}},
+			Endpoints: []monitoringv1.Endpoint{
+				{
+					HonorLabels:   true,
+					Interval:      "5s",
+					Port:          "metrics-port",
+					ScrapeTimeout: "5s",
+					Scheme:        "https",
+					TLSConfig:     mc.tlsConfig(KubeControllerMetrics),
+				},
+			},
 		},
 	}
 }

@@ -20,7 +20,7 @@ require (
 	github.com/projectcalico/api v0.0.0-20220722155641-439a754a988b
 	github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring v0.62.0
 	github.com/r3labs/diff/v2 v2.15.1
-	github.com/stretchr/testify v1.8.1
+	github.com/stretchr/testify v1.8.2
 	github.com/tigera/api v0.0.0-20230213173520-467b09635559
 	go.uber.org/zap v1.23.0
 	golang.org/x/crypto v0.4.0

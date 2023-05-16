@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -230,7 +230,8 @@ func main() {
 		// tiers that the user is authorized for.
 		NewCache: cache.BuilderWithOptions(cache.Options{
 			SelectorsByObject: cache.SelectorsByObject{
-				&v3.NetworkPolicy{}: {Label: policySelector},
+				&v3.NetworkPolicy{}:       {Label: policySelector},
+				&v3.GlobalNetworkPolicy{}: {Label: policySelector},
 			},
 		}),
 	})
@@ -256,10 +257,15 @@ func main() {
 	// Determine if PodSecurityPolicies are supported. PSPs were removed in
 	// Kubernetes v1.25. We can remove this check once the operator not longer
 	// supports Kubernetes < v1.25.0.
-	usePSP, err := utils.SupportsPodSecurityPolicies(clientset)
-	if err != nil {
-		setupLog.Error(err, "Failed to discover PodSecurityPolicy availability")
-		os.Exit(1)
+	// Skip installation of PSPs in OpenShift since we use Security Context
+	// Constraints (SCC) instead.
+	usePSP := false
+	if provider != operatorv1.ProviderOpenShift {
+		usePSP, err = utils.SupportsPodSecurityPolicies(clientset)
+		if err != nil {
+			setupLog.Error(err, "Failed to discover PodSecurityPolicy availability")
+			os.Exit(1)
+		}
 	}
 	setupLog.WithValues("supported", usePSP).Info("Checking if PodSecurityPolicies are supported by the cluster")
 

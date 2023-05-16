@@ -91,7 +91,7 @@ type KubeControllersConfiguration struct {
 	KubeControllersGatewaySecret *corev1.Secret
 	TrustedBundle                certificatemanagement.TrustedBundle
 
-	// Whether or not the cluster supports pod security policies.
+	// Whether the cluster supports pod security policies.
 	UsePSP           bool
 	MetricsServerTLS certificatemanagement.KeyPairInterface
 }
@@ -234,13 +234,16 @@ func (c *kubeControllersComponent) Objects() ([]client.Object, []client.Object) 
 		c.controllersDeployment(),
 	)
 
+	if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderOpenShift {
+		objectsToCreate = append(objectsToCreate, c.controllersOCPFederationRoleBinding())
+	}
 	objectsToDelete := []client.Object{}
 	if c.cfg.KubeControllersGatewaySecret != nil {
 		objectsToCreate = append(objectsToCreate, secret.ToRuntimeObjects(
 			secret.CopyToNamespace(common.CalicoNamespace, c.cfg.KubeControllersGatewaySecret)...)...)
 	}
 
-	if c.cfg.Installation.KubernetesProvider != operatorv1.ProviderOpenShift && c.cfg.UsePSP {
+	if c.cfg.UsePSP {
 		objectsToCreate = append(objectsToCreate, c.controllersPodSecurityPolicy())
 	}
 
@@ -315,7 +318,7 @@ func kubeControllersRoleCommonRules(cfg *KubeControllersConfiguration, kubeContr
 		},
 	}
 
-	if cfg.Installation.KubernetesProvider != operatorv1.ProviderOpenShift {
+	if cfg.UsePSP {
 		// Allow access to the pod security policy in case this is enforced on the cluster
 		rules = append(rules, rbacv1.PolicyRule{
 			APIGroups:     []string{"policy"},
@@ -406,6 +409,30 @@ func (c *kubeControllersComponent) controllersRole() *rbacv1.ClusterRole {
 	return role
 }
 
+// controllersOCPFederationRoleBinding on Openshift, an admission controller will block requests unless this permission
+// is active.
+func (c *kubeControllersComponent) controllersOCPFederationRoleBinding() *rbacv1.ClusterRoleBinding {
+	return &rbacv1.ClusterRoleBinding{
+		TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "calico-kube-controllers-endpoint-controller",
+			Labels: map[string]string{},
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "system:controller:endpoint-controller",
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      KubeController,
+				Namespace: common.CalicoNamespace,
+			},
+		},
+	}
+}
+
 func (c *kubeControllersComponent) controllersDeployment() *appsv1.Deployment {
 	env := []corev1.EnvVar{
 		{Name: "KUBE_CONTROLLERS_CONFIG_NAME", Value: c.kubeControllerConfigName},
@@ -451,16 +478,18 @@ func (c *kubeControllersComponent) controllersDeployment() *appsv1.Deployment {
 			corev1.EnvVar{Name: "CA_CRT_PATH", Value: c.cfg.TrustedBundle.MountPath()},
 		)
 	}
+
 	// UID 999 is used in kube-controller Dockerfile.
 	sc := securitycontext.NewNonRootContext()
 	sc.RunAsUser = ptr.Int64ToPtr(999)
 	sc.RunAsGroup = ptr.Int64ToPtr(0)
 
 	container := corev1.Container{
-		Name:      c.kubeControllerName,
-		Image:     c.image,
-		Env:       env,
-		Resources: c.kubeControllersResources(),
+		Name:            c.kubeControllerName,
+		Image:           c.image,
+		ImagePullPolicy: render.ImagePullPolicy(),
+		Env:             env,
+		Resources:       c.kubeControllersResources(),
 		ReadinessProbe: &corev1.Probe{
 			PeriodSeconds: int32(10),
 			ProbeHandler: corev1.ProbeHandler{
@@ -615,9 +644,7 @@ func (c *kubeControllersComponent) annotations() map[string]string {
 }
 
 func (c *kubeControllersComponent) controllersPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	psp := podsecuritypolicy.NewBasePolicy()
-	psp.GetObjectMeta().SetName(c.kubeControllerName)
-	return psp
+	return podsecuritypolicy.NewBasePolicy(c.kubeControllerName)
 }
 
 func (c *kubeControllersComponent) kubeControllersVolumeMounts() []corev1.VolumeMount {
@@ -626,7 +653,7 @@ func (c *kubeControllersComponent) kubeControllersVolumeMounts() []corev1.Volume
 		mounts = append(mounts, c.cfg.ManagerInternalSecret.VolumeMount(c.SupportedOSType()))
 	}
 	if c.cfg.TrustedBundle != nil {
-		mounts = append(mounts, c.cfg.TrustedBundle.VolumeMount(c.SupportedOSType()))
+		mounts = append(mounts, c.cfg.TrustedBundle.VolumeMounts(c.SupportedOSType())...)
 	}
 	if c.cfg.MetricsServerTLS != nil {
 		mounts = append(mounts, c.cfg.MetricsServerTLS.VolumeMount(c.SupportedOSType()))
@@ -675,6 +702,17 @@ func kubeControllersAllowTigeraPolicy(cfg *KubeControllersConfiguration) *v3.Net
 		})
 	}
 
+	ingressRules := []v3.Rule{
+		{
+			Action:   v3.Allow,
+			Protocol: &networkpolicy.TCPProtocol,
+			Source:   networkpolicy.PrometheusSourceEntityRule,
+			Destination: v3.EntityRule{
+				Ports: networkpolicy.Ports(uint16(cfg.MetricsPort)),
+			},
+		},
+	}
+
 	return &v3.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -685,8 +723,9 @@ func kubeControllersAllowTigeraPolicy(cfg *KubeControllersConfiguration) *v3.Net
 			Order:    &networkpolicy.HighPrecedenceOrder,
 			Tier:     networkpolicy.TigeraComponentTierName,
 			Selector: networkpolicy.KubernetesAppSelector(KubeController),
-			Types:    []v3.PolicyType{v3.PolicyTypeEgress},
+			Types:    []v3.PolicyType{v3.PolicyTypeEgress, v3.PolicyTypeIngress},
 			Egress:   egressRules,
+			Ingress:  ingressRules,
 		},
 	}
 }

@@ -20,6 +20,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tigera/operator/pkg/ptr"
+
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -58,12 +60,15 @@ const (
 	IntrusionDetectionControllerPolicyName = networkpolicy.TigeraComponentPolicyPrefix + IntrusionDetectionControllerName
 	IntrusionDetectionInstallerPolicyName  = networkpolicy.TigeraComponentPolicyPrefix + "intrusion-detection-elastic"
 
-	ADAPIObjectName          = "anomaly-detection-api"
-	ADAPIObjectPortName      = "anomaly-detection-api-https"
-	ADAPITLSSecretName       = "anomaly-detection-api-tls"
-	ADAPIExpectedServiceName = "anomaly-detection-api.tigera-intrusion-detection.svc"
-	ADAPIPolicyName          = networkpolicy.TigeraComponentPolicyPrefix + ADAPIObjectName
-	adAPIPort                = 8080
+	ADAPIObjectName                 = "anomaly-detection-api"
+	ADAPIPodSecurityPolicyName      = "anomaly-detection-api"
+	ADAPIObjectPortName             = "anomaly-detection-api-https"
+	ADAPITLSSecretName              = "anomaly-detection-api-tls"
+	IntrusionDetectionTLSSecretName = "intrusion-detection-tls"
+	DPITLSSecretName                = "deep-packet-inspection-tls"
+	ADAPIExpectedServiceName        = "anomaly-detection-api.tigera-intrusion-detection.svc"
+	ADAPIPolicyName                 = networkpolicy.TigeraComponentPolicyPrefix + ADAPIObjectName
+	adAPIPort                       = 8080
 
 	ADPersistentVolumeClaimName            = "tigera-anomaly-detection"
 	DefaultAnomalyDetectionPVRequestSizeGi = "10Gi"
@@ -81,11 +86,14 @@ const (
 
 var adAPIReplicas int32 = 1
 
-var intrusionDetectionNamespaceSelector = fmt.Sprintf("projectcalico.org/name == '%s'", IntrusionDetectionNamespace)
-var IntrusionDetectionSourceEntityRule = v3.EntityRule{
-	NamespaceSelector: intrusionDetectionNamespaceSelector,
-	Selector:          fmt.Sprintf("k8s-app == '%s'", IntrusionDetectionControllerName),
-}
+var (
+	intrusionDetectionNamespaceSelector = fmt.Sprintf("projectcalico.org/name == '%s'", IntrusionDetectionNamespace)
+	IntrusionDetectionSourceEntityRule  = v3.EntityRule{
+		NamespaceSelector: intrusionDetectionNamespaceSelector,
+		Selector:          fmt.Sprintf("k8s-app == '%s'", IntrusionDetectionControllerName),
+	}
+)
+
 var IntrusionDetectionInstallerSourceEntityRule = v3.EntityRule{
 	NamespaceSelector: intrusionDetectionNamespaceSelector,
 	Selector:          fmt.Sprintf("job-name == '%s'", IntrusionDetectionInstallerJobName),
@@ -112,12 +120,13 @@ type IntrusionDetectionConfiguration struct {
 
 	// PVC fields Spec fields are immutable, set to true when an existing AD PVC
 	// is not found as to avoid update failures.
-	ShouldRenderADPVC     bool
-	HasNoLicense          bool
-	TrustedCertBundle     certificatemanagement.TrustedBundle
-	ADAPIServerCertSecret certificatemanagement.KeyPairInterface
+	ShouldRenderADPVC            bool
+	HasNoLicense                 bool
+	TrustedCertBundle            certificatemanagement.TrustedBundle
+	ADAPIServerCertSecret        certificatemanagement.KeyPairInterface
+	IntrusionDetectionCertSecret certificatemanagement.KeyPairInterface
 
-	// Whether or not the cluster supports pod security policies.
+	// Whether the cluster supports pod security policies.
 	UsePSP bool
 }
 
@@ -256,13 +265,23 @@ func (c *intrusionDetectionComponent) Objects() ([]client.Object, []client.Objec
 		}
 	}
 
-	if !c.cfg.Openshift {
+	if c.cfg.UsePSP {
 		objs = append(objs,
 			c.intrusionDetectionPSPClusterRole(),
-			c.intrusionDetectionPSPClusterRoleBinding())
-		if c.cfg.UsePSP {
-			objs = append(objs, c.intrusionDetectionPodSecurityPolicy())
-		}
+			c.intrusionDetectionPSPClusterRoleBinding(),
+			c.intrusionDetectionPodSecurityPolicy(),
+			c.adAPIPodSecurityPolicy(),
+		)
+	}
+
+	if c.cfg.ManagedCluster {
+		// For managed clusters, we must create a role binding to allow Linseed to
+		// manage access token secrets in our namespace.
+		objs = append(objs, c.externalLinseedRoleBinding())
+	} else {
+		// We can delete the role binding for management and standalone clusters, since
+		// for these cluster types normal serviceaccount tokens are used.
+		objsToDelete = append(objsToDelete, c.externalLinseedRoleBinding())
 	}
 
 	if c.cfg.HasNoLicense {
@@ -309,6 +328,9 @@ func (c *intrusionDetectionComponent) intrusionDetectionElasticsearchJob() *batc
 				},
 			},
 			Template: *podTemplate,
+			// PodFailurePolicy is not available for k8s < 1.26; setting BackoffLimit to a higher number (default is 6)
+			// to lessen the frequency of installation failures when responses from Elastic Search takes more time.
+			BackoffLimit: ptr.Int32ToPtr(30),
 			PodFailurePolicy: &batchv1.PodFailurePolicy{
 				Rules: []batchv1.PodFailurePolicyRule{
 					// We don't want the job to fail, so we keep retrying by ignoring incrementing the backoff.
@@ -329,8 +351,9 @@ func (c *intrusionDetectionComponent) intrusionDetectionJobContainer() corev1.Co
 	kScheme, kHost, kPort, _ := url.ParseEndpoint(rkibana.HTTPSEndpoint(c.SupportedOSType(), c.cfg.ClusterDomain))
 	secretName := ElasticsearchIntrusionDetectionJobUserSecret
 	return corev1.Container{
-		Name:  "elasticsearch-job-installer",
-		Image: c.jobInstallerImage,
+		Name:            "elasticsearch-job-installer",
+		Image:           c.jobInstallerImage,
+		ImagePullPolicy: ImagePullPolicy(),
 		Env: []corev1.EnvVar{
 			{
 				Name:  "KIBANA_HOST",
@@ -366,9 +389,13 @@ func (c *intrusionDetectionComponent) intrusionDetectionJobContainer() corev1.Co
 				Name:  "CLUSTER_NAME",
 				Value: c.cfg.ESClusterConfig.ClusterName(),
 			},
+			{
+				Name:  "FIPS_MODE_ENABLED",
+				Value: operatorv1.IsFIPSModeEnabledString(c.cfg.Installation.FIPSMode),
+			},
 		},
 		SecurityContext: securitycontext.NewNonRootContext(),
-		VolumeMounts:    []corev1.VolumeMount{c.cfg.TrustedCertBundle.VolumeMount(c.SupportedOSType())},
+		VolumeMounts:    c.cfg.TrustedCertBundle.VolumeMounts(c.SupportedOSType()),
 	}
 }
 
@@ -429,6 +456,25 @@ func (c *intrusionDetectionComponent) intrusionDetectionClusterRole() *rbacv1.Cl
 			APIGroups: []string{"apps"},
 			Resources: []string{"deployments"},
 			Verbs:     []string{"get"},
+		},
+		{
+			// Add write access to Linseed APIs.
+			APIGroups: []string{"linseed.tigera.io"},
+			Resources: []string{"events"},
+			Verbs:     []string{"create"},
+		},
+		{
+			// Add read access to Linseed APIs.
+			APIGroups: []string{"linseed.tigera.io"},
+			Resources: []string{
+				"waflogs",
+				"dnslogs",
+				"l7logs",
+				"flowlogs",
+				"auditlogs",
+				"events",
+			},
+			Verbs: []string{"get"},
 		},
 	}
 
@@ -493,6 +539,31 @@ func (c *intrusionDetectionComponent) intrusionDetectionClusterRoleBinding() *rb
 				Kind:      "ServiceAccount",
 				Name:      IntrusionDetectionName,
 				Namespace: IntrusionDetectionNamespace,
+			},
+		},
+	}
+}
+
+func (c *intrusionDetectionComponent) externalLinseedRoleBinding() *rbacv1.RoleBinding {
+	// For managed clusters, we must create a role binding to allow Linseed to manage access token secrets
+	// in our namespace.
+	linseed := "tigera-linseed"
+	return &rbacv1.RoleBinding{
+		TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      linseed,
+			Namespace: IntrusionDetectionNamespace,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     linseed,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      linseed,
+				Namespace: ElasticsearchNamespace,
 			},
 		},
 	}
@@ -568,6 +639,7 @@ func (c *intrusionDetectionComponent) deploymentPodTemplate() *corev1.PodTemplat
 
 	volumes := []corev1.Volume{
 		c.cfg.TrustedCertBundle.Volume(),
+		c.cfg.IntrusionDetectionCertSecret.Volume(),
 	}
 	// If syslog forwarding is enabled then set the necessary hostpath volume to write
 	// logs for Fluentd to access.
@@ -582,6 +654,19 @@ func (c *intrusionDetectionComponent) deploymentPodTemplate() *corev1.PodTemplat
 				},
 			},
 		})
+	}
+
+	if c.cfg.ManagedCluster {
+		volumes = append(volumes,
+			corev1.Volume{
+				Name: LinseedTokenVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{
+						SecretName: fmt.Sprintf(LinseedTokenSecret, IntrusionDetectionName),
+						Items:      []corev1.KeyToPath{{Key: LinseedTokenKey, Path: LinseedTokenSubPath}},
+					},
+				},
+			})
 	}
 
 	container := relasticsearch.ContainerDecorateIndexCreator(
@@ -630,15 +715,34 @@ func (c *intrusionDetectionComponent) intrusionDetectionControllerContainer() co
 			Name:  "FIPS_MODE_ENABLED",
 			Value: operatorv1.IsFIPSModeEnabledString(c.cfg.Installation.FIPSMode),
 		},
+		{
+			Name:  "LINSEED_URL",
+			Value: relasticsearch.LinseedEndpoint(c.SupportedOSType(), c.cfg.ClusterDomain),
+		},
+		{
+			Name:  "LINSEED_CA",
+			Value: c.cfg.TrustedCertBundle.MountPath(),
+		},
+		{
+			Name:  "LINSEED_CLIENT_CERT",
+			Value: c.cfg.IntrusionDetectionCertSecret.VolumeMountCertificateFilePath(),
+		},
+		{
+			Name:  "LINSEED_CLIENT_KEY",
+			Value: c.cfg.IntrusionDetectionCertSecret.VolumeMountKeyFilePath(),
+		},
+		{
+			Name:  "LINSEED_TOKEN",
+			Value: GetLinseedTokenPath(c.cfg.ManagedCluster),
+		},
 	}
 
 	sc := securitycontext.NewNonRootContext()
 
 	// If syslog forwarding is enabled then set the necessary ENV var and volume mount to
 	// write logs for Fluentd.
-	volumeMounts := []corev1.VolumeMount{
-		c.cfg.TrustedCertBundle.VolumeMount(c.SupportedOSType()),
-	}
+	volumeMounts := c.cfg.TrustedCertBundle.VolumeMounts(c.SupportedOSType())
+	volumeMounts = append(volumeMounts, c.cfg.IntrusionDetectionCertSecret.VolumeMount(c.SupportedOSType()))
 	if c.syslogForwardingIsEnabled() {
 		envs = append(envs,
 			corev1.EnvVar{Name: "IDS_ENABLE_EVENT_FORWARDING", Value: "true"},
@@ -652,10 +756,19 @@ func (c *intrusionDetectionComponent) intrusionDetectionControllerContainer() co
 		sc = securitycontext.NewRootContext(c.cfg.Openshift)
 	}
 
+	if c.cfg.ManagedCluster {
+		volumeMounts = append(volumeMounts,
+			corev1.VolumeMount{
+				Name:      LinseedTokenVolumeName,
+				MountPath: LinseedVolumeMountPath,
+			})
+	}
+
 	return corev1.Container{
-		Name:  "controller",
-		Image: c.controllerImage,
-		Env:   envs,
+		Name:            "controller",
+		Image:           c.controllerImage,
+		ImagePullPolicy: ImagePullPolicy(),
+		Env:             envs,
 		// Needed for permissions to write to the audit log
 		LivenessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{
@@ -1242,9 +1355,7 @@ func (c *intrusionDetectionComponent) adJobsGlobalertTemplates() []client.Object
 }
 
 func (c *intrusionDetectionComponent) intrusionDetectionPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	psp := podsecuritypolicy.NewBasePolicy()
-	psp.GetObjectMeta().SetName("intrusion-detection")
-
+	psp := podsecuritypolicy.NewBasePolicy("intrusion-detection")
 	if c.syslogForwardingIsEnabled() {
 		psp.Spec.Volumes = append(psp.Spec.Volumes, policyv1beta1.HostPath)
 		psp.Spec.AllowedHostPaths = []policyv1beta1.AllowedHostPath{
@@ -1253,9 +1364,8 @@ func (c *intrusionDetectionComponent) intrusionDetectionPodSecurityPolicy() *pol
 				ReadOnly:   false,
 			},
 		}
+		psp.Spec.RunAsUser.Rule = policyv1beta1.RunAsUserStrategyRunAsAny
 	}
-
-	psp.Spec.RunAsUser.Rule = policyv1beta1.RunAsUserStrategyRunAsAny
 	return psp
 }
 
@@ -1319,23 +1429,34 @@ func (c *intrusionDetectionComponent) adAPIServiceAccount() *corev1.ServiceAccou
 }
 
 func (c *intrusionDetectionComponent) adAPIAccessClusterRole() *rbacv1.ClusterRole {
+	rules := []rbacv1.PolicyRule{
+		{
+			APIGroups: []string{"authorization.k8s.io"},
+			Resources: []string{"subjectaccessreviews"},
+			Verbs:     []string{"create"},
+		},
+		{
+			APIGroups: []string{"authentication.k8s.io"},
+			Resources: []string{"tokenreviews"},
+			Verbs:     []string{"create"},
+		},
+	}
+
+	if c.cfg.UsePSP {
+		rules = append(rules, rbacv1.PolicyRule{
+			APIGroups:     []string{"policy"},
+			Resources:     []string{"podsecuritypolicies"},
+			Verbs:         []string{"use"},
+			ResourceNames: []string{ADAPIPodSecurityPolicyName},
+		})
+	}
+
 	return &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: ADAPIObjectName,
 		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{"authorization.k8s.io"},
-				Resources: []string{"subjectaccessreviews"},
-				Verbs:     []string{"create"},
-			},
-			{
-				APIGroups: []string{"authentication.k8s.io"},
-				Resources: []string{"tokenreviews"},
-				Verbs:     []string{"create"},
-			},
-		},
+		Rules: rules,
 	}
 }
 
@@ -1414,6 +1535,10 @@ func (c *intrusionDetectionComponent) adPersistentVolumeClaim() *corev1.Persiste
 	return &adPVC
 }
 
+func (c *intrusionDetectionComponent) adAPIPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
+	return podsecuritypolicy.NewBasePolicy(ADAPIPodSecurityPolicyName)
+}
+
 func (c *intrusionDetectionComponent) adAPIDeployment() *appsv1.Deployment {
 	var adModelVolumeSource corev1.VolumeSource
 	sc := securitycontext.NewNonRootContext()
@@ -1473,8 +1598,9 @@ func (c *intrusionDetectionComponent) adAPIDeployment() *appsv1.Deployment {
 					InitContainers: initContainers,
 					Containers: []corev1.Container{
 						{
-							Name:  ADAPIObjectName,
-							Image: c.adAPIImage,
+							Name:            ADAPIObjectName,
+							Image:           c.adAPIImage,
+							ImagePullPolicy: ImagePullPolicy(),
 							Env: []corev1.EnvVar{
 								{Name: "LOG_LEVEL", Value: "info"},
 								{Name: "STORAGE_PATH", Value: adAPIStoragePath},
@@ -1501,15 +1627,11 @@ func (c *intrusionDetectionComponent) adAPIDeployment() *appsv1.Deployment {
 									},
 								},
 							},
-							VolumeMounts: []corev1.VolumeMount{
-								c.cfg.TrustedCertBundle.VolumeMount(c.SupportedOSType()),
+							VolumeMounts: append(
+								c.cfg.TrustedCertBundle.VolumeMounts(c.SupportedOSType()),
 								c.cfg.ADAPIServerCertSecret.VolumeMount(c.SupportedOSType()),
-								{
-									MountPath: adAPIStoragePath,
-									Name:      adAPIStorageVolumeName,
-									ReadOnly:  false,
-								},
-							},
+								corev1.VolumeMount{MountPath: adAPIStoragePath, Name: adAPIStorageVolumeName, ReadOnly: false},
+							),
 						},
 					},
 				},
@@ -1547,27 +1669,37 @@ func (c *intrusionDetectionComponent) adDetectorSecret() *corev1.Secret {
 }
 
 func (c *intrusionDetectionComponent) adDetectorAccessRole() *rbacv1.Role {
+	rules := []rbacv1.PolicyRule{
+		{
+			APIGroups: []string{ADResourceGroup},
+			Resources: []string{
+				ADDetectorsModelResourceName,
+				ADLogTypeMetaDataResourceName,
+			},
+			Verbs: []string{
+				"get",
+				"create",
+				"update",
+			},
+		},
+	}
+
+	if c.cfg.UsePSP {
+		rules = append(rules, rbacv1.PolicyRule{
+			APIGroups:     []string{"policy"},
+			Resources:     []string{"podsecuritypolicies"},
+			Verbs:         []string{"use"},
+			ResourceNames: []string{ADAPIPodSecurityPolicyName},
+		})
+	}
+
 	return &rbacv1.Role{
 		TypeMeta: metav1.TypeMeta{Kind: "Role", APIVersion: "rbac.authorization.k8s.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      adDetectorName,
 			Namespace: IntrusionDetectionNamespace,
 		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{
-					ADResourceGroup,
-				},
-				Resources: []string{
-					ADDetectorsModelResourceName, ADLogTypeMetaDataResourceName,
-				},
-				Verbs: []string{
-					"get",
-					"create",
-					"update",
-				},
-			},
-		},
+		Rules: rules,
 	}
 }
 
@@ -1627,12 +1759,13 @@ func (c *intrusionDetectionComponent) getBaseADDetectorsPodTemplate(podTemplateN
 	container := corev1.Container{
 		Name:            "adjobs",
 		Image:           c.adDetectorsImage,
+		ImagePullPolicy: ImagePullPolicy(),
 		SecurityContext: securitycontext.NewNonRootContext(),
 		Env:             envVars,
-		VolumeMounts: []corev1.VolumeMount{
-			c.cfg.TrustedCertBundle.VolumeMount(c.SupportedOSType()),
+		VolumeMounts: append(
+			c.cfg.TrustedCertBundle.VolumeMounts(c.SupportedOSType()),
 			c.cfg.ADAPIServerCertSecret.VolumeMount(c.SupportedOSType()),
-		},
+		),
 	}
 
 	return corev1.PodTemplate{
@@ -1701,6 +1834,12 @@ func (c *intrusionDetectionComponent) intrusionDetectionControllerAllowTigeraPol
 			Protocol:    &networkpolicy.TCPProtocol,
 			Destination: networkpolicy.ESGatewayEntityRule,
 		})
+		egressRules = append(egressRules, v3.Rule{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Destination: networkpolicy.LinseedEntityRule,
+		})
+
 	}
 	egressRules = append(egressRules, []v3.Rule{
 		{

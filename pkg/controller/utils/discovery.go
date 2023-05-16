@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -167,15 +167,40 @@ func isDockerEE(ctx context.Context, c kubernetes.Interface) (bool, error) {
 // EKS doesn't have any provider-specific API groups, so we need to use a different approach than
 // we use for other platforms in autodetectFromGroup.
 func isEKS(ctx context.Context, c kubernetes.Interface) (bool, error) {
-	cm, err := c.CoreV1().ConfigMaps("kube-system").Get(ctx, "eks-certificates-controller", metav1.GetOptions{})
-	if err != nil {
-		if kerrors.IsNotFound(err) {
-			return false, nil
-		}
+	// This looks for a configmap that is used in EKS clusters for enabling access to EKS clusters
+	// https://docs.aws.amazon.com/eks/latest/userguide/add-user-role.html
+	_, err := c.CoreV1().ConfigMaps("kube-system").Get(ctx, "aws-auth", metav1.GetOptions{})
+	if err == nil {
+		return true, nil
+	} else if !kerrors.IsNotFound(err) {
 		return false, err
 	}
 
-	return (cm != nil), nil
+	// This is a config map that that use to be present in EKS cluster but now seems to be deprecated.
+	// We'll keep this detection so we ensure we detect EKS in older clusters that have this.
+	_, err = c.CoreV1().ConfigMaps("kube-system").Get(ctx, "eks-certificates-controller", metav1.GetOptions{})
+	if err == nil {
+		return true, nil
+	} else if !kerrors.IsNotFound(err) {
+		return false, err
+	}
+
+	// We'll check the labels on the kube-dns service if it exists and if we find the seemingly EKS
+	// specific label then we'll assume EKS.
+	dnsService, err := c.CoreV1().Services("kube-system").Get(ctx, "kube-dns", metav1.GetOptions{})
+	if err == nil {
+		if dnsService != nil {
+			for key := range dnsService.Labels {
+				if key == "eks.amazonaws.com/component" {
+					return true, nil
+				}
+			}
+		}
+	} else if !kerrors.IsNotFound(err) {
+		return false, err
+	}
+
+	return false, nil
 }
 
 // isRKE2 returns true if running on an RKE2 cluster, and false otherwise.
@@ -195,7 +220,7 @@ func isRKE2(ctx context.Context, c kubernetes.Interface) (bool, error) {
 }
 
 // SupportsPodSecurityPolicies returns true if the cluster contains the policy/v1beta1 PodSecurityPolicy API,
-// and false otherwise. This API is scheuled to be removed in Kubernetes v1.25, but should still be used
+// and false otherwise. This API is scheduled to be removed in Kubernetes v1.25, but should still be used
 // in earlier Kubernetes versions.
 func SupportsPodSecurityPolicies(c kubernetes.Interface) (bool, error) {
 	resources, err := c.Discovery().ServerResourcesForGroupVersion("policy/v1beta1")

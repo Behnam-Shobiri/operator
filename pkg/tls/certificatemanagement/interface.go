@@ -1,4 +1,4 @@
-// Copyright (c) 2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2023 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,16 +15,17 @@
 package certificatemanagement
 
 import (
-	"github.com/tigera/operator/pkg/render/common/meta"
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/tigera/operator/pkg/render/common/meta"
 )
 
 const (
 	CASecretName                      = "tigera-ca-private"
 	TrustedCertConfigMapName          = "tigera-ca-bundle"
 	TrustedCertConfigMapKeyName       = "tigera-ca-bundle.crt"
-	TrustedCertVolumeMountPath        = "/etc/pki/tls/certs/"
-	TrustedCertVolumeMountPathWindows = "c:/etc/pki/tls/certs/"
+	TrustedCertVolumeMountPath        = "/etc/pki/tls/"
+	TrustedCertVolumeMountPathWindows = "c:/etc/pki/tls/"
 	TrustedCertBundleMountPath        = "/etc/pki/tls/certs/tigera-ca-bundle.crt"
 	TrustedCertBundleMountPathWindows = "c:/etc/pki/tls/certs/tigera-ca-bundle.crt"
 )
@@ -32,7 +33,7 @@ const (
 // KeyPairInterface wraps a Secret object that contains a private key and a certificate. Whether CertificateManagement is
 // configured or not, KeyPair returns the right InitContainer, VolumeMount or Volume (when applicable).
 type KeyPairInterface interface {
-	//UseCertificateManagement returns true if this key pair was not user provided and certificate management has been configured.
+	// UseCertificateManagement returns true if this key pair was not user provided and certificate management has been configured.
 	UseCertificateManagement() bool
 	// BYO returns true if this KeyPair was provided by the user. If BYO is true, UseCertificateManagement is false.
 	BYO() bool
@@ -59,7 +60,7 @@ type TrustedBundle interface {
 	MountPath() string
 	ConfigMap(namespace string) *corev1.ConfigMap
 	HashAnnotations() map[string]string
-	VolumeMount(osType meta.OSType) corev1.VolumeMount
+	VolumeMounts(osType meta.OSType) []corev1.VolumeMount
 	Volume() corev1.Volume
 	AddCertificates(certificates ...CertificateInterface)
 }

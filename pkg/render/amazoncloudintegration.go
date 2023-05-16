@@ -302,6 +302,7 @@ func (c *amazonCloudIntegrationComponent) container() corev1.Container {
 	return corev1.Container{
 		Name:            AmazonCloudIntegrationComponentName,
 		Image:           c.image,
+		ImagePullPolicy: ImagePullPolicy(),
 		Env:             env,
 		SecurityContext: securitycontext.NewNonRootContext(),
 		ReadinessProbe: &corev1.Probe{
@@ -317,7 +318,7 @@ func (c *amazonCloudIntegrationComponent) container() corev1.Container {
 			PeriodSeconds:       10,
 			FailureThreshold:    3,
 		},
-		VolumeMounts: []corev1.VolumeMount{c.cfg.TrustedBundle.VolumeMount(c.SupportedOSType())},
+		VolumeMounts: c.cfg.TrustedBundle.VolumeMounts(c.SupportedOSType()),
 	}
 }
 

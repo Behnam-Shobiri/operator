@@ -41,7 +41,6 @@ import (
 	rtest "github.com/tigera/operator/pkg/render/common/test"
 	"github.com/tigera/operator/pkg/render/testutils"
 	"github.com/tigera/operator/pkg/tls"
-	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
 
 var _ = Describe("compliance rendering tests", func() {
@@ -65,19 +64,31 @@ var _ = Describe("compliance rendering tests", func() {
 		certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain)
 		Expect(err).NotTo(HaveOccurred())
 		bundle := certificateManager.CreateTrustedBundle()
-		secret, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceServerCertSecret, common.OperatorNamespace(), []string{""})
+		serverKP, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceServerCertSecret, common.OperatorNamespace(), []string{""})
+		Expect(err).NotTo(HaveOccurred())
+		controllerKP, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceControllerSecret, common.OperatorNamespace(), []string{""})
+		Expect(err).NotTo(HaveOccurred())
+		benchmarkerKP, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceBenchmarkerSecret, common.OperatorNamespace(), []string{""})
+		Expect(err).NotTo(HaveOccurred())
+		reporterKP, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceReporterSecret, common.OperatorNamespace(), []string{""})
+		Expect(err).NotTo(HaveOccurred())
+		snapshotterKP, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceSnapshotterSecret, common.OperatorNamespace(), []string{""})
 		Expect(err).NotTo(HaveOccurred())
 		cfg = &render.ComplianceConfiguration{
 			Installation: &operatorv1.InstallationSpec{
 				KubernetesProvider: operatorv1.ProviderNone,
 				Registry:           "testregistry.com/",
 			},
-			ComplianceServerCertSecret: secret,
-			ESClusterConfig:            relasticsearch.NewClusterConfig("cluster", 1, 1, 1),
-			Openshift:                  notOpenshift,
-			ClusterDomain:              clusterDomain,
-			TrustedBundle:              bundle,
-			UsePSP:                     true,
+			ServerKeyPair:      serverKP,
+			ControllerKeyPair:  controllerKP,
+			ReporterKeyPair:    reporterKP,
+			BenchmarkerKeyPair: benchmarkerKP,
+			SnapshotterKeyPair: snapshotterKP,
+			ESClusterConfig:    relasticsearch.NewClusterConfig("cluster", 1, 1, 1),
+			Openshift:          notOpenshift,
+			ClusterDomain:      clusterDomain,
+			TrustedBundle:      bundle,
+			UsePSP:             true,
 		}
 	})
 
@@ -195,6 +206,11 @@ var _ = Describe("compliance rendering tests", func() {
 					Verbs:         []string{"use"},
 					ResourceNames: []string{"compliance-server"},
 				},
+				{
+					APIGroups: []string{"linseed.tigera.io"},
+					Resources: []string{"compliancereports"},
+					Verbs:     []string{"get"},
+				},
 			}))
 
 			d := rtest.GetResource(resources, "compliance-controller", ns, "apps", "v1", "Deployment").(*appsv1.Deployment)
@@ -202,8 +218,9 @@ var _ = Describe("compliance rendering tests", func() {
 
 			envs := d.Spec.Template.Spec.Containers[0].Env
 			expectedEnvs := []corev1.EnvVar{
-				{Name: "ELASTIC_HOST", Value: "tigera-secure-es-gateway-http.tigera-elasticsearch.svc"},
-				{Name: "ELASTIC_PORT", Value: "9200"},
+				{Name: "CLUSTER_NAME", Value: "cluster"},
+				{Name: "LINSEED_CLIENT_KEY", Value: "/tigera-compliance-controller-tls/tls.key"},
+				{Name: "LINSEED_CLIENT_CERT", Value: "/tigera-compliance-controller-tls/tls.crt"},
 			}
 			for _, expected := range expectedEnvs {
 				Expect(envs).To(ContainElement(expected))
@@ -331,31 +348,31 @@ var _ = Describe("compliance rendering tests", func() {
 			complianceBenchmarker := rtest.GetResource(resources, "compliance-benchmarker", ns, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
 
 			Expect(dpComplianceServer.Spec.Template.Spec.Containers[0].Env).Should(ContainElements(
-				corev1.EnvVar{Name: "ELASTIC_INDEX_SUFFIX", Value: "cluster"},
+				corev1.EnvVar{Name: "CLUSTER_NAME", Value: "cluster"},
 			))
 			Expect(complianceController.Spec.Template.Spec.Containers[0].Env).Should(ContainElements(
-				corev1.EnvVar{Name: "ELASTIC_INDEX_SUFFIX", Value: "cluster"},
+				corev1.EnvVar{Name: "CLUSTER_NAME", Value: "cluster"},
 			))
 			Expect(complianceSnapshotter.Spec.Template.Spec.Containers[0].Env).Should(ContainElements(
-				corev1.EnvVar{Name: "ELASTIC_INDEX_SUFFIX", Value: "cluster"},
+				corev1.EnvVar{Name: "CLUSTER_NAME", Value: "cluster"},
 			))
 			Expect(complianceBenchmarker.Spec.Template.Spec.Containers[0].Env).Should(ContainElements(
-				corev1.EnvVar{Name: "ELASTIC_INDEX_SUFFIX", Value: "cluster"},
+				corev1.EnvVar{Name: "CLUSTER_NAME", Value: "cluster"},
 			))
 			Expect(dpComplianceServer.Spec.Template.Spec.Containers[0].Env).Should(ContainElements(
-				corev1.EnvVar{Name: "ELASTIC_INDEX_SUFFIX", Value: "cluster"},
+				corev1.EnvVar{Name: "CLUSTER_NAME", Value: "cluster"},
 			))
-			Expect(len(dpComplianceServer.Spec.Template.Spec.Containers[0].VolumeMounts)).To(Equal(2))
-			Expect(dpComplianceServer.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name).To(Equal(certificatemanagement.TrustedCertConfigMapName))
-			Expect(dpComplianceServer.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath).To(Equal(certificatemanagement.TrustedCertVolumeMountPath))
+			Expect(dpComplianceServer.Spec.Template.Spec.Containers[0].VolumeMounts).To(HaveLen(2))
+			Expect(dpComplianceServer.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name).To(Equal("tigera-ca-bundle"))
+			Expect(dpComplianceServer.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath).To(Equal("/etc/pki/tls/certs"))
 			Expect(dpComplianceServer.Spec.Template.Spec.Containers[0].VolumeMounts[1].Name).To(Equal(render.ComplianceServerCertSecret))
 			Expect(dpComplianceServer.Spec.Template.Spec.Containers[0].VolumeMounts[1].MountPath).To(Equal("/tigera-compliance-server-tls"))
 
-			Expect(len(dpComplianceServer.Spec.Template.Spec.Volumes)).To(Equal(2))
+			Expect(dpComplianceServer.Spec.Template.Spec.Volumes).To(HaveLen(2))
 			Expect(dpComplianceServer.Spec.Template.Spec.Volumes[0].Name).To(Equal(render.ComplianceServerCertSecret))
 			Expect(dpComplianceServer.Spec.Template.Spec.Volumes[0].Secret.SecretName).To(Equal(render.ComplianceServerCertSecret))
-			Expect(dpComplianceServer.Spec.Template.Spec.Volumes[1].Name).To(Equal(certificatemanagement.TrustedCertConfigMapName))
-			Expect(dpComplianceServer.Spec.Template.Spec.Volumes[1].ConfigMap.Name).To(Equal(certificatemanagement.TrustedCertConfigMapName))
+			Expect(dpComplianceServer.Spec.Template.Spec.Volumes[1].Name).To(Equal("tigera-ca-bundle"))
+			Expect(dpComplianceServer.Spec.Template.Spec.Volumes[1].ConfigMap.Name).To(Equal("tigera-ca-bundle"))
 
 			clusterRole := rtest.GetResource(resources, "tigera-compliance-server", "", rbac, "v1", "ClusterRole").(*rbacv1.ClusterRole)
 			Expect(clusterRole.Rules).To(ConsistOf([]rbacv1.PolicyRule{
@@ -379,6 +396,11 @@ var _ = Describe("compliance rendering tests", func() {
 					Resources:     []string{"podsecuritypolicies"},
 					Verbs:         []string{"use"},
 					ResourceNames: []string{"compliance-server"},
+				},
+				{
+					APIGroups: []string{"linseed.tigera.io"},
+					Resources: []string{"compliancereports"},
+					Verbs:     []string{"get"},
 				},
 			}))
 		})
@@ -429,6 +451,7 @@ var _ = Describe("compliance rendering tests", func() {
 				{"tigera-compliance-server", ns, "", "v1", "ServiceAccount"},
 				{"tigera-compliance-server", "", rbac, "v1", "ClusterRoleBinding"},
 				{"tigera-compliance-server", "", rbac, "v1", "ClusterRole"},
+				{"tigera-linseed", ns, rbac, "v1", "RoleBinding"},
 				{"compliance-benchmarker", "", "policy", "v1beta1", "PodSecurityPolicy"},
 				{"compliance-controller", "", "policy", "v1beta1", "PodSecurityPolicy"},
 				{"compliance-reporter", "", "policy", "v1beta1", "PodSecurityPolicy"},
@@ -512,7 +535,7 @@ var _ = Describe("compliance rendering tests", func() {
 			Expect(err).NotTo(HaveOccurred())
 			complianceTLS, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceServerCertSecret, common.OperatorNamespace(), []string{""})
 			Expect(err).NotTo(HaveOccurred())
-			cfg.ComplianceServerCertSecret = complianceTLS
+			cfg.ServerKeyPair = complianceTLS
 			component, err := render.Compliance(cfg)
 			Expect(err).ShouldNot(HaveOccurred())
 			resources, _ := component.Objects()
@@ -584,7 +607,7 @@ var _ = Describe("compliance rendering tests", func() {
 			dsBenchMarker := rtest.GetResource(resources, "compliance-benchmarker", ns, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
 			volumeMounts := dsBenchMarker.Spec.Template.Spec.Containers[0].VolumeMounts
 
-			Expect(len(volumeMounts)).To(Equal(6))
+			Expect(volumeMounts).To(HaveLen(7))
 
 			Expect(volumeMounts[0].Name).To(Equal("var-lib-etcd"))
 			Expect(volumeMounts[0].MountPath).To(Equal("/var/lib/etcd"))
@@ -596,8 +619,10 @@ var _ = Describe("compliance rendering tests", func() {
 			Expect(volumeMounts[3].MountPath).To(Equal("/etc/kubernetes"))
 			Expect(volumeMounts[4].Name).To(Equal("usr-bin"))
 			Expect(volumeMounts[4].MountPath).To(Equal("/usr/local/bin"))
-			Expect(volumeMounts[5].Name).To(Equal(certificatemanagement.TrustedCertConfigMapName))
-			Expect(volumeMounts[5].MountPath).To(Equal(certificatemanagement.TrustedCertVolumeMountPath))
+			Expect(volumeMounts[5].Name).To(Equal("tigera-ca-bundle"))
+			Expect(volumeMounts[5].MountPath).To(Equal("/etc/pki/tls/certs"))
+			Expect(volumeMounts[6].Name).To(Equal("tigera-compliance-benchmarker-tls"))
+			Expect(volumeMounts[6].MountPath).To(Equal("/tigera-compliance-benchmarker-tls"))
 		})
 
 		It("should render benchmarker properly for GKE environments", func() {
@@ -609,7 +634,7 @@ var _ = Describe("compliance rendering tests", func() {
 			dsBenchMarker := rtest.GetResource(resources, "compliance-benchmarker", ns, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
 			volumeMounts := dsBenchMarker.Spec.Template.Spec.Containers[0].VolumeMounts
 
-			Expect(len(volumeMounts)).To(Equal(7))
+			Expect(volumeMounts).To(HaveLen(8))
 
 			Expect(volumeMounts[0].Name).To(Equal("var-lib-etcd"))
 			Expect(volumeMounts[0].MountPath).To(Equal("/var/lib/etcd"))
@@ -621,10 +646,12 @@ var _ = Describe("compliance rendering tests", func() {
 			Expect(volumeMounts[3].MountPath).To(Equal("/etc/kubernetes"))
 			Expect(volumeMounts[4].Name).To(Equal("usr-bin"))
 			Expect(volumeMounts[4].MountPath).To(Equal("/usr/local/bin"))
-			Expect(volumeMounts[5].Name).To(Equal(certificatemanagement.TrustedCertConfigMapName))
-			Expect(volumeMounts[5].MountPath).To(Equal(certificatemanagement.TrustedCertVolumeMountPath))
-			Expect(volumeMounts[6].Name).To(Equal("home-kubernetes"))
-			Expect(volumeMounts[6].MountPath).To(Equal("/home/kubernetes"))
+			Expect(volumeMounts[5].Name).To(Equal("tigera-ca-bundle"))
+			Expect(volumeMounts[5].MountPath).To(Equal("/etc/pki/tls/certs"))
+			Expect(volumeMounts[6].Name).To(Equal("tigera-compliance-benchmarker-tls"))
+			Expect(volumeMounts[6].MountPath).To(Equal("/tigera-compliance-benchmarker-tls"))
+			Expect(volumeMounts[7].Name).To(Equal("home-kubernetes"))
+			Expect(volumeMounts[7].MountPath).To(Equal("/home/kubernetes"))
 		})
 	})
 

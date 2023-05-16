@@ -1,4 +1,4 @@
-// Copyright (c) 2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2023 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ const TigeraComponentDefaultDenyPolicyName = TigeraComponentPolicyPrefix + "defa
 var TCPProtocol = numorstring.ProtocolFromString(numorstring.ProtocolTCP)
 var UDPProtocol = numorstring.ProtocolFromString(numorstring.ProtocolUDP)
 var HighPrecedenceOrder = 1.0
+var AfterHighPrecendenceOrder = 10.0
 
 // AppendDNSEgressRules appends a rule to the provided slice that allows DNS egress. The appended rule utilizes label selectors and ports.
 func AppendDNSEgressRules(egressRules []v3.Rule, openShift bool) []v3.Rule {
@@ -187,6 +188,10 @@ var KubeAPIServerServiceSelectorEntityRule = v3.EntityRule{
 var ESGatewayEntityRule = CreateEntityRule("tigera-elasticsearch", "tigera-secure-es-gateway", 5554)
 var ESGatewaySourceEntityRule = CreateSourceEntityRule("tigera-elasticsearch", "tigera-secure-es-gateway")
 var ESGatewayServiceSelectorEntityRule = CreateServiceSelectorEntityRule("tigera-elasticsearch", "tigera-secure-es-gateway-http")
+
+var LinseedEntityRule = CreateEntityRule("tigera-elasticsearch", "tigera-linseed", 8444)
+var LinseedSourceEntityRule = CreateSourceEntityRule("tigera-elasticsearch", "tigera-linseed")
+var LinseedServiceSelectorEntityRule = CreateServiceSelectorEntityRule("tigera-elasticsearch", "tigera-linseed")
 
 const PrometheusSelector = "(app == 'prometheus' && prometheus == 'calico-node-prometheus') || (app.kubernetes.io/name == 'prometheus' && prometheus == 'calico-node-prometheus')"
 

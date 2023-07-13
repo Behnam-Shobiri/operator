@@ -159,13 +159,14 @@ func (c *nodeComponent) ResolveImages(is *operatorv1.ImageSet) error {
 		c.nodeImage = appendIfErr(components.GetReference(components.ComponentTigeraNode, reg, path, prefix, is))
 		c.flexvolImage = appendIfErr(components.GetReference(components.ComponentFlexVolumePrivate, reg, path, prefix, is))
 	} else {
+		c.flexvolImage = appendIfErr(components.GetReference(components.ComponentFlexVolume, reg, path, prefix, is))
 		if operatorv1.IsFIPSModeEnabled(c.cfg.Installation.FIPSMode) {
 			c.cniImage = appendIfErr(components.GetReference(components.ComponentCalicoCNIFIPS, reg, path, prefix, is))
+			c.nodeImage = appendIfErr(components.GetReference(components.ComponentCalicoNodeFIPS, reg, path, prefix, is))
 		} else {
 			c.cniImage = appendIfErr(components.GetReference(components.ComponentCalicoCNI, reg, path, prefix, is))
+			c.nodeImage = appendIfErr(components.GetReference(components.ComponentCalicoNode, reg, path, prefix, is))
 		}
-		c.nodeImage = appendIfErr(components.GetReference(components.ComponentCalicoNode, reg, path, prefix, is))
-		c.flexvolImage = appendIfErr(components.GetReference(components.ComponentFlexVolume, reg, path, prefix, is))
 	}
 
 	if len(errMsgs) != 0 {
@@ -229,6 +230,14 @@ func (c *nodeComponent) Objects() ([]client.Object, []client.Object) {
 	// This controller creates the cluster role for any pod in the cluster that requires certificate management.
 	if c.cfg.Installation.CertificateManagement != nil {
 		objs = append(objs, certificatemanagement.CSRClusterRole())
+	}
+
+	if c.cfg.MigrateNamespaces {
+		objs = append(objs, migration.ClusterRoleForKubeSystemNode())
+		objs = append(objs, migration.ClusterRoleBindingForKubeSystemNode())
+	} else {
+		objsToDelete = append(objsToDelete, migration.ClusterRoleForKubeSystemNode())
+		objsToDelete = append(objsToDelete, migration.ClusterRoleBindingForKubeSystemNode())
 	}
 
 	if c.cfg.Terminating {
@@ -718,7 +727,7 @@ func (c *nodeComponent) nodeCNIConfigMap() *corev1.ConfigMap {
 	config := fmt.Sprintf(`{
 			  "name": "k8s-pod-network",
 			  "cniVersion": "0.3.1",
-			  "plugins": %s 
+			  "plugins": %s
 			}`, string(pluginsArray))
 
 	return &corev1.ConfigMap{
@@ -799,7 +808,7 @@ func (c *nodeComponent) birdTemplateConfigMap() *corev1.ConfigMap {
 }
 
 // clusterAdminClusterRoleBinding returns a ClusterRoleBinding for DockerEE to give
-// the cluster-admin role to calico-node, this is needed for calico-node to be
+// the cluster-admin role to calico-node and calico-cni-plugin, this is needed for calico-node/calico-cni-plugin to be
 // able to use hostNetwork in Docker Enterprise.
 func (c *nodeComponent) clusterAdminClusterRoleBinding() *rbacv1.ClusterRoleBinding {
 	crb := &rbacv1.ClusterRoleBinding{
@@ -817,6 +826,11 @@ func (c *nodeComponent) clusterAdminClusterRoleBinding() *rbacv1.ClusterRoleBind
 			{
 				Kind:      "ServiceAccount",
 				Name:      CalicoNodeObjectName,
+				Namespace: common.CalicoNamespace,
+			},
+			{
+				Kind:      "ServiceAccount",
+				Name:      CalicoCNIPluginObjectName,
 				Namespace: common.CalicoNamespace,
 			},
 		},
@@ -1636,15 +1650,6 @@ func (c *nodeComponent) nodeEnvVars() []corev1.EnvVar {
 	case operatorv1.ProviderOpenShift:
 		// For Openshift, we need special configuration since our default port is already in use.
 		nodeEnv = append(nodeEnv, corev1.EnvVar{Name: "FELIX_HEALTHPORT", Value: "9199"})
-		if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
-			// We also need to configure a non-default trusted DNS server, since there's no kube-dns.
-			nodeEnv = append(nodeEnv, corev1.EnvVar{Name: "FELIX_DNSTRUSTEDSERVERS", Value: "k8s-service:openshift-dns/dns-default"})
-		}
-	case operatorv1.ProviderRKE2:
-		// For RKE2, configure a non-default trusted DNS server, as the DNS service is not named "kube-dns".
-		if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
-			nodeEnv = append(nodeEnv, corev1.EnvVar{Name: "FELIX_DNSTRUSTEDSERVERS", Value: "k8s-service:kube-system/rke2-coredns-rke2-coredns"})
-		}
 	// For AKS/AzureVNET and EKS/VPCCNI, we must explicitly ask felix to add host IP's to wireguard ifaces
 	case operatorv1.ProviderAKS:
 		if c.cfg.Installation.CNI.Type == operatorv1.PluginAzureVNET {

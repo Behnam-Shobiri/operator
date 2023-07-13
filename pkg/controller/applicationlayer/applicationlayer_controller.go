@@ -172,7 +172,7 @@ func (r *ReconcileApplicationLayer) Reconcile(ctx context.Context, request recon
 	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 	reqLogger.Info("Reconciling ApplicationLayer")
 
-	applicationLayer, err := getApplicationLayer(ctx, r.client)
+	instance, err := getApplicationLayer(ctx, r.client)
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
@@ -190,7 +190,7 @@ func (r *ReconcileApplicationLayer) Reconcile(ctx context.Context, request recon
 	}
 	r.status.OnCRFound()
 	// SetMetaData in the TigeraStatus such as observedGenerations.
-	defer r.status.SetMetaData(&applicationLayer.ObjectMeta)
+	defer r.status.SetMetaData(&instance.ObjectMeta)
 
 	// Changes for updating application layer status conditions.
 	if request.Name == ResourceName && request.Namespace == "" {
@@ -199,26 +199,24 @@ func (r *ReconcileApplicationLayer) Reconcile(ctx context.Context, request recon
 		if err != nil {
 			return reconcile.Result{}, err
 		}
-		applicationLayer.Status.Conditions = status.UpdateStatusCondition(applicationLayer.Status.Conditions, ts.Status.Conditions)
-		if err := r.client.Status().Update(ctx, applicationLayer); err != nil {
+		instance.Status.Conditions = status.UpdateStatusCondition(instance.Status.Conditions, ts.Status.Conditions)
+		if err := r.client.Status().Update(ctx, instance); err != nil {
 			log.WithValues("reason", err).Info("Failed to create ApplicationLayer status conditions.")
 			return reconcile.Result{}, err
 		}
 	}
 
-	preDefaultPatchFrom := client.MergeFrom(applicationLayer.DeepCopy())
+	preDefaultPatchFrom := client.MergeFrom(instance.DeepCopy())
 
-	updateApplicationLayerWithDefaults(applicationLayer)
+	updateApplicationLayerWithDefaults(instance)
 
-	err = validateApplicationLayer(applicationLayer)
-
-	if err != nil {
+	if err = validateApplicationLayer(instance); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceValidationError, "", err, reqLogger)
 		return reconcile.Result{}, nil
 	}
 
 	// Write the application layer back to the datastore, so the controllers depending on this can reconcile.
-	if err = r.client.Patch(ctx, applicationLayer, preDefaultPatchFrom); err != nil {
+	if err = r.client.Patch(ctx, instance, preDefaultPatchFrom); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Failed to write defaults to applicationLayer", err, reqLogger)
 		return reconcile.Result{}, err
 	}
@@ -251,16 +249,14 @@ func (r *ReconcileApplicationLayer) Reconcile(ctx context.Context, request recon
 	}
 
 	// Patch felix configuration if necessary.
-	err = r.patchFelixConfiguration(ctx, applicationLayer)
-
-	if err != nil {
+	if err = r.patchFelixConfiguration(ctx, instance); err != nil {
 		r.status.SetDegraded(operatorv1.ResourcePatchError, "Error patching felix configuration", err, reqLogger)
 		return reconcile.Result{}, err
 	}
 
 	var passthroughModSecurityRuleSet bool
 	var modSecurityRuleSet *corev1.ConfigMap
-	if r.isWAFEnabled(&applicationLayer.Spec) {
+	if r.isWAFEnabled(&instance.Spec) {
 		if modSecurityRuleSet, passthroughModSecurityRuleSet, err = r.getModSecurityRuleSet(ctx); err != nil {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Error getting Web Application Firewall ModSecurity rule set", err, reqLogger)
 			return reconcile.Result{}, err
@@ -271,22 +267,24 @@ func (r *ReconcileApplicationLayer) Reconcile(ctx context.Context, request recon
 		}
 	}
 
-	lcSpec := applicationLayer.Spec.LogCollection
+	lcSpec := instance.Spec.LogCollection
 	config := &applicationlayer.Config{
 		PullSecrets:            pullSecrets,
 		Installation:           installation,
 		OsType:                 rmeta.OSTypeLinux,
-		WAFEnabled:             r.isWAFEnabled(&applicationLayer.Spec),
-		LogsEnabled:            r.isLogsCollectionEnabled(&applicationLayer.Spec),
-		ALPEnabled:             r.isALPEnabled(&applicationLayer.Spec),
+		WAFEnabled:             r.isWAFEnabled(&instance.Spec),
+		LogsEnabled:            r.isLogsCollectionEnabled(&instance.Spec),
+		ALPEnabled:             r.isALPEnabled(&instance.Spec),
 		LogRequestsPerInterval: lcSpec.LogRequestsPerInterval,
 		LogIntervalSeconds:     lcSpec.LogIntervalSeconds,
 		ModSecurityConfigMap:   modSecurityRuleSet,
+		UseRemoteAddressXFF:    instance.Spec.EnvoySettings.UseRemoteAddress,
+		NumTrustedHopsXFF:      instance.Spec.EnvoySettings.XFFNumTrustedHops,
 		UsePSP:                 r.usePSP,
 	}
 	component := applicationlayer.ApplicationLayer(config)
 
-	ch := utils.NewComponentHandler(log, r.client, r.scheme, applicationLayer)
+	ch := utils.NewComponentHandler(log, r.client, r.scheme, instance)
 
 	if err = imageset.ApplyImageSet(ctx, r.client, variant, component); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error with images from ImageSet", err, reqLogger)
@@ -317,8 +315,8 @@ func (r *ReconcileApplicationLayer) Reconcile(ctx context.Context, request recon
 	}
 
 	// Everything is available - update the CRD status.
-	applicationLayer.Status.State = operatorv1.TigeraStatusReady
-	if err = r.client.Status().Update(ctx, applicationLayer); err != nil {
+	instance.Status.State = operatorv1.TigeraStatusReady
+	if err = r.client.Status().Update(ctx, instance); err != nil {
 		return reconcile.Result{}, err
 	}
 
@@ -358,6 +356,13 @@ func updateApplicationLayerWithDefaults(al *operatorv1.ApplicationLayer) {
 
 	if al.Spec.ApplicationLayerPolicy == nil {
 		al.Spec.ApplicationLayerPolicy = &defaultApplicationLayerPolicyStatusType
+	}
+
+	if al.Spec.EnvoySettings == nil {
+		al.Spec.EnvoySettings = &operatorv1.EnvoySettings{
+			UseRemoteAddress:  false,
+			XFFNumTrustedHops: 0,
+		}
 	}
 }
 
@@ -516,58 +521,47 @@ func (r *ReconcileApplicationLayer) getTProxyMode(al *operatorv1.ApplicationLaye
 // patchFelixConfiguration takes all application layer specs as arguments and patches felix config.
 // If at least one of the specs requires TPROXYMode as "Enabled" it'll be patched as "Enabled" otherwise it is "Disabled".
 func (r *ReconcileApplicationLayer) patchFelixConfiguration(ctx context.Context, al *operatorv1.ApplicationLayer) error {
-	// Fetch any existing default FelixConfiguration object.
-	fc := &crdv1.FelixConfiguration{}
-	err := r.client.Get(ctx, types.NamespacedName{Name: "default"}, fc)
-	if err != nil && !apierrors.IsNotFound(err) {
-		r.status.SetDegraded(operatorv1.ResourceReadError, "Unable to read FelixConfiguration", err, log)
-		return err
-	}
+	_, err := utils.PatchFelixConfiguration(ctx, r.client, func(fc *crdv1.FelixConfiguration) bool {
+		var tproxyMode crdv1.TPROXYModeOption
+		if ok, v := r.getTProxyMode(al); ok {
+			tproxyMode = v
+		} else {
+			if fc.Spec.TPROXYMode == nil {
+				// Workaround: we'd like to always force the value to be the correct one, matching the operator's
+				// configuration.  However, during an upgrade from a version that predates the TPROXYMode option,
+				// Felix hits a bug and gets confused by the new config parameter, which in turn triggers a restart.
+				// Work around that by relying on Disabled being the default value for the field instead.
+				//
+				// The felix bug was fixed in v3.16, v3.15.1 and v3.14.4; it should be safe to set new config fields
+				// once we know we're only upgrading from those versions and above.
+				return false
+			}
 
-	patchFrom := client.MergeFrom(fc.DeepCopy())
-
-	var tproxyMode crdv1.TPROXYModeOption
-	if ok, v := r.getTProxyMode(al); ok {
-		tproxyMode = v
-	} else {
-		if fc.Spec.TPROXYMode == nil {
-			// Workaround: we'd like to always force the value to be the correct one, matching the operator's
-			// configuration.  However, during an upgrade from a version that predates the TPROXYMode option,
-			// Felix hits a bug and gets confused by the new config parameter, which in turn triggers a restart.
-			// Work around that by relying on Disabled being the default value for the field instead.
-			//
-			// The felix bug was fixed in v3.16, v3.15.1 and v3.14.4; it should be safe to set new config fields
-			// once we know we're only upgrading from those versions and above.
-			return nil
+			// If the mode is already set, fall through to the normal logic, it's safe to force-set the field now.
+			// This also avoids churning the config if a previous version of the operator set it to Disabled already,
+			// we avoid setting it back to nil.
+			tproxyMode = crdv1.TPROXYModeOptionDisabled
 		}
 
-		// If the mode is already set, fall through to the normal logic, it's safe to force-set the field now.
-		// This also avoids churning the config if a previous version of the operator set it to Disabled already,
-		// we avoid setting it back to nil.
-		tproxyMode = crdv1.TPROXYModeOptionDisabled
-	}
+		policySyncPrefix := r.getPolicySyncPathPrefix(&fc.Spec, al)
+		policySyncPrefixSetDesired := fc.Spec.PolicySyncPathPrefix == policySyncPrefix
+		tproxyModeSetDesired := fc.Spec.TPROXYMode != nil && *fc.Spec.TPROXYMode == tproxyMode
 
-	policySyncPrefix := r.getPolicySyncPathPrefix(&fc.Spec, al)
-	policySyncPrefixSetDesired := fc.Spec.PolicySyncPathPrefix == policySyncPrefix
-	tproxyModeSetDesired := fc.Spec.TPROXYMode != nil && *fc.Spec.TPROXYMode == tproxyMode
+		// If tproxy mode is already set to desired state return false to indicate patch not needed.
+		if policySyncPrefixSetDesired && tproxyModeSetDesired {
+			return false
+		}
 
-	// If tproxy mode is already set to desired state return nil.
-	if policySyncPrefixSetDesired && tproxyModeSetDesired {
-		return nil
-	}
+		fc.Spec.TPROXYMode = &tproxyMode
+		fc.Spec.PolicySyncPathPrefix = policySyncPrefix
 
-	fc.Spec.TPROXYMode = &tproxyMode
-	fc.Spec.PolicySyncPathPrefix = policySyncPrefix
+		log.Info(
+			"Patching FelixConfiguration: ",
+			"policySyncPathPrefix", fc.Spec.PolicySyncPathPrefix,
+			"tproxyMode", string(tproxyMode),
+		)
+		return true
+	})
 
-	log.Info(
-		"Patching FelixConfiguration: ",
-		"policySyncPathPrefix", fc.Spec.PolicySyncPathPrefix,
-		"tproxyMode", string(tproxyMode),
-	)
-
-	if err := r.client.Patch(ctx, fc, patchFrom); err != nil {
-		return err
-	}
-
-	return nil
+	return err
 }

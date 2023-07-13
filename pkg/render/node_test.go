@@ -1951,7 +1951,6 @@ var _ = Describe("Node rendering tests", func() {
 					// The OpenShift envvar overrides.
 					{Name: "FELIX_HEALTHPORT", Value: "9199"},
 					{Name: "MULTI_INTERFACE_MODE", Value: operatorv1.MultiInterfaceModeNone.Value()},
-					{Name: "FELIX_DNSTRUSTEDSERVERS", Value: "k8s-service:openshift-dns/dns-default"},
 					{Name: "FIPS_MODE_ENABLED", Value: "false"},
 				}
 				expectedNodeEnv = configureExpectedNodeEnvIPVersions(expectedNodeEnv, defaultInstance, enableIPv4, enableIPv6)
@@ -2046,7 +2045,6 @@ var _ = Describe("Node rendering tests", func() {
 
 					// The RKE2 envvar overrides.
 					{Name: "MULTI_INTERFACE_MODE", Value: operatorv1.MultiInterfaceModeNone.Value()},
-					{Name: "FELIX_DNSTRUSTEDSERVERS", Value: "k8s-service:kube-system/rke2-coredns-rke2-coredns"},
 					{Name: "FIPS_MODE_ENABLED", Value: "false"},
 				}
 				expectedNodeEnv = configureExpectedNodeEnvIPVersions(expectedNodeEnv, defaultInstance, enableIPv4, enableIPv6)
@@ -2237,7 +2235,8 @@ var _ = Describe("Node rendering tests", func() {
 				component := render.Node(&cfg)
 				Expect(component.ResolveImages(nil)).To(BeNil())
 				resources, _ := component.Objects()
-				Expect(len(resources)).To(Equal(defaultNumExpectedResources), fmt.Sprintf("resources are %v", resources))
+				// +2 for temporary calico-node ClusterRole and ClusterRoleBinding during namespace migration
+				Expect(len(resources)).To(Equal(defaultNumExpectedResources+2), fmt.Sprintf("resources are %v", resources))
 
 				// Should render the correct resources.
 				Expect(rtest.GetResource(resources, "calico-node", "calico-system", "", "v1", "ServiceAccount")).ToNot(BeNil())
@@ -3383,6 +3382,7 @@ var _ = Describe("Node rendering tests", func() {
 
 				Expect(nodeDS.Spec.Template.Spec.Containers[0].Name).To(Equal("calico-node"))
 				Expect(nodeDS.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "FIPS_MODE_ENABLED", Value: "true"}))
+				Expect(nodeDS.Spec.Template.Spec.Containers[0].Image).To(ContainSubstring("-fips"))
 
 				Expect(nodeDS.Spec.Template.Spec.InitContainers[1].Name).To(Equal("install-cni"))
 				Expect(nodeDS.Spec.Template.Spec.InitContainers[1].Image).To(ContainSubstring("-fips"))

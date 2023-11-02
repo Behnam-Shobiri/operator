@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,6 +32,8 @@ import (
 
 	opv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
+	"github.com/tigera/operator/pkg/common"
+	"github.com/tigera/operator/pkg/controller/k8sapi"
 	"github.com/tigera/operator/pkg/render"
 
 	apps "k8s.io/api/apps/v1"
@@ -219,6 +221,90 @@ var _ = Describe("AddPeriodicReconcile", func() {
 
 		// In practice, perfect alignment of the timers is unlikely.
 		Expect(periodicReconciles == numPeriods || periodicReconciles == numPeriods-1).To(BeTrue())
+	})
+})
+
+var _ = Describe("PopulateK8sServiceEndPoint", func() {
+	var (
+		c      client.Client
+		ctx    context.Context
+		scheme *runtime.Scheme
+	)
+
+	BeforeEach(func() {
+		// Create a Kubernetes client.
+		scheme = runtime.NewScheme()
+		err := apis.AddToScheme(scheme)
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(v1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+		Expect(apps.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+		Expect(batchv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+
+		c = fake.NewClientBuilder().WithScheme(scheme).Build()
+		ctx = context.Background()
+	})
+
+	It("reads a ConfigMap with KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT.", func() {
+		cmName := render.K8sSvcEndpointConfigMapName
+		cm := &corev1.ConfigMap{}
+		cm.ObjectMeta.Name = cmName
+		cm.ObjectMeta.Namespace = common.OperatorNamespace()
+		cm.Data = map[string]string{}
+		cm.Data["KUBERNETES_SERVICE_HOST"] = "1.2.3.4"
+		cm.Data["KUBERNETES_SERVICE_PORT"] = "5678"
+
+		Expect(c.Create(ctx, cm)).ShouldNot(HaveOccurred())
+
+		err := PopulateK8sServiceEndPoint(c)
+
+		Expect(err).To(BeNil())
+
+		Expect(k8sapi.Endpoint.Host).To(Equal("1.2.3.4"))
+		Expect(k8sapi.Endpoint.Port).To(Equal("5678"))
+	})
+
+	It("does not return error if ConfigMap is not found.", func() {
+		err := PopulateK8sServiceEndPoint(c)
+
+		Expect(err).To(BeNil())
+	})
+
+})
+
+var _ = Describe("Utils ElasticSearch test", func() {
+	var (
+		userPrefix = "test-es-prefix"
+		clusterID  = "clusterUUID"
+		tenantID   = "tenantID"
+	)
+	It("should generate usernames in expected format", func() {
+		generatedESUsername := formatName(userPrefix, clusterID, tenantID)
+		expectedESUsername := fmt.Sprintf("%s_%s_%s", userPrefix, clusterID, tenantID)
+		Expect(generatedESUsername).To(Equal(expectedESUsername))
+	})
+
+	It("should generate Linseed ElasticUser with expected username and roles", func() {
+		linseedUser := LinseedUser(clusterID, tenantID)
+		expectedLinseedESName := fmt.Sprintf("%s_%s_%s", ElasticsearchUserNameLinseed, clusterID, tenantID)
+
+		Expect(linseedUser.Username).To(Equal(expectedLinseedESName))
+		Expect(len(linseedUser.Roles)).To(Equal(1))
+		linseedRole := linseedUser.Roles[0]
+		Expect(linseedRole.Name).To(Equal(expectedLinseedESName))
+
+		expectedLinseedRoleDef := RoleDefinition{
+			Cluster: []string{"monitor", "manage_index_templates", "manage_ilm"},
+			Indices: []RoleIndex{
+				{
+					// Include both single-index and multi-index name formats.
+					Names:      []string{indexPattern("tigera_secure_ee_*", "*", ".*", tenantID), "calico_*"},
+					Privileges: []string{"create_index", "write", "manage", "read"},
+				},
+			},
+		}
+
+		Expect(*linseedRole.Definition).To(Equal(expectedLinseedRoleDef))
 	})
 })
 

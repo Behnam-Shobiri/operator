@@ -76,12 +76,16 @@ var _ = Describe("monitor rendering tests", func() {
 		scheme := runtime.NewScheme()
 		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
 		cli := fake.NewClientBuilder().WithScheme(scheme).Build()
-		certificateManager, err := certificatemanager.Create(cli, nil, dns.DefaultClusterDomain)
+
+		certificateManager, err := certificatemanager.Create(cli, nil, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
+
 		prometheusKeyPair, err = certificateManager.GetOrCreateKeyPair(cli, monitor.PrometheusTLSSecretName, common.OperatorNamespace(), []string{render.FelixCommonName})
 		Expect(err).NotTo(HaveOccurred())
+
 		prometheusClientKeyPair, err := certificateManager.GetOrCreateKeyPair(cli, monitor.PrometheusClientTLSSecretName, common.OperatorNamespace(), []string{render.FelixCommonName})
 		Expect(err).NotTo(HaveOccurred())
+
 		bundle := certificateManager.CreateTrustedBundle()
 		cfg = &monitor.Config{
 			Installation: &operatorv1.InstallationSpec{},
@@ -140,7 +144,7 @@ var _ = Describe("monitor rendering tests", func() {
 
 		for i, expectedRes := range expectedResources {
 			obj := toCreate[i]
-			rtest.ExpectResource(obj, expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+			rtest.ExpectResourceTypeAndObjectMetadata(obj, expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 		}
 
 		Expect(toDelete).To(HaveLen(2))
@@ -149,6 +153,9 @@ var _ = Describe("monitor rendering tests", func() {
 		namespace := rtest.GetResource(toCreate, "tigera-prometheus", "", "", "v1", "Namespace").(*corev1.Namespace)
 		Expect(namespace.Labels["pod-security.kubernetes.io/enforce"]).To(Equal("baseline"))
 		Expect(namespace.Labels["pod-security.kubernetes.io/enforce-version"]).To(Equal("latest"))
+
+		service := rtest.GetResource(toCreate, "prometheus-http-api", "tigera-prometheus", "", "v1", "Service").(*corev1.Service)
+		Expect(service.Labels["k8s-app"]).To(Equal("tigera-prometheus"))
 	})
 
 	It("Should render Prometheus resource Specs correctly", func() {
@@ -317,6 +324,22 @@ var _ = Describe("monitor rendering tests", func() {
 			&corev1.SeccompProfile{
 				Type: corev1.SeccompProfileTypeRuntimeDefault,
 			}))
+		Expect(prometheusObj.Spec.CommonPrometheusFields.Containers).To(HaveLen(1))
+		Expect(prometheusObj.Spec.CommonPrometheusFields.Containers[0].Name).To(Equal("authn-proxy"))
+		Expect(*prometheusObj.Spec.CommonPrometheusFields.Containers[0].SecurityContext.AllowPrivilegeEscalation).To(BeFalse())
+		Expect(*prometheusObj.Spec.CommonPrometheusFields.Containers[0].SecurityContext.Privileged).To(BeFalse())
+		Expect(*prometheusObj.Spec.CommonPrometheusFields.Containers[0].SecurityContext.RunAsGroup).To(BeEquivalentTo(10001))
+		Expect(*prometheusObj.Spec.CommonPrometheusFields.Containers[0].SecurityContext.RunAsNonRoot).To(BeTrue())
+		Expect(*prometheusObj.Spec.CommonPrometheusFields.Containers[0].SecurityContext.RunAsUser).To(BeEquivalentTo(10001))
+		Expect(prometheusObj.Spec.CommonPrometheusFields.Containers[0].SecurityContext.Capabilities).To(Equal(
+			&corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+		))
+		Expect(prometheusObj.Spec.CommonPrometheusFields.Containers[0].SecurityContext.SeccompProfile).To(Equal(
+			&corev1.SeccompProfile{
+				Type: corev1.SeccompProfileTypeRuntimeDefault,
+			}))
 
 		// Prometheus ServiceAccount
 		_, ok = rtest.GetResource(toCreate, "prometheus", common.TigeraPrometheusNamespace, "", "v1", "ServiceAccount").(*corev1.ServiceAccount)
@@ -394,8 +417,15 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(ok).To(BeTrue())
 		Expect(servicemonitorObj.ObjectMeta.Labels).To(HaveLen(1))
 		Expect(servicemonitorObj.ObjectMeta.Labels["team"]).To(Equal("network-operators"))
-		Expect(servicemonitorObj.Spec.Selector.MatchLabels).To(HaveLen(1))
-		Expect(servicemonitorObj.Spec.Selector.MatchLabels["k8s-app"]).To(Equal("fluentd-node"))
+		Expect(servicemonitorObj.Spec.Selector.MatchLabels).To(HaveLen(0))
+		Expect(servicemonitorObj.Spec.Selector.MatchExpressions).To(HaveLen(1))
+		Expect(servicemonitorObj.Spec.Selector.MatchExpressions).To(ConsistOf([]metav1.LabelSelectorRequirement{
+			{
+				Key:      "k8s-app",
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{"fluentd-node", "fluentd-node-windows"},
+			},
+		}))
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames).To(HaveLen(1))
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames[0]).To(Equal("tigera-fluentd"))
 		Expect(servicemonitorObj.Spec.Endpoints).To(HaveLen(1))
@@ -424,8 +454,13 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(ok).To(BeTrue())
 		Expect(servicemonitorObj.ObjectMeta.Labels).To(HaveLen(1))
 		Expect(servicemonitorObj.ObjectMeta.Labels["team"]).To(Equal("network-operators"))
-		Expect(servicemonitorObj.Spec.Selector.MatchLabels).To(HaveLen(1))
-		Expect(servicemonitorObj.Spec.Selector.MatchLabels["k8s-app"]).To(Equal("calico-node"))
+		Expect(servicemonitorObj.Spec.Selector.MatchLabels).To(HaveLen(0))
+		Expect(servicemonitorObj.Spec.Selector.MatchExpressions).To(HaveLen(1))
+		Expect(servicemonitorObj.Spec.Selector.MatchExpressions).To(ConsistOf([]metav1.LabelSelectorRequirement{
+			{Key: "k8s-app",
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{"calico-node", "calico-node-windows"}},
+		}))
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames).To(HaveLen(1))
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames[0]).To(Equal("calico-system"))
 		Expect(servicemonitorObj.Spec.Endpoints).To(HaveLen(2))
@@ -455,8 +490,15 @@ var _ = Describe("monitor rendering tests", func() {
 
 		servicemonitorObj, ok = rtest.GetResource(toCreate, "fluentd-metrics", common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind).(*monitoringv1.ServiceMonitor)
 		Expect(ok).To(BeTrue())
-		Expect(servicemonitorObj.Spec.Selector.MatchLabels).To(HaveLen(1))
-		Expect(servicemonitorObj.Spec.Selector.MatchLabels["k8s-app"]).To(Equal("fluentd-node"))
+		Expect(servicemonitorObj.Spec.Selector.MatchLabels).To(HaveLen(0))
+		Expect(servicemonitorObj.Spec.Selector.MatchExpressions).To(HaveLen(1))
+		Expect(servicemonitorObj.Spec.Selector.MatchExpressions).To(ConsistOf([]metav1.LabelSelectorRequirement{
+			{
+				Key:      "k8s-app",
+				Operator: metav1.LabelSelectorOpIn,
+				Values:   []string{"fluentd-node", "fluentd-node-windows"},
+			},
+		}))
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames).To(HaveLen(1))
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames[0]).To(Equal("tigera-fluentd"))
 		Expect(servicemonitorObj.Spec.Endpoints).To(HaveLen(1))
@@ -587,7 +629,7 @@ var _ = Describe("monitor rendering tests", func() {
 
 		for i, expectedRes := range expectedResources {
 			obj := toCreate[i]
-			rtest.ExpectResource(obj, expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+			rtest.ExpectResourceTypeAndObjectMetadata(obj, expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 		}
 
 		Expect(toDelete).To(HaveLen(2))

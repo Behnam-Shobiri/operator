@@ -63,12 +63,12 @@ var (
 	}
 
 	ComponentEckElasticsearch = component{
-		Version:  "7.17.11",
+		Version:  "7.17.14",
 		Registry: "",
 	}
 
 	ComponentEckKibana = component{
-		Version:  "7.17.11",
+		Version:  "7.17.14",
 		Registry: "",
 	}
 
@@ -146,18 +146,6 @@ var (
 	ComponentIntrusionDetectionController = component{
 		Version:  "master",
 		Image:    "tigera/intrusion-detection-controller",
-		Registry: "",
-	}
-
-	ComponentAnomalyDetectionJobs = component{
-		Version:  "master",
-		Image:    "tigera/anomaly_detection_jobs",
-		Registry: "",
-	}
-
-	ComponentAnomalyDetectionAPI = component{
-		Version:  "master",
-		Image:    "tigera/anomaly-detection-api",
 		Registry: "",
 	}
 
@@ -267,6 +255,12 @@ var (
 		Registry: "",
 	}
 
+	ComponentTigeraNodeWindows = component{
+		Version:  "master",
+		Image:    "tigera/cnx-node-windows",
+		Registry: "",
+	}
+
 	ComponentTigeraTypha = component{
 		Version:  "master",
 		Image:    "tigera/typha",
@@ -285,6 +279,12 @@ var (
 		Registry: "",
 	}
 
+	ComponentTigeraCNIWindows = component{
+		Version:  "master",
+		Image:    "tigera/cni-windows",
+		Registry: "",
+	}
+
 	ComponentCloudControllers = component{
 		Version:  "master",
 		Image:    "tigera/cloud-controllers",
@@ -294,12 +294,6 @@ var (
 	ComponentElasticsearchMetrics = component{
 		Version:  "master",
 		Image:    "tigera/elasticsearch-metrics",
-		Registry: "",
-	}
-
-	ComponentTigeraWindowsUpgrade = component{
-		Version:  "master",
-		Image:    "tigera/calico-windows-upgrade",
 		Registry: "",
 	}
 
@@ -340,8 +334,6 @@ var (
 		ComponentFluentdWindows,
 		ComponentGuardian,
 		ComponentIntrusionDetectionController,
-		ComponentAnomalyDetectionJobs,
-		ComponentAnomalyDetectionAPI,
 		ComponentKibana,
 		ComponentManager,
 		ComponentDex,
@@ -364,7 +356,6 @@ var (
 		ComponentElasticsearchMetrics,
 		ComponentESGateway,
 		ComponentLinseed,
-		ComponentTigeraWindowsUpgrade,
 		ComponentDikastes,
 		ComponentFlexVolumePrivate,
 		ComponentCSIPrivate,

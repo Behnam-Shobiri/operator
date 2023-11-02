@@ -29,19 +29,21 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apiserver/pkg/authentication/serviceaccount"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
+	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/render"
+	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/common/podaffinity"
 	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
-	"github.com/tigera/operator/pkg/render/intrusiondetection/dpi"
 	"github.com/tigera/operator/pkg/render/logstorage/esmetrics"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
@@ -49,8 +51,6 @@ import (
 const (
 	DeploymentName        = "tigera-linseed"
 	ServiceAccountName    = "tigera-linseed"
-	RoleName              = "tigera-linseed"
-	ServiceName           = "tigera-linseed"
 	PodSecurityPolicyName = "tigera-linseed"
 	PolicyName            = networkpolicy.TigeraComponentPolicyPrefix + "linseed-access"
 	PortName              = "tigera-linseed"
@@ -62,7 +62,7 @@ const (
 func Linseed(c *Config) render.Component {
 	return &linseed{
 		cfg:       c,
-		namespace: render.ElasticsearchNamespace,
+		namespace: c.Namespace,
 	}
 }
 
@@ -90,7 +90,7 @@ type Config struct {
 	TokenKeyPair certificatemanagement.KeyPairInterface
 
 	// Trusted bundle to use when validating client certificates.
-	TrustedBundle certificatemanagement.TrustedBundle
+	TrustedBundle certificatemanagement.TrustedBundleRO
 
 	// ClusterDomain to use when building service URLs.
 	ClusterDomain string
@@ -103,6 +103,18 @@ type Config struct {
 
 	// Elastic cluster configuration
 	ESClusterConfig *relasticsearch.ClusterConfig
+
+	// Indicates whether DPI is installed in the cluster or not
+	HasDPIResource bool
+
+	// Namespace to install into.
+	Namespace string
+
+	// Namespaces to which we must bind the Linseed cluster role.
+	BindNamespaces []string
+
+	// Tenant configuration, if running for a particular tenant.
+	Tenant *operatorv1.Tenant
 }
 
 func (l *linseed) ResolveImages(is *operatorv1.ImageSet) error {
@@ -134,7 +146,7 @@ func (l *linseed) Objects() (toCreate, toDelete []client.Object) {
 	toCreate = append(toCreate, l.linseedAllowTigeraPolicy())
 	toCreate = append(toCreate, l.linseedService())
 	toCreate = append(toCreate, l.linseedClusterRole())
-	toCreate = append(toCreate, l.linseedRoleBinding())
+	toCreate = append(toCreate, l.linseedClusterRoleBinding(l.cfg.BindNamespaces))
 	toCreate = append(toCreate, l.linseedServiceAccount())
 	toCreate = append(toCreate, l.linseedDeployment())
 	if l.cfg.UsePSP {
@@ -169,10 +181,39 @@ func (l *linseed) linseedClusterRole() *rbacv1.ClusterRole {
 		},
 		{
 			// Need to be able to list managed clusters
+			// TODO: Move to namespaced role in multi-tenant.
 			APIGroups: []string{"projectcalico.org"},
 			Resources: []string{"managedclusters"},
 			Verbs:     []string{"list", "watch"},
 		},
+		// These permissions are necessary to allow the management cluster to monitor secrets that we want to propagate
+		// through to the managed cluster for identity verification such as the Voltron Linseed public certificate
+		{
+			APIGroups: []string{""},
+			Resources: []string{"secrets"},
+			Verbs:     []string{"get", "list", "watch"},
+		},
+	}
+
+	if l.cfg.Tenant != nil {
+		rules = append(rules, []rbacv1.PolicyRule{
+			{
+				APIGroups:     []string{""},
+				Resources:     []string{"serviceaccounts"},
+				Verbs:         []string{"impersonate"},
+				ResourceNames: []string{render.LinseedServiceName},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"groups"},
+				Verbs:     []string{"impersonate"},
+				ResourceNames: []string{
+					serviceaccount.AllServiceAccountsGroup,
+					"system:authenticated",
+					fmt.Sprintf("%s%s", serviceaccount.ServiceAccountGroupPrefix, render.ElasticsearchNamespace),
+				},
+			},
+		}...)
 	}
 
 	if l.cfg.UsePSP {
@@ -193,25 +234,8 @@ func (l *linseed) linseedClusterRole() *rbacv1.ClusterRole {
 	}
 }
 
-func (l *linseed) linseedRoleBinding() *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: ClusterRoleName,
-		},
-		RoleRef: rbacv1.RoleRef{
-			Kind:     "ClusterRole",
-			Name:     ClusterRoleName,
-			APIGroup: "rbac.authorization.k8s.io",
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      ServiceAccountName,
-				Namespace: l.namespace,
-			},
-		},
-	}
+func (l *linseed) linseedClusterRoleBinding(namespaces []string) client.Object {
+	return rcomponents.ClusterRoleBinding(ClusterRoleName, ClusterRoleName, ServiceAccountName, namespaces)
 }
 
 func (l *linseed) linseedPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
@@ -277,11 +301,18 @@ func (l *linseed) linseedDeployment() *appsv1.Deployment {
 
 	if l.cfg.ManagementCluster {
 		envVars = append(envVars,
-			corev1.EnvVar{Name: "TOKEN_CONTROLLER_ENABLED", Value: "true"},
-			corev1.EnvVar{Name: "LINSEED_TOKEN_KEY", Value: l.cfg.TokenKeyPair.VolumeMountKeyFilePath()},
+			corev1.EnvVar{Name: "MANAGEMENT_OPERATOR_NS", Value: common.OperatorNamespace()},
 		)
-		volumes = append(volumes, l.cfg.TokenKeyPair.Volume())
-		volumeMounts = append(volumeMounts, l.cfg.TokenKeyPair.VolumeMount(l.SupportedOSType()))
+	}
+
+	if l.cfg.Tenant != nil {
+		// If a tenant was provided, set the expected tenant ID and enable the shared index backend.
+		envVars = append(envVars, corev1.EnvVar{Name: "LINSEED_EXPECTED_TENANT_ID", Value: l.cfg.Tenant.Spec.ID})
+		envVars = append(envVars, corev1.EnvVar{Name: "BACKEND", Value: "elastic-single-index"})
+		envVars = append(envVars, corev1.EnvVar{Name: "LINSEED_MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: fmt.Sprintf("https://tigera-manager.%s.svc:9443", l.cfg.Tenant.Namespace)})
+		for _, index := range l.cfg.Tenant.Spec.Indices {
+			envVars = append(envVars, index.EnvVar())
+		}
 	}
 
 	var initContainers []corev1.Container
@@ -291,7 +322,17 @@ func (l *linseed) linseedDeployment() *appsv1.Deployment {
 
 	annotations := l.cfg.TrustedBundle.HashAnnotations()
 	annotations[l.cfg.KeyPair.HashAnnotationKey()] = l.cfg.KeyPair.HashAnnotationValue()
+
 	if l.cfg.TokenKeyPair != nil {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "TOKEN_CONTROLLER_ENABLED", Value: "true"},
+			corev1.EnvVar{Name: "LINSEED_TOKEN_KEY", Value: l.cfg.TokenKeyPair.VolumeMountKeyFilePath()},
+		)
+		volumes = append(volumes, l.cfg.TokenKeyPair.Volume())
+		volumeMounts = append(volumeMounts, l.cfg.TokenKeyPair.VolumeMount(l.SupportedOSType()))
+		if l.cfg.TokenKeyPair.UseCertificateManagement() {
+			initContainers = append(initContainers, l.cfg.TokenKeyPair.InitContainer(l.namespace))
+		}
 		annotations[l.cfg.TokenKeyPair.HashAnnotationKey()] = l.cfg.TokenKeyPair.HashAnnotationValue()
 	}
 	podTemplate := &corev1.PodTemplateSpec{
@@ -322,7 +363,6 @@ func (l *linseed) linseedDeployment() *appsv1.Deployment {
 							},
 						},
 						InitialDelaySeconds: 10,
-						PeriodSeconds:       5,
 					},
 					LivenessProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
@@ -331,7 +371,6 @@ func (l *linseed) linseedDeployment() *appsv1.Deployment {
 							},
 						},
 						InitialDelaySeconds: 10,
-						PeriodSeconds:       5,
 					},
 				},
 			},
@@ -422,7 +461,7 @@ func (l *linseed) linseedAllowTigeraPolicy() *v3.NetworkPolicy {
 		egressRules = append(egressRules, v3.Rule{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: render.ManagerEntityRule,
+			Destination: networkpolicy.Helper(l.cfg.Tenant != nil, l.cfg.Namespace).ManagerEntityRule(),
 		})
 	}
 
@@ -430,6 +469,105 @@ func (l *linseed) linseedAllowTigeraPolicy() *v3.NetworkPolicy {
 	linseedIngressDestinationEntityRule := v3.EntityRule{
 		Ports: networkpolicy.Ports(TargetPort),
 	}
+
+	ingressRules := []v3.Rule{
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      render.FluentdSourceEntityRule,
+			Destination: linseedIngressDestinationEntityRule,
+		},
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      render.EKSLogForwarderEntityRule,
+			Destination: linseedIngressDestinationEntityRule,
+		},
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      render.IntrusionDetectionInstallerSourceEntityRule,
+			Destination: linseedIngressDestinationEntityRule,
+		},
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      render.ESCuratorSourceEntityRule,
+			Destination: linseedIngressDestinationEntityRule,
+		},
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      networkpolicy.Helper(l.cfg.Tenant != nil, l.cfg.Namespace).ManagerSourceEntityRule(),
+			Destination: linseedIngressDestinationEntityRule,
+		},
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      render.ComplianceBenchmarkerSourceEntityRule,
+			Destination: linseedIngressDestinationEntityRule,
+		},
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      render.ComplianceControllerSourceEntityRule,
+			Destination: linseedIngressDestinationEntityRule,
+		},
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      render.ComplianceServerSourceEntityRule,
+			Destination: linseedIngressDestinationEntityRule,
+		},
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      render.ComplianceSnapshotterSourceEntityRule,
+			Destination: linseedIngressDestinationEntityRule,
+		},
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      render.ComplianceReporterSourceEntityRule,
+			Destination: linseedIngressDestinationEntityRule,
+		},
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      render.IntrusionDetectionSourceEntityRule,
+			Destination: linseedIngressDestinationEntityRule,
+		},
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      render.ECKOperatorSourceEntityRule,
+			Destination: linseedIngressDestinationEntityRule,
+		},
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      esmetrics.ESMetricsSourceEntityRule,
+			Destination: linseedIngressDestinationEntityRule,
+		},
+		{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Source:      render.PolicyRecommendationEntityRule,
+			Destination: linseedIngressDestinationEntityRule,
+		},
+	}
+
+	if l.cfg.HasDPIResource {
+		// DPI needs to access Linseed, however, since the is on the host network
+		// it's hard to create specific network policies for it.
+		// Allow all sources, as node CIDRs are not known.
+		ingressRules = append(ingressRules, v3.Rule{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Destination: linseedIngressDestinationEntityRule,
+		})
+	}
+
 	return &v3.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -441,99 +579,8 @@ func (l *linseed) linseedAllowTigeraPolicy() *v3.NetworkPolicy {
 			Tier:     networkpolicy.TigeraComponentTierName,
 			Selector: networkpolicy.KubernetesAppSelector(DeploymentName),
 			Types:    []v3.PolicyType{v3.PolicyTypeIngress, v3.PolicyTypeEgress},
-			Ingress: []v3.Rule{
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      render.FluentdSourceEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      render.EKSLogForwarderEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      render.IntrusionDetectionInstallerSourceEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      render.ESCuratorSourceEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      render.ManagerSourceEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      render.ComplianceBenchmarkerSourceEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      render.ComplianceControllerSourceEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      render.ComplianceServerSourceEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      render.ComplianceSnapshotterSourceEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      render.ComplianceReporterSourceEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      render.IntrusionDetectionSourceEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      render.ECKOperatorSourceEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      esmetrics.ESMetricsSourceEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      dpi.DPISourceEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      render.PolicyRecommendationEntityRule,
-					Destination: linseedIngressDestinationEntityRule,
-				},
-			},
-			Egress: egressRules,
+			Ingress:  ingressRules,
+			Egress:   egressRules,
 		},
 	}
 }

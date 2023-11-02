@@ -15,6 +15,7 @@
 package monitor
 
 import (
+	"crypto/x509"
 	_ "embed"
 	"fmt"
 	"strings"
@@ -45,6 +46,7 @@ import (
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
 	"github.com/tigera/operator/pkg/render/logstorage/esmetrics"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
+	"github.com/tigera/operator/pkg/tls/certkeyusage"
 )
 
 const (
@@ -91,6 +93,11 @@ var alertManagerSelector = fmt.Sprintf(
 	"(app == 'alertmanager' && alertmanager == '%[1]s') || (app.kubernetes.io/name == 'alertmanager' && alertmanager == '%[1]s')",
 	CalicoNodeAlertmanager,
 )
+
+// Register secret/certs that need Server and Client Key usage
+func init() {
+	certkeyusage.SetCertKeyUsage(PrometheusClientTLSSecretName, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth})
+}
 
 func Monitor(cfg *Config) render.Component {
 	return &monitorComponent{
@@ -505,6 +512,7 @@ func (mc *monitorComponent) prometheus() *monitoringv1.Prometheus {
 								},
 							},
 						},
+						SecurityContext: securitycontext.NewNonRootContext(),
 					},
 				},
 				Image:            &mc.prometheusImage,
@@ -676,6 +684,9 @@ func (mc *monitorComponent) prometheusServiceService() *corev1.Service {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      PrometheusServiceServiceName,
 			Namespace: common.TigeraPrometheusNamespace,
+			Labels: map[string]string{
+				"k8s-app": TigeraPrometheusObjectName,
+			},
 		},
 		Spec: corev1.ServiceSpec{
 			Type: corev1.ServiceTypeClusterIP,
@@ -735,7 +746,15 @@ func (mc *monitorComponent) serviceMonitorCalicoNode() *monitoringv1.ServiceMoni
 			Labels:    map[string]string{"team": "network-operators"},
 		},
 		Spec: monitoringv1.ServiceMonitorSpec{
-			Selector:          metav1.LabelSelector{MatchLabels: map[string]string{"k8s-app": "calico-node"}},
+			Selector: metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{
+						Key:      "k8s-app",
+						Operator: metav1.LabelSelectorOpIn,
+						Values:   []string{"calico-node", "calico-node-windows"},
+					},
+				},
+			},
 			NamespaceSelector: monitoringv1.NamespaceSelector{MatchNames: []string{"calico-system"}},
 			Endpoints: []monitoringv1.Endpoint{
 				{
@@ -807,7 +826,15 @@ func (mc *monitorComponent) serviceMonitorFluentd() *monitoringv1.ServiceMonitor
 			Labels:    map[string]string{"team": "network-operators"},
 		},
 		Spec: monitoringv1.ServiceMonitorSpec{
-			Selector:          metav1.LabelSelector{MatchLabels: map[string]string{"k8s-app": "fluentd-node"}},
+			Selector: metav1.LabelSelector{
+				MatchExpressions: []metav1.LabelSelectorRequirement{
+					{
+						Key:      "k8s-app",
+						Operator: metav1.LabelSelectorOpIn,
+						Values:   []string{"fluentd-node", "fluentd-node-windows"},
+					},
+				},
+			},
 			NamespaceSelector: monitoringv1.NamespaceSelector{MatchNames: []string{render.LogCollectorNamespace}},
 			Endpoints: []monitoringv1.Endpoint{
 				{

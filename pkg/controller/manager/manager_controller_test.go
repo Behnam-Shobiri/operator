@@ -16,7 +16,12 @@ package manager
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+
+	kerror "k8s.io/apimachinery/pkg/api/errors"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
@@ -78,14 +83,46 @@ var _ = Describe("Manager controller tests", func() {
 		}
 		err := c.Create(ctx, instance)
 		Expect(err).NotTo(HaveOccurred())
-		instance, err = GetManager(ctx, c)
+		instance, err = GetManager(ctx, c, false, "")
 		Expect(err).NotTo(HaveOccurred())
+	})
+
+	// This test uses a mock client, so ultimately we're just testing that a namespaced `GetManager` call
+	// functions correctly
+	It("should create and query multiple tenant manager instances", func() {
+		tenantANamespace := "tenant-a"
+		instanceA := &operatorv1.Manager{
+			TypeMeta:   metav1.TypeMeta{Kind: "Manager", APIVersion: "operator.tigera.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure", Namespace: tenantANamespace},
+		}
+		err := c.Create(ctx, instanceA)
+		Expect(err).NotTo(HaveOccurred())
+		instance, err = GetManager(ctx, c, true, tenantANamespace)
+		Expect(err).NotTo(HaveOccurred())
+
+		tenantBNamespace := "tenant-b"
+		instanceB := &operatorv1.Manager{
+			TypeMeta:   metav1.TypeMeta{Kind: "Manager", APIVersion: "operator.tigera.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure", Namespace: tenantBNamespace},
+		}
+		err = c.Create(ctx, instanceB)
+		Expect(err).NotTo(HaveOccurred())
+		instance, err = GetManager(ctx, c, true, tenantBNamespace)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("should return expected error when querying namespace that does not contain a manager instance", func() {
+		nsWithoutManager := "non-manager-ns"
+		instance, err := GetManager(ctx, c, true, nsWithoutManager)
+		Expect(kerror.IsNotFound(err)).To(BeTrue())
+		Expect(instance).To(BeNil())
 	})
 
 	Context("cert tests", func() {
 		var r ReconcileManager
 		var cr *operatorv1.Manager
 		var mockStatus *status.MockStatus
+		var certificateManager certificatemanager.CertificateManager
 
 		clusterDomain := "some.domain"
 		expectedDNSNames := dns.GetServiceDNSNames(render.ManagerServiceName, render.ManagerNamespace, clusterDomain)
@@ -107,6 +144,7 @@ var _ = Describe("Manager controller tests", func() {
 			mockStatus.On("SetDegraded", operatorv1.ResourceNotReady, "Waiting for secret 'tigera-packetcapture-server-tls' to become available", mock.Anything, mock.Anything).Return().Maybe()
 			mockStatus.On("SetDegraded", operatorv1.ResourceNotReady, "Waiting for secret 'tigera-secure-linseed-cert' to become available", mock.Anything, mock.Anything).Return().Maybe()
 			mockStatus.On("SetDegraded", operatorv1.ResourceNotReady, "Waiting for secret 'calico-node-prometheus-tls' to become available", mock.Anything, mock.Anything).Return().Maybe()
+			mockStatus.On("SetDegraded", operatorv1.ResourceNotReady, "Waiting for secret internal-manager-tls in namespace tigera-operator to be available", mock.Anything, mock.Anything).Return().Maybe()
 			mockStatus.On("ReadyToMonitor")
 			mockStatus.On("SetMetaData", mock.Anything).Return()
 
@@ -165,12 +203,15 @@ var _ = Describe("Manager controller tests", func() {
 			Expect(c.Create(ctx, relasticsearch.NewClusterConfig("cluster", 1, 1, 1).ConfigMap())).NotTo(HaveOccurred())
 
 			// Provision certificates that the controller will query as part of the test.
-			certificateManager, err := certificatemanager.Create(c, nil, "")
+			var err error
+			certificateManager, err = certificatemanager.Create(c, nil, "", common.OperatorNamespace(), certificatemanager.AllowCACreation())
 			Expect(err).NotTo(HaveOccurred())
+			caSecret := certificateManager.KeyPair().Secret(common.OperatorNamespace())
+			Expect(c.Create(ctx, caSecret)).NotTo(HaveOccurred())
 			complianceKp, err := certificateManager.GetOrCreateKeyPair(c, render.ComplianceServerCertSecret, common.OperatorNamespace(), []string{render.ComplianceServerCertSecret})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, complianceKp.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
-			pcapKp, err := certificateManager.GetOrCreateKeyPair(c, render.PacketCaptureCertSecret, common.OperatorNamespace(), []string{render.PacketCaptureCertSecret})
+			pcapKp, err := certificateManager.GetOrCreateKeyPair(c, render.PacketCaptureServerCert, common.OperatorNamespace(), []string{render.PacketCaptureServerCert})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, pcapKp.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
 			promKp, err := certificateManager.GetOrCreateKeyPair(c, monitor.PrometheusTLSSecretName, common.OperatorNamespace(), []string{monitor.PrometheusTLSSecretName})
@@ -185,6 +226,9 @@ var _ = Describe("Manager controller tests", func() {
 			queryServerKp, err := certificateManager.GetOrCreateKeyPair(c, render.ProjectCalicoAPIServerTLSSecretName(operatorv1.TigeraSecureEnterprise), common.OperatorNamespace(), []string{render.ProjectCalicoAPIServerTLSSecretName(operatorv1.TigeraSecureEnterprise)})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, queryServerKp.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
+			internalKp, err := certificateManager.GetOrCreateKeyPair(c, render.ManagerInternalTLSSecretName, common.OperatorNamespace(), expectedDNSNames)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, internalKp.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
 
 			Expect(c.Create(ctx, &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
@@ -212,6 +256,46 @@ var _ = Describe("Manager controller tests", func() {
 			r.tierWatchReady.MarkAsReady()
 		})
 
+		It("should create an internal manager TLS cert secret", func() {
+			_, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			internalManagerTLSSecret := &corev1.Secret{
+				TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      render.ManagerInternalTLSSecretName,
+					Namespace: common.OperatorNamespace(),
+				},
+			}
+			dnsNames := dns.GetServiceDNSNames(render.ManagerServiceName, render.ManagerNamespace, clusterDomain)
+			dnsNames = append(dnsNames, "localhost")
+			Expect(test.GetResource(c, internalManagerTLSSecret)).To(BeNil())
+			test.VerifyCert(internalManagerTLSSecret, dnsNames...)
+		})
+
+		It("should replace the internal manager TLS cert secret if its DNS names are invalid", func() {
+			// Update the internal manager TLS secret with old DNS name.
+			oldKp, err := certificateManager.GetOrCreateKeyPair(c, render.ManagerInternalTLSSecretName, common.OperatorNamespace(), []string{"tigera-manager.tigera-manager.svc"})
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(c.Update(ctx, oldKp.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
+
+			_, err = r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			internalManagerTLSSecret := &corev1.Secret{
+				TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      render.ManagerInternalTLSSecretName,
+					Namespace: common.OperatorNamespace(),
+				},
+			}
+
+			dnsNames := dns.GetServiceDNSNames(render.ManagerServiceName, render.ManagerNamespace, clusterDomain)
+			dnsNames = append(dnsNames, "localhost")
+			Expect(test.GetResource(c, internalManagerTLSSecret)).To(BeNil())
+			test.VerifyCert(internalManagerTLSSecret, dnsNames...)
+		})
+
 		It("should reconcile if user supplied a manager TLS cert", func() {
 			// Create a manager cert secret.
 			dnsNames := []string{"manager.example.com", "192.168.10.22"}
@@ -231,6 +315,10 @@ var _ = Describe("Manager controller tests", func() {
 
 			Expect(c.Get(ctx, types.NamespacedName{Name: render.ManagerTLSSecretName, Namespace: render.ManagerNamespace}, secret)).ShouldNot(HaveOccurred())
 			Expect(secret.Data).To(Equal(userSecret.Data))
+
+			// Check that the internal secret was copied over to the manager namespace
+			internalSecret := &corev1.Secret{}
+			Expect(c.Get(ctx, types.NamespacedName{Name: render.ManagerInternalTLSSecretName, Namespace: render.ManagerNamespace}, internalSecret)).ShouldNot(HaveOccurred())
 		})
 
 		It("should create a manager TLS cert secret if not provided and add an OwnerReference to it", func() {
@@ -240,6 +328,10 @@ var _ = Describe("Manager controller tests", func() {
 			secret := &corev1.Secret{}
 			Expect(c.Get(ctx, types.NamespacedName{Name: render.ManagerTLSSecretName, Namespace: common.OperatorNamespace()}, secret)).ShouldNot(HaveOccurred())
 			Expect(secret.GetOwnerReferences()).To(HaveLen(1))
+
+			// Check that the internal secret was copied over to the manager namespace
+			internalSecret := &corev1.Secret{}
+			Expect(c.Get(ctx, types.NamespacedName{Name: render.ManagerInternalTLSSecretName, Namespace: render.ManagerNamespace}, internalSecret)).ShouldNot(HaveOccurred())
 		})
 
 		It("should not add OwnerReference to an user supplied manager TLS cert", func() {
@@ -261,6 +353,10 @@ var _ = Describe("Manager controller tests", func() {
 
 			Expect(c.Get(ctx, types.NamespacedName{Name: render.ManagerTLSSecretName, Namespace: render.ManagerNamespace}, secret)).ShouldNot(HaveOccurred())
 			Expect(secret.GetOwnerReferences()).To(HaveLen(1))
+
+			// Check that the internal secret was copied over to the manager namespace
+			internalSecret := &corev1.Secret{}
+			Expect(c.Get(ctx, types.NamespacedName{Name: render.ManagerInternalTLSSecretName, Namespace: render.ManagerNamespace}, internalSecret)).ShouldNot(HaveOccurred())
 		})
 
 		It("should reconcile if operator-managed cert exists and user replaces it with a custom cert", func() {
@@ -272,10 +368,14 @@ var _ = Describe("Manager controller tests", func() {
 			// Verify that the operator managed cert secrets exist. These cert
 			// secrets should have the manager service DNS names plus localhost only.
 			Expect(c.Get(ctx, types.NamespacedName{Name: render.ManagerTLSSecretName, Namespace: common.OperatorNamespace()}, secret)).ShouldNot(HaveOccurred())
-			test.VerifyCert(secret, expectedDNSNames...)
+			test.VerifyCert(secret, []string{"localhost"}...)
 
 			Expect(c.Get(ctx, types.NamespacedName{Name: render.ManagerTLSSecretName, Namespace: render.ManagerNamespace}, secret)).ShouldNot(HaveOccurred())
-			test.VerifyCert(secret, expectedDNSNames...)
+			test.VerifyCert(secret, []string{"localhost"}...)
+
+			// Check that the internal secret was copied over to the manager namespace
+			internalSecret := &corev1.Secret{}
+			Expect(c.Get(ctx, types.NamespacedName{Name: render.ManagerInternalTLSSecretName, Namespace: render.ManagerNamespace}, internalSecret)).ShouldNot(HaveOccurred())
 
 			// Create a custom manager cert secret.
 			dnsNames := []string{"manager.example.com", "192.168.10.22"}
@@ -302,6 +402,27 @@ var _ = Describe("Manager controller tests", func() {
 			Expect(c.Get(ctx, types.NamespacedName{Name: render.ManagerTLSSecretName, Namespace: render.ManagerNamespace}, secret)).ShouldNot(HaveOccurred())
 			test.VerifyCert(secret, dnsNames...)
 		})
+
+		It("should replace the internal manager TLS cert secret if its DNS names are invalid", func() {
+			internalTLS := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      render.ManagerInternalTLSSecretName,
+					Namespace: common.OperatorNamespace(),
+				},
+			}
+			Expect(c.Delete(ctx, internalTLS)).NotTo(HaveOccurred())
+			// Create a internal manager TLS secret with old DNS name.
+			oldKp, err := certificateManager.GetOrCreateKeyPair(c, render.ManagerInternalTLSSecretName, common.OperatorNamespace(), []string{"tigera-manager.tigera-manager.svc"})
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(c.Create(ctx, oldKp.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
+
+			_, err = r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			dnsNames := dns.GetServiceDNSNames(render.ManagerServiceName, render.ManagerNamespace, clusterDomain)
+			Expect(test.GetResource(c, internalTLS)).To(BeNil())
+			test.VerifyCert(internalTLS, dnsNames...)
+		})
 	})
 
 	Context("reconciliation", func() {
@@ -309,6 +430,7 @@ var _ = Describe("Manager controller tests", func() {
 		var mockStatus *status.MockStatus
 		var licenseKey *v3.LicenseKey
 		var compliance *operatorv1.Compliance
+		var certificateManager certificatemanager.CertificateManager
 
 		BeforeEach(func() {
 			// Create an object we can use throughout the test to do the compliance reconcile loops.
@@ -324,6 +446,7 @@ var _ = Describe("Manager controller tests", func() {
 			mockStatus.On("SetDegraded", operatorv1.ResourceNotReady, "Waiting for secret 'calico-node-prometheus-tls' to become available", mock.Anything, mock.Anything).Return().Maybe()
 			mockStatus.On("SetDegraded", operatorv1.ResourceNotReady, "Waiting for secret 'tigera-packetcapture-server-tls' to become available", mock.Anything, mock.Anything).Return().Maybe()
 			mockStatus.On("SetDegraded", operatorv1.ResourceNotReady, "Waiting for secret 'tigera-secure-linseed-cert' to become available", mock.Anything, mock.Anything).Return().Maybe()
+			mockStatus.On("SetDegraded", operatorv1.ResourceNotReady, "Waiting for secret internal-manager-tls in namespace tigera-operator to be available", mock.Anything, mock.Anything).Return().Maybe()
 			mockStatus.On("RemoveCertificateSigningRequests", mock.Anything)
 			mockStatus.On("ReadyToMonitor")
 			mockStatus.On("SetMetaData", mock.Anything).Return()
@@ -386,12 +509,15 @@ var _ = Describe("Manager controller tests", func() {
 			})).NotTo(HaveOccurred())
 
 			// Provision certificates that the controller will query as part of the test.
-			certificateManager, err := certificatemanager.Create(c, nil, "")
+			var err error
+			certificateManager, err = certificatemanager.Create(c, nil, "", common.OperatorNamespace(), certificatemanager.AllowCACreation())
 			Expect(err).NotTo(HaveOccurred())
+			caSecret := certificateManager.KeyPair().Secret(common.OperatorNamespace())
+			Expect(c.Create(ctx, caSecret)).NotTo(HaveOccurred())
 			complianceKp, err := certificateManager.GetOrCreateKeyPair(c, render.ComplianceServerCertSecret, common.OperatorNamespace(), []string{render.ComplianceServerCertSecret})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, complianceKp.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
-			pcapKp, err := certificateManager.GetOrCreateKeyPair(c, render.PacketCaptureCertSecret, common.OperatorNamespace(), []string{render.PacketCaptureCertSecret})
+			pcapKp, err := certificateManager.GetOrCreateKeyPair(c, render.PacketCaptureServerCert, common.OperatorNamespace(), []string{render.PacketCaptureServerCert})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, pcapKp.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
 			promKp, err := certificateManager.GetOrCreateKeyPair(c, monitor.PrometheusTLSSecretName, common.OperatorNamespace(), []string{monitor.PrometheusTLSSecretName})
@@ -406,6 +532,9 @@ var _ = Describe("Manager controller tests", func() {
 			queryServerKp, err := certificateManager.GetOrCreateKeyPair(c, render.ProjectCalicoAPIServerTLSSecretName(operatorv1.TigeraSecureEnterprise), common.OperatorNamespace(), []string{render.ProjectCalicoAPIServerTLSSecretName(operatorv1.TigeraSecureEnterprise)})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, queryServerKp.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
+			internalCertKp, err := certificateManager.GetOrCreateKeyPair(c, render.ManagerInternalTLSSecretName, common.OperatorNamespace(), []string{render.ManagerInternalTLSSecretName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, internalCertKp.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
 
 			Expect(c.Create(ctx, relasticsearch.NewClusterConfig("cluster", 1, 1, 1).ConfigMap())).NotTo(HaveOccurred())
 
@@ -574,6 +703,17 @@ var _ = Describe("Manager controller tests", func() {
 			})
 
 			DescribeTable("should not degrade when compliance CR or compliance license feature is not present/active", func(crPresent, licenseFeatureActive bool) {
+				mockStatus = &status.MockStatus{}
+				mockStatus.On("IsAvailable").Return(true)
+				mockStatus.On("OnCRFound").Return()
+				mockStatus.On("AddDeployments", mock.Anything)
+				mockStatus.On("ClearDegraded")
+				mockStatus.On("SetDegraded", operatorv1.ResourceNotReady, "Compliance is not ready", mock.Anything, mock.Anything).Return().Maybe()
+				mockStatus.On("RemoveCertificateSigningRequests", mock.Anything)
+				mockStatus.On("ReadyToMonitor")
+				mockStatus.On("SetMetaData", mock.Anything).Return()
+				r.status = mockStatus
+
 				if !crPresent {
 					Expect(c.Delete(ctx, compliance)).NotTo(HaveOccurred())
 				}
@@ -620,7 +760,7 @@ var _ = Describe("Manager controller tests", func() {
 					Namespace: "",
 				}})
 				Expect(err).ShouldNot(HaveOccurred())
-				instance, err := GetManager(ctx, r.client)
+				instance, err := GetManager(ctx, r.client, false, "")
 				Expect(err).ShouldNot(HaveOccurred())
 
 				Expect(instance.Status.Conditions).To(HaveLen(1))
@@ -644,7 +784,7 @@ var _ = Describe("Manager controller tests", func() {
 					Namespace: "",
 				}})
 				Expect(err).ShouldNot(HaveOccurred())
-				instance, err := GetManager(ctx, r.client)
+				instance, err := GetManager(ctx, r.client, false, "")
 				Expect(err).ShouldNot(HaveOccurred())
 
 				Expect(instance.Status.Conditions).To(HaveLen(0))
@@ -688,7 +828,7 @@ var _ = Describe("Manager controller tests", func() {
 					Namespace: "",
 				}})
 				Expect(err).ShouldNot(HaveOccurred())
-				instance, err := GetManager(ctx, r.client)
+				instance, err := GetManager(ctx, r.client, false, "")
 				Expect(err).ShouldNot(HaveOccurred())
 
 				Expect(instance.Status.Conditions).To(HaveLen(3))
@@ -710,6 +850,7 @@ var _ = Describe("Manager controller tests", func() {
 				Expect(instance.Status.Conditions[2].Message).To(Equal("Error resolving ImageSet for components"))
 				Expect(instance.Status.Conditions[2].ObservedGeneration).To(Equal(generation))
 			})
+
 			It("should reconcile with creating new status condition and toggle Available to true & others to false", func() {
 				mockStatus.On("RemoveCertificateSigningRequests", mock.Anything).Return()
 				ts := &operatorv1.TigeraStatus{
@@ -748,7 +889,7 @@ var _ = Describe("Manager controller tests", func() {
 					Namespace: "",
 				}})
 				Expect(err).ShouldNot(HaveOccurred())
-				instance, err := GetManager(ctx, r.client)
+				instance, err := GetManager(ctx, r.client, false, "")
 				Expect(err).ShouldNot(HaveOccurred())
 
 				Expect(instance.Status.Conditions).To(HaveLen(3))
@@ -772,5 +913,229 @@ var _ = Describe("Manager controller tests", func() {
 				Expect(instance.Status.Conditions[2].ObservedGeneration).To(Equal(generation))
 			})
 		})
+
+		Context("Multi-cluster reconciliation", func() {
+			It("Should reconcile multi-cluster setup for a management cluster for a single tenant", func() {
+				// Create the ManagementCluster CR needed to configure
+				// a management cluster for a multi-cluster setup
+				managementCluster := &operatorv1.ManagementCluster{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "tigera-secure",
+					},
+				}
+				Expect(c.Create(ctx, managementCluster)).NotTo(HaveOccurred())
+
+				// Create the Manager CR needed to jumpstart the reconciliation
+				// for the manager
+				err := c.Create(ctx, &operatorv1.Manager{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tigera-secure",
+						Namespace: common.OperatorNamespace(),
+					},
+				})
+				Expect(err).NotTo(HaveOccurred())
+
+				// Reconcile Manager
+				_, err = r.Reconcile(ctx, reconcile.Request{})
+				Expect(err).ShouldNot(HaveOccurred())
+
+				deployment := appsv1.Deployment{
+					TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "v1"},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tigera-manager",
+						Namespace: render.ManagerNamespace,
+					},
+				}
+				clusterConnection := corev1.Secret{
+					TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      render.VoltronTunnelSecretName,
+						Namespace: common.OperatorNamespace(),
+					},
+				}
+				clusterConnectionInManagerNs := corev1.Secret{
+					TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      render.VoltronTunnelSecretName,
+						Namespace: render.ManagerNamespace,
+					},
+				}
+
+				// Ensure a deployment was created for the manager
+				err = test.GetResource(c, &deployment)
+				Expect(kerror.IsNotFound(err)).Should(BeFalse())
+
+				// Ensure the secret was created in tigera-operator namespace
+				// and that it configures voltron as a Subject Alternate Name
+				err = test.GetResource(c, &clusterConnection)
+				Expect(kerror.IsNotFound(err)).Should(BeFalse())
+				assertSANs(&clusterConnection, "voltron")
+
+				// Ensure the secret was created in tigera-manager namespace
+				// and that it configures voltron as a Subject Alternate Name
+				err = test.GetResource(c, &clusterConnectionInManagerNs)
+				Expect(kerror.IsNotFound(err)).Should(BeFalse())
+				assertSANs(&clusterConnectionInManagerNs, "voltron")
+			})
+		})
+		Context("Multi-tenant/namespaced reconciliation", func() {
+			tenantANamespace := "tenant-a"
+			tenantBNamespace := "tenant-b"
+			BeforeEach(func() {
+				r.multiTenant = true
+			})
+
+			It("Should reconcile only if a namespace is provided.", func() {
+				// Create the Tenant resources for tenant-a and tenant-b.
+				tenantA := &operatorv1.Tenant{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "default",
+						Namespace: tenantANamespace,
+					},
+					Spec: operatorv1.TenantSpec{ID: "tenant-a"},
+				}
+				Expect(c.Create(ctx, tenantA)).NotTo(HaveOccurred())
+				tenantB := &operatorv1.Tenant{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "default",
+						Namespace: tenantBNamespace,
+					},
+					Spec: operatorv1.TenantSpec{ID: "tenant-b"},
+				}
+				Expect(c.Create(ctx, tenantB)).NotTo(HaveOccurred())
+
+				managementCluster := &operatorv1.ManagementCluster{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "tigera-secure",
+					},
+				}
+				Expect(c.Create(ctx, managementCluster)).NotTo(HaveOccurred())
+
+				certificateManagerTenantA, err := certificatemanager.Create(c, nil, "", tenantANamespace, certificatemanager.AllowCACreation(), certificatemanager.WithTenant(tenantA))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(c.Create(ctx, certificateManagerTenantA.KeyPair().Secret(tenantANamespace)))
+				managerTLSTenantA, err := certificateManagerTenantA.GetOrCreateKeyPair(c, render.ManagerInternalTLSSecretName, tenantANamespace, []string{render.ManagerInternalTLSSecretName})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(c.Create(ctx, managerTLSTenantA.Secret(tenantANamespace))).NotTo(HaveOccurred())
+				Expect(c.Create(ctx, certificateManagerTenantA.CreateTrustedBundle().ConfigMap(tenantANamespace))).NotTo(HaveOccurred())
+
+				certificateManagerTenantB, err := certificatemanager.Create(c, nil, "", tenantBNamespace, certificatemanager.AllowCACreation(), certificatemanager.WithTenant(tenantB))
+				Expect(err).NotTo(HaveOccurred())
+				Expect(c.Create(ctx, certificateManagerTenantB.KeyPair().Secret(tenantBNamespace)))
+				managerTLSTenantB, err := certificateManagerTenantB.GetOrCreateKeyPair(c, render.ManagerInternalTLSSecretName, tenantBNamespace, []string{render.ManagerInternalTLSSecretName})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(c.Create(ctx, managerTLSTenantB.Secret(tenantBNamespace))).NotTo(HaveOccurred())
+				Expect(c.Create(ctx, certificateManagerTenantB.CreateTrustedBundle().ConfigMap(tenantBNamespace))).NotTo(HaveOccurred())
+
+				err = c.Create(ctx, &operatorv1.Manager{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tigera-secure",
+						Namespace: tenantANamespace,
+					},
+				})
+				Expect(err).NotTo(HaveOccurred())
+
+				err = c.Create(ctx, &operatorv1.Manager{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tigera-secure",
+						Namespace: tenantBNamespace,
+					},
+				})
+				Expect(err).NotTo(HaveOccurred())
+
+				_, err = r.Reconcile(ctx, reconcile.Request{})
+				Expect(err).ShouldNot(HaveOccurred())
+
+				tenantADeployment := appsv1.Deployment{
+					TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "v1"},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tigera-manager",
+						Namespace: tenantANamespace,
+					},
+				}
+				tenantAClusterConnection := corev1.Secret{
+					TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      render.VoltronTunnelSecretName,
+						Namespace: tenantANamespace,
+					},
+				}
+
+				tenantBDeployment := appsv1.Deployment{
+					TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "v1"},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tigera-manager",
+						Namespace: tenantBNamespace,
+					},
+				}
+				tenantBClusterConnection := corev1.Secret{
+					TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      render.VoltronTunnelSecretName,
+						Namespace: tenantBNamespace,
+					},
+				}
+
+				// We called Reconcile without specifying a namespace, so neither of these namespaced deployments should
+				// exist yet
+				err = test.GetResource(c, &tenantADeployment)
+				Expect(kerror.IsNotFound(err)).Should(BeTrue())
+
+				err = test.GetResource(c, &tenantBDeployment)
+				Expect(kerror.IsNotFound(err)).Should(BeTrue())
+
+				// Now reconcile only tenant A's namespace and check that its deployment exists, but tenant B's deployment
+				// still hasn't been reconciled so it should still not exist
+				result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: tenantANamespace}})
+				Expect(err).ShouldNot(HaveOccurred())
+				Expect(result).To(Equal(reconcile.Result{}))
+
+				err = test.GetResource(c, &tenantADeployment)
+				Expect(kerror.IsNotFound(err)).Should(BeFalse())
+
+				// Ensure the secret was created in tenant namespace
+				// and that it configures the tenant ID as a Subject Alternate Name
+				err = test.GetResource(c, &tenantAClusterConnection)
+				Expect(kerror.IsNotFound(err)).Should(BeFalse())
+				assertSANs(&tenantAClusterConnection, "tenant-a")
+
+				err = test.GetResource(c, &tenantBDeployment)
+				Expect(kerror.IsNotFound(err)).Should(BeTrue())
+
+				// Now reconcile tenant B's namespace and check that its deployment exists now alongside tenant A's
+				_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: tenantBNamespace}})
+				Expect(err).ShouldNot(HaveOccurred())
+
+				err = test.GetResource(c, &tenantADeployment)
+				Expect(kerror.IsNotFound(err)).Should(BeFalse())
+
+				// Ensure the secret was created in tenant namespace
+				// and that it configures the tenant ID as a Subject Alternate Name
+				err = test.GetResource(c, &tenantBClusterConnection)
+				Expect(kerror.IsNotFound(err)).Should(BeFalse())
+				assertSANs(&tenantBClusterConnection, "tenant-b")
+
+				err = test.GetResource(c, &tenantBDeployment)
+				Expect(kerror.IsNotFound(err)).Should(BeFalse())
+			})
+		})
 	})
 })
+
+func assertSANs(secret *corev1.Secret, expectedSAN string) {
+	var cert *x509.Certificate
+
+	certPEM := secret.Data[corev1.TLSCertKey]
+	keyPEM := secret.Data[corev1.TLSPrivateKeyKey]
+	_, err := tls.X509KeyPair(certPEM, keyPEM)
+	Expect(err).ShouldNot(HaveOccurred())
+
+	block, _ := pem.Decode(certPEM)
+	Expect(err).ShouldNot(HaveOccurred())
+	Expect(block).To(Not(BeNil()))
+
+	cert, err = x509.ParseCertificate(block.Bytes)
+	Expect(err).ShouldNot(HaveOccurred())
+
+	Expect(cert.DNSNames).To(Equal([]string{expectedSAN}))
+}

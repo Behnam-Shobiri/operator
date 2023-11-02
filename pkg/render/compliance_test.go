@@ -61,8 +61,10 @@ var _ = Describe("compliance rendering tests", func() {
 		scheme := runtime.NewScheme()
 		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
 		cli = fake.NewClientBuilder().WithScheme(scheme).Build()
-		certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain)
+
+		certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
+
 		bundle := certificateManager.CreateTrustedBundle()
 		serverKP, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceServerCertSecret, common.OperatorNamespace(), []string{""})
 		Expect(err).NotTo(HaveOccurred())
@@ -74,6 +76,7 @@ var _ = Describe("compliance rendering tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 		snapshotterKP, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceSnapshotterSecret, common.OperatorNamespace(), []string{""})
 		Expect(err).NotTo(HaveOccurred())
+
 		cfg = &render.ComplianceConfiguration{
 			Installation: &operatorv1.InstallationSpec{
 				KubernetesProvider: operatorv1.ProviderNone,
@@ -129,7 +132,6 @@ var _ = Describe("compliance rendering tests", func() {
 				version string
 				kind    string
 			}{
-				{ns, "", "", "v1", "Namespace"},
 				{"allow-tigera.compliance-access", ns, "projectcalico.org", "v3", "NetworkPolicy"},
 				{"allow-tigera.default-deny", ns, "projectcalico.org", "v3", "NetworkPolicy"},
 				{"tigera-compliance-controller", ns, "", "v1", "ServiceAccount"},
@@ -170,18 +172,13 @@ var _ = Describe("compliance rendering tests", func() {
 			Expect(len(resources)).To(Equal(len(expectedResources)))
 
 			for i, expectedRes := range expectedResources {
-				rtest.ExpectResource(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+				rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 			}
 
 			rtest.ExpectGlobalReportType(rtest.GetResource(resources, "inventory", "", "projectcalico.org", "v3", "GlobalReportType"), "inventory")
 			rtest.ExpectGlobalReportType(rtest.GetResource(resources, "network-access", "", "projectcalico.org", "v3", "GlobalReportType"), "network-access")
 			rtest.ExpectGlobalReportType(rtest.GetResource(resources, "policy-audit", "", "projectcalico.org", "v3", "GlobalReportType"), "policy-audit")
 			rtest.ExpectGlobalReportType(rtest.GetResource(resources, "cis-benchmark", "", "projectcalico.org", "v3", "GlobalReportType"), "cis-benchmark")
-
-			// Check the namespace.
-			namespace := rtest.GetResource(resources, "tigera-compliance", "", "", "v1", "Namespace").(*corev1.Namespace)
-			Expect(namespace.Labels["pod-security.kubernetes.io/enforce"]).To(Equal("privileged"))
-			Expect(namespace.Labels["pod-security.kubernetes.io/enforce-version"]).To(Equal("latest"))
 
 			clusterRole := rtest.GetResource(resources, "tigera-compliance-server", "", rbac, "v1", "ClusterRole").(*rbacv1.ClusterRole)
 			Expect(clusterRole.Rules).To(ConsistOf([]rbacv1.PolicyRule{
@@ -292,7 +289,6 @@ var _ = Describe("compliance rendering tests", func() {
 				version string
 				kind    string
 			}{
-				{ns, "", "", "v1", "Namespace"},
 				{"allow-tigera.compliance-access", ns, "projectcalico.org", "v3", "NetworkPolicy"},
 				{"allow-tigera.default-deny", ns, "projectcalico.org", "v3", "NetworkPolicy"},
 				{"tigera-compliance-controller", ns, "", "v1", "ServiceAccount"},
@@ -333,7 +329,7 @@ var _ = Describe("compliance rendering tests", func() {
 			Expect(len(resources)).To(Equal(len(expectedResources)))
 
 			for i, expectedRes := range expectedResources {
-				rtest.ExpectResource(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+				rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 			}
 
 			rtest.ExpectGlobalReportType(rtest.GetResource(resources, "inventory", "", "projectcalico.org", "v3", "GlobalReportType"), "inventory")
@@ -412,7 +408,6 @@ var _ = Describe("compliance rendering tests", func() {
 				version string
 				kind    string
 			}{
-				{ns, "", "", "v1", "Namespace"},
 				{"allow-tigera.compliance-access", ns, "projectcalico.org", "v3", "NetworkPolicy"},
 				{"allow-tigera.default-deny", ns, "projectcalico.org", "v3", "NetworkPolicy"},
 				{"tigera-compliance-controller", ns, "", "v1", "ServiceAccount"},
@@ -451,7 +446,7 @@ var _ = Describe("compliance rendering tests", func() {
 			Expect(len(resources)).To(Equal(len(expectedResources)))
 
 			for i, expectedRes := range expectedResources {
-				rtest.ExpectResource(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+				rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 			}
 
 			rtest.ExpectGlobalReportType(rtest.GetResource(resources, "inventory", "", "projectcalico.org", "v3", "GlobalReportType"), "inventory")
@@ -520,7 +515,8 @@ var _ = Describe("compliance rendering tests", func() {
 			ca, _ := tls.MakeCA(rmeta.DefaultOperatorCASignerName())
 			cert, _, _ := ca.Config.GetPEMBytes() // create a valid pem block
 			cfg.Installation.CertificateManagement = &operatorv1.CertificateManagement{CACert: cert}
-			certificateManager, err := certificatemanager.Create(cli, cfg.Installation, clusterDomain)
+
+			certificateManager, err := certificatemanager.Create(cli, cfg.Installation, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 			Expect(err).NotTo(HaveOccurred())
 
 			complianceTLS, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceServerCertSecret, common.OperatorNamespace(), []string{""})
@@ -554,7 +550,6 @@ var _ = Describe("compliance rendering tests", func() {
 				version string
 				kind    string
 			}{
-				{ns, "", "", "v1", "Namespace"},
 				{"allow-tigera.compliance-access", ns, "projectcalico.org", "v3", "NetworkPolicy"},
 				{"allow-tigera.default-deny", ns, "projectcalico.org", "v3", "NetworkPolicy"},
 				{"tigera-compliance-controller", ns, "", "v1", "ServiceAccount"},
@@ -593,7 +588,7 @@ var _ = Describe("compliance rendering tests", func() {
 			}
 
 			for i, expectedRes := range expectedResources {
-				rtest.ExpectResource(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+				rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 			}
 			Expect(len(resources)).To(Equal(len(expectedResources)))
 

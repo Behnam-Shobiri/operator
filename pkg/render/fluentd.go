@@ -15,8 +15,8 @@
 package render
 
 import (
+	"crypto/x509"
 	"fmt"
-	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -37,6 +37,7 @@ import (
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
+	"github.com/tigera/operator/pkg/tls/certkeyusage"
 	"github.com/tigera/operator/pkg/url"
 )
 
@@ -54,6 +55,7 @@ const (
 	// use-case for this credential. However, it is used on all TLS connections served by fluentd.
 	FluentdPrometheusTLSSecretName           = "tigera-fluentd-prometheus-tls"
 	FluentdMetricsService                    = "fluentd-metrics"
+	FluentdMetricsServiceWindows             = "fluentd-metrics-windows"
 	FluentdMetricsPortName                   = "fluentd-metrics-port"
 	FluentdMetricsPort                       = 9081
 	FluentdPolicyName                        = networkpolicy.TigeraComponentPolicyPrefix + "allow-fluentd-node"
@@ -62,7 +64,6 @@ const (
 	splunkCredentialHashAnnotation           = "hash.operator.tigera.io/splunk-credentials"
 	eksCloudwatchLogCredentialHashAnnotation = "hash.operator.tigera.io/eks-cloudwatch-log-credentials"
 	fluentdDefaultFlush                      = "5s"
-	ElasticsearchLogCollectorUserSecret      = "tigera-fluentd-elasticsearch-access"
 	ElasticsearchEksLogForwarderUserSecret   = "tigera-eks-log-forwarder-elasticsearch-access"
 	EksLogForwarderSecret                    = "tigera-eks-log-forwarder-secret"
 	EksLogForwarderAwsId                     = "aws-id"
@@ -87,15 +88,6 @@ const (
 	LinseedVolumeMountPath = "/var/run/secrets/tigera.io/linseed/"
 	LinseedTokenPath       = "/var/run/secrets/tigera.io/linseed/token"
 
-	probeTimeoutSeconds        int32 = 5
-	probePeriodSeconds         int32 = 5
-	probeWindowsTimeoutSeconds int32 = 10
-	probeWindowsPeriodSeconds  int32 = 10
-
-	// Default failure threshold for probes is 3. For the startupProbe tolerate more failures.
-	probeFailureThreshold        int32 = 3
-	startupProbeFailureThreshold int32 = 10
-
 	fluentdName        = "tigera-fluentd"
 	fluentdWindowsName = "tigera-fluentd-windows"
 
@@ -115,6 +107,11 @@ var FluentdSourceEntityRule = v3.EntityRule{
 
 var EKSLogForwarderEntityRule = networkpolicy.CreateSourceEntityRule(LogCollectorNamespace, eksLogForwarderName)
 
+// Register secret/certs that need Server and Client Key usage
+func init() {
+	certkeyusage.SetCertKeyUsage(FluentdPrometheusTLSSecretName, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth})
+}
+
 type FluentdFilters struct {
 	Flow string
 	DNS  string
@@ -131,17 +128,10 @@ type SplunkCredential struct {
 }
 
 func Fluentd(cfg *FluentdConfiguration) Component {
-	timeout := probeTimeoutSeconds
-	period := probePeriodSeconds
-	if cfg.OSType == rmeta.OSTypeWindows {
-		timeout = probeWindowsTimeoutSeconds
-		period = probeWindowsPeriodSeconds
-	}
-
 	return &fluentdComponent{
 		cfg:          cfg,
-		probeTimeout: timeout,
-		probePeriod:  period,
+		probeTimeout: 10,
+		probePeriod:  60,
 	}
 }
 
@@ -156,12 +146,13 @@ type EksCloudwatchLogConfig struct {
 
 // FluentdConfiguration contains all the config information needed to render the component.
 type FluentdConfiguration struct {
-	LogCollector    *operatorv1.LogCollector
-	ESSecrets       []*corev1.Secret
+	LogCollector   *operatorv1.LogCollector
+	S3Credential   *S3Credential
+	SplkCredential *SplunkCredential
+	Filters        *FluentdFilters
+	// ESClusterConfig is only populated for when EKSConfig
+	// is also defined
 	ESClusterConfig *relasticsearch.ClusterConfig
-	S3Credential    *S3Credential
-	SplkCredential  *SplunkCredential
-	Filters         *FluentdFilters
 	EKSConfig       *EksCloudwatchLogConfig
 	PullSecrets     []*corev1.Secret
 	Installation    *operatorv1.InstallationSpec
@@ -170,6 +161,10 @@ type FluentdConfiguration struct {
 	FluentdKeyPair  certificatemanagement.KeyPairInterface
 	TrustedBundle   certificatemanagement.TrustedBundle
 	ManagedCluster  bool
+
+	// Set if running as a multi-tenant management cluster. Configures the management cluster's
+	// own fluentd daemonset.
+	Tenant *operatorv1.Tenant
 
 	// Whether the cluster supports pod security policies.
 	UsePSP bool
@@ -219,6 +214,16 @@ func (c *fluentdComponent) fluentdNodeName() string {
 		return fluentdNodeWindowsName
 	}
 	return FluentdNodeName
+}
+
+// Use different service names depending on the OS type ("fluentd-metrics"
+// vs "fluentd-metrics-windows") in order to help identify which OS daemonset
+// we are referring to.
+func (c *fluentdComponent) fluentdMetricsServiceName() string {
+	if c.cfg.OSType == rmeta.OSTypeWindows {
+		return FluentdMetricsServiceWindows
+	}
+	return FluentdMetricsService
 }
 
 func (c *fluentdComponent) readinessCmd() []string {
@@ -308,7 +313,6 @@ func (c *fluentdComponent) Objects() ([]client.Object, []client.Object) {
 		objs = append(objs, c.fluentdPodSecurityPolicy())
 	}
 
-	objs = append(objs, secret.ToRuntimeObjects(secret.CopyToNamespace(LogCollectorNamespace, c.cfg.ESSecrets...)...)...)
 	objs = append(objs, c.fluentdServiceAccount())
 	objs = append(objs, c.packetCaptureApiRole(), c.packetCaptureApiRoleBinding())
 	objs = append(objs, c.daemonset())
@@ -475,7 +479,7 @@ func (c *fluentdComponent) daemonset() *appsv1.DaemonSet {
 		initContainers = append(initContainers, c.cfg.FluentdKeyPair.InitContainer(LogCollectorNamespace))
 	}
 
-	podTemplate := relasticsearch.DecorateAnnotations(&corev1.PodTemplateSpec{
+	podTemplate := &corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Annotations: annots,
 		},
@@ -489,7 +493,7 @@ func (c *fluentdComponent) daemonset() *appsv1.DaemonSet {
 			Volumes:                       c.volumes(),
 			ServiceAccountName:            c.fluentdNodeName(),
 		},
-	}, c.cfg.ESClusterConfig, c.cfg.ESSecrets).(*corev1.PodTemplateSpec)
+	}
 
 	ds := &appsv1.DaemonSet{
 		TypeMeta: metav1.TypeMeta{Kind: "DaemonSet", APIVersion: "apps/v1"},
@@ -570,7 +574,7 @@ func (c *fluentdComponent) container() corev1.Container {
 			})
 	}
 
-	return relasticsearch.ContainerDecorateENVVars(corev1.Container{
+	return corev1.Container{
 		Name:            "fluentd",
 		Image:           c.image,
 		ImagePullPolicy: ImagePullPolicy(),
@@ -585,19 +589,19 @@ func (c *fluentdComponent) container() corev1.Container {
 			Name:          "metrics-port",
 			ContainerPort: FluentdMetricsPort,
 		}},
-	}, c.cfg.ESClusterConfig.ClusterName(), ElasticsearchLogCollectorUserSecret, c.cfg.ClusterDomain, c.cfg.OSType)
+	}
 }
 
 func (c *fluentdComponent) metricsService() *corev1.Service {
 	return &corev1.Service{
 		TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      FluentdMetricsService,
+			Name:      c.fluentdMetricsServiceName(),
 			Namespace: LogCollectorNamespace,
-			Labels:    map[string]string{"k8s-app": FluentdNodeName},
+			Labels:    map[string]string{"k8s-app": c.fluentdNodeName()},
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"k8s-app": FluentdNodeName},
+			Selector: map[string]string{"k8s-app": c.fluentdNodeName()},
 			// Important: "None" tells Kubernetes that we want a headless service with
 			// no kube-proxy load balancer.  If we omit this then kube-proxy will render
 			// a huge set of iptables rules for this service since there's an instance
@@ -616,9 +620,16 @@ func (c *fluentdComponent) metricsService() *corev1.Service {
 }
 
 func (c *fluentdComponent) envvars() []corev1.EnvVar {
+	// Determine the namespace in which Linseed is running. For managed and standalone clusters, this is always the elasticsearch
+	// namespace. For multi-tenant management clusters, this may vary.
+	linseedNS := ElasticsearchNamespace
+	if c.cfg.Tenant != nil {
+		linseedNS = c.cfg.Tenant.Namespace
+	}
+
 	envs := []corev1.EnvVar{
 		{Name: "LINSEED_ENABLED", Value: "true"},
-		{Name: "LINSEED_ENDPOINT", Value: relasticsearch.LinseedEndpoint(c.SupportedOSType(), c.cfg.ClusterDomain)},
+		{Name: "LINSEED_ENDPOINT", Value: relasticsearch.LinseedEndpoint(c.SupportedOSType(), c.cfg.ClusterDomain, linseedNS)},
 		{Name: "LINSEED_CA_PATH", Value: c.trustedBundlePath()},
 		{Name: "TLS_KEY_PATH", Value: c.keyPath()},
 		{Name: "TLS_CRT_PATH", Value: c.certPath()},
@@ -628,6 +639,10 @@ func (c *fluentdComponent) envvars() []corev1.EnvVar {
 		{Name: "FLUENTD_ES_SECURE", Value: "true"},
 		{Name: "NODENAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}}},
 		{Name: "LINSEED_TOKEN", Value: c.path(GetLinseedTokenPath(c.cfg.ManagedCluster))},
+	}
+
+	if c.cfg.Tenant != nil {
+		envs = append(envs, corev1.EnvVar{Name: "TENANT_ID", Value: c.cfg.Tenant.Spec.ID})
 	}
 
 	if c.cfg.LogCollector.Spec.AdditionalStores != nil {
@@ -776,29 +791,8 @@ func (c *fluentdComponent) envvars() []corev1.EnvVar {
 		}
 	}
 
-	envs = append(envs,
-		corev1.EnvVar{Name: "ELASTIC_FLOWS_INDEX_REPLICAS", Value: strconv.Itoa(c.cfg.ESClusterConfig.Replicas())},
-		corev1.EnvVar{Name: "ELASTIC_DNS_INDEX_REPLICAS", Value: strconv.Itoa(c.cfg.ESClusterConfig.Replicas())},
-		corev1.EnvVar{Name: "ELASTIC_AUDIT_INDEX_REPLICAS", Value: strconv.Itoa(c.cfg.ESClusterConfig.Replicas())},
-		corev1.EnvVar{Name: "ELASTIC_BGP_INDEX_REPLICAS", Value: strconv.Itoa(c.cfg.ESClusterConfig.Replicas())},
-		corev1.EnvVar{Name: "ELASTIC_WAF_INDEX_REPLICAS", Value: strconv.Itoa(c.cfg.ESClusterConfig.Replicas())},
-		corev1.EnvVar{Name: "ELASTIC_L7_INDEX_REPLICAS", Value: strconv.Itoa(c.cfg.ESClusterConfig.Replicas())},
-		corev1.EnvVar{Name: "ELASTIC_RUNTIME_INDEX_REPLICAS", Value: strconv.Itoa(c.cfg.ESClusterConfig.Replicas())},
+	envs = append(envs, corev1.EnvVar{Name: "CA_CRT_PATH", Value: c.trustedBundlePath()})
 
-		corev1.EnvVar{Name: "ELASTIC_FLOWS_INDEX_SHARDS", Value: strconv.Itoa(c.cfg.ESClusterConfig.FlowShards())},
-		corev1.EnvVar{Name: "ELASTIC_DNS_INDEX_SHARDS", Value: strconv.Itoa(c.cfg.ESClusterConfig.Shards())},
-		corev1.EnvVar{Name: "ELASTIC_AUDIT_INDEX_SHARDS", Value: strconv.Itoa(c.cfg.ESClusterConfig.Shards())},
-		corev1.EnvVar{Name: "ELASTIC_BGP_INDEX_SHARDS", Value: strconv.Itoa(c.cfg.ESClusterConfig.Shards())},
-		corev1.EnvVar{Name: "ELASTIC_WAF_INDEX_SHARDS", Value: strconv.Itoa(c.cfg.ESClusterConfig.Shards())},
-		corev1.EnvVar{Name: "ELASTIC_L7_INDEX_SHARDS", Value: strconv.Itoa(c.cfg.ESClusterConfig.Shards())},
-		corev1.EnvVar{Name: "ELASTIC_RUNTIME_INDEX_SHARDS", Value: strconv.Itoa(c.cfg.ESClusterConfig.Shards())},
-	)
-
-	if c.SupportedOSType() != rmeta.OSTypeWindows {
-		envs = append(envs,
-			corev1.EnvVar{Name: "CA_CRT_PATH", Value: c.cfg.TrustedBundle.MountPath()},
-		)
-	}
 	return envs
 }
 
@@ -833,9 +827,10 @@ func (c *fluentdComponent) startup() *corev1.Probe {
 				Command: c.livenessCmd(),
 			},
 		},
-		TimeoutSeconds:   c.probeTimeout * 2,
-		PeriodSeconds:    c.probePeriod * 2,
-		FailureThreshold: startupProbeFailureThreshold,
+		TimeoutSeconds: c.probeTimeout,
+		PeriodSeconds:  c.probePeriod,
+		// tolerate more failures for the startup probe
+		FailureThreshold: 10,
 	}
 }
 
@@ -846,9 +841,8 @@ func (c *fluentdComponent) liveness() *corev1.Probe {
 				Command: c.livenessCmd(),
 			},
 		},
-		TimeoutSeconds:   c.probeTimeout,
-		PeriodSeconds:    c.probePeriod,
-		FailureThreshold: probeFailureThreshold,
+		TimeoutSeconds: c.probeTimeout,
+		PeriodSeconds:  c.probePeriod,
 	}
 }
 
@@ -859,9 +853,8 @@ func (c *fluentdComponent) readiness() *corev1.Probe {
 				Command: c.readinessCmd(),
 			},
 		},
-		TimeoutSeconds:   c.probeTimeout,
-		PeriodSeconds:    c.probePeriod,
-		FailureThreshold: probeFailureThreshold,
+		TimeoutSeconds: c.probeTimeout,
+		PeriodSeconds:  c.probePeriod,
 	}
 }
 
@@ -995,6 +988,14 @@ func (c *fluentdComponent) fluentdClusterRole() *rbacv1.ClusterRole {
 			ResourceNames: []string{c.fluentdName()},
 		})
 	}
+	if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderOpenShift {
+		role.Rules = append(role.Rules, rbacv1.PolicyRule{
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
+			Verbs:         []string{"use"},
+			ResourceNames: []string{PSSPrivileged},
+		})
+	}
 	return role
 }
 
@@ -1075,7 +1076,7 @@ func (c *fluentdComponent) eksLogForwarderDeployment() *appsv1.Deployment {
 					Tolerations:        c.cfg.Installation.ControlPlaneTolerations,
 					ServiceAccountName: eksLogForwarderName,
 					ImagePullSecrets:   secret.GetReferenceList(c.cfg.PullSecrets),
-					InitContainers: []corev1.Container{relasticsearch.ContainerDecorateENVVars(corev1.Container{
+					InitContainers: []corev1.Container{relasticsearch.ContainerDecorate(corev1.Container{
 						Name:            eksLogForwarderName + "-startup",
 						Image:           c.image,
 						ImagePullPolicy: ImagePullPolicy(),
@@ -1084,7 +1085,7 @@ func (c *fluentdComponent) eksLogForwarderDeployment() *appsv1.Deployment {
 						SecurityContext: c.securityContext(false),
 						VolumeMounts:    c.eksLogForwarderVolumeMounts(),
 					}, c.cfg.ESClusterConfig.ClusterName(), ElasticsearchEksLogForwarderUserSecret, c.cfg.ClusterDomain, c.cfg.OSType)},
-					Containers: []corev1.Container{relasticsearch.ContainerDecorateENVVars(corev1.Container{
+					Containers: []corev1.Container{relasticsearch.ContainerDecorate(corev1.Container{
 						Name:            eksLogForwarderName,
 						Image:           c.image,
 						ImagePullPolicy: ImagePullPolicy(),

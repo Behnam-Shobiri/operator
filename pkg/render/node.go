@@ -405,7 +405,7 @@ func (c *nodeComponent) nodeRole() *rbacv1.ClusterRole {
 				// Used for creating service account tokens to be used by the CNI plugin.
 				APIGroups:     []string{""},
 				Resources:     []string{"serviceaccounts/token"},
-				ResourceNames: []string{"calico-cni-plugin"},
+				ResourceNames: []string{CalicoCNIPluginObjectName},
 				Verbs:         []string{"create"},
 			},
 			{
@@ -506,6 +506,7 @@ func (c *nodeComponent) nodeRole() *rbacv1.ClusterRole {
 				APIGroups: []string{"crd.projectcalico.org"},
 				Resources: []string{
 					"externalnetworks",
+					"egressgatewaypolicies",
 					"licensekeys",
 					"remoteclusterconfigurations",
 					"stagedglobalnetworkpolicies",
@@ -542,6 +543,14 @@ func (c *nodeComponent) nodeRole() *rbacv1.ClusterRole {
 			Resources:     []string{"podsecuritypolicies"},
 			Verbs:         []string{"use"},
 			ResourceNames: []string{common.NodeDaemonSetName},
+		})
+	}
+	if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderOpenShift {
+		role.Rules = append(role.Rules, rbacv1.PolicyRule{
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
+			Verbs:         []string{"use"},
+			ResourceNames: []string{PSSPrivileged},
 		})
 	}
 	return role
@@ -590,7 +599,6 @@ func (c *nodeComponent) cniPluginRole() *rbacv1.ClusterRole {
 			},
 		},
 	}
-
 	return role
 }
 
@@ -1647,9 +1655,6 @@ func (c *nodeComponent) nodeEnvVars() []corev1.EnvVar {
 
 	// Configure provider specific environment variables here.
 	switch c.cfg.Installation.KubernetesProvider {
-	case operatorv1.ProviderOpenShift:
-		// For Openshift, we need special configuration since our default port is already in use.
-		nodeEnv = append(nodeEnv, corev1.EnvVar{Name: "FELIX_HEALTHPORT", Value: "9199"})
 	// For AKS/AzureVNET and EKS/VPCCNI, we must explicitly ask felix to add host IP's to wireguard ifaces
 	case operatorv1.ProviderAKS:
 		if c.cfg.Installation.CNI.Type == operatorv1.PluginAzureVNET {
@@ -1741,9 +1746,8 @@ func (c *nodeComponent) nodeLivenessReadinessProbes() (*corev1.Probe, *corev1.Pr
 	rp := &corev1.Probe{
 		ProbeHandler: corev1.ProbeHandler{Exec: &corev1.ExecAction{Command: readinessCmd}},
 		// Set the TimeoutSeconds greater than the default of 1 to allow additional time on loaded nodes.
-		// This timeout should be less than the PeriodSeconds.
-		TimeoutSeconds: 5,
-		PeriodSeconds:  10,
+		// This timeout should be less than the PeriodSeconds (30s in controller/utils/component.go).
+		TimeoutSeconds: 10,
 	}
 	return lp, rp
 }

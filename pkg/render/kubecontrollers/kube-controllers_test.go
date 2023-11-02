@@ -38,7 +38,6 @@ import (
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	"github.com/tigera/operator/pkg/controller/k8sapi"
 	"github.com/tigera/operator/pkg/dns"
-	"github.com/tigera/operator/pkg/render"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	rtest "github.com/tigera/operator/pkg/render/common/test"
 	"github.com/tigera/operator/pkg/render/kubecontrollers"
@@ -49,11 +48,10 @@ import (
 
 var _ = Describe("kube-controllers rendering tests", func() {
 	var (
-		instance                 *operatorv1.InstallationSpec
-		k8sServiceEp             k8sapi.ServiceEndpoint
-		cfg                      kubecontrollers.KubeControllersConfiguration
-		internalManagerTLSSecret certificatemanagement.KeyPairInterface
-		cli                      client.Client
+		instance     *operatorv1.InstallationSpec
+		k8sServiceEp k8sapi.ServiceEndpoint
+		cfg          kubecontrollers.KubeControllersConfiguration
+		cli          client.Client
 	)
 
 	esEnvs := []corev1.EnvVar{
@@ -121,22 +119,22 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		}
 		k8sServiceEp = k8sapi.ServiceEndpoint{}
 
-		// Set up a default config to pass to render.
-
 		scheme := runtime.NewScheme()
 		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
 		cli = fake.NewClientBuilder().WithScheme(scheme).Build()
-		certificateManager, err := certificatemanager.Create(cli, nil, dns.DefaultClusterDomain)
+
+		certificateManager, err := certificatemanager.Create(cli, nil, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
-		internalManagerTLSSecret, err = certificateManager.GetOrCreateKeyPair(cli, render.ManagerInternalTLSSecretName, common.OperatorNamespace(), []string{render.ManagerInternalTLSSecretName})
-		Expect(err).NotTo(HaveOccurred())
+
 		cfg = kubecontrollers.KubeControllersConfiguration{
-			K8sServiceEp:  k8sServiceEp,
-			Installation:  instance,
-			ClusterDomain: dns.DefaultClusterDomain,
-			MetricsPort:   9094,
-			TrustedBundle: certificateManager.CreateTrustedBundle(),
-			UsePSP:        true,
+			K8sServiceEp:      k8sServiceEp,
+			Installation:      instance,
+			ClusterDomain:     dns.DefaultClusterDomain,
+			MetricsPort:       9094,
+			TrustedBundle:     certificateManager.CreateTrustedBundle(),
+			UsePSP:            true,
+			Namespace:         common.CalicoNamespace,
+			BindingNamespaces: []string{common.CalicoNamespace},
 		}
 	})
 
@@ -168,10 +166,12 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		}
 
 		cfg = kubecontrollers.KubeControllersConfiguration{
-			K8sServiceEp:  k8sServiceEp,
-			Installation:  instance,
-			ClusterDomain: dns.DefaultClusterDomain,
-			UsePSP:        true,
+			K8sServiceEp:      k8sServiceEp,
+			Installation:      instance,
+			ClusterDomain:     dns.DefaultClusterDomain,
+			UsePSP:            true,
+			Namespace:         common.CalicoNamespace,
+			BindingNamespaces: []string{common.CalicoNamespace},
 		}
 		component := kubecontrollers.NewCalicoKubeControllers(&cfg)
 		Expect(component.ResolveImages(nil)).To(BeNil())
@@ -181,7 +181,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		// Should render the correct resources.
 		i := 0
 		for _, expectedRes := range expectedResources {
-			rtest.ExpectResource(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+			rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 			i++
 		}
 
@@ -240,7 +240,6 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		}
 
 		instance.Variant = operatorv1.TigeraSecureEnterprise
-		cfg.ManagerInternalSecret = internalManagerTLSSecret
 		cfg.MetricsPort = 9094
 
 		component := kubecontrollers.NewCalicoKubeControllers(&cfg)
@@ -251,7 +250,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		// Should render the correct resources.
 		i := 0
 		for _, expectedRes := range expectedResources {
-			rtest.ExpectResource(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+			rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 			i++
 		}
 
@@ -264,13 +263,8 @@ var _ = Describe("kube-controllers rendering tests", func() {
 			Name: "ENABLED_CONTROLLERS", Value: "node,service,federatedservices",
 		}))
 
-		Expect(len(dp.Spec.Template.Spec.Containers[0].VolumeMounts)).To(Equal(2))
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name).To(Equal(render.ManagerInternalTLSSecretName))
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath).To(Equal("/internal-manager-tls"))
-
-		Expect(len(dp.Spec.Template.Spec.Volumes)).To(Equal(2))
-		Expect(dp.Spec.Template.Spec.Volumes[0].Name).To(Equal(render.ManagerInternalTLSSecretName))
-		Expect(dp.Spec.Template.Spec.Volumes[0].Secret.SecretName).To(Equal(render.ManagerInternalTLSSecretName))
+		Expect(len(dp.Spec.Template.Spec.Containers[0].VolumeMounts)).To(Equal(1))
+		Expect(len(dp.Spec.Template.Spec.Volumes)).To(Equal(1))
 
 		clusterRole := rtest.GetResource(resources, kubecontrollers.KubeControllerRole, "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
 		Expect(len(clusterRole.Rules)).To(Equal(19))
@@ -304,7 +298,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		Expect(len(resources)).To(Equal(len(expectedResources)))
 		// Should render the correct resources.
 		for i, expectedRes := range expectedResources {
-			rtest.ExpectResource(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+			rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 		}
 	})
 
@@ -329,7 +323,6 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		instance.Variant = operatorv1.TigeraSecureEnterprise
 		cfg.LogStorageExists = true
 		cfg.KubeControllersGatewaySecret = &testutils.KubeControllersUserSecret
-		cfg.ManagerInternalSecret = internalManagerTLSSecret
 		cfg.MetricsPort = 9094
 
 		component := kubecontrollers.NewElasticsearchKubeControllers(&cfg)
@@ -340,7 +333,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		// Should render the correct resources.
 		i := 0
 		for _, expectedRes := range expectedResources {
-			rtest.ExpectResource(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+			rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 			i++
 		}
 
@@ -354,17 +347,13 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		}))
 		Expect(envs).To(ContainElements(esEnvs))
 
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts).To(HaveLen(2))
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name).To(Equal(render.ManagerInternalTLSSecretName))
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath).To(Equal("/internal-manager-tls"))
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[1].Name).To(Equal("tigera-ca-bundle"))
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[1].MountPath).To(Equal("/etc/pki/tls/certs"))
+		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts).To(HaveLen(1))
+		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name).To(Equal("tigera-ca-bundle"))
+		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath).To(Equal("/etc/pki/tls/certs"))
 
-		Expect(dp.Spec.Template.Spec.Volumes).To(HaveLen(2))
-		Expect(dp.Spec.Template.Spec.Volumes[0].Name).To(Equal(render.ManagerInternalTLSSecretName))
-		Expect(dp.Spec.Template.Spec.Volumes[0].Secret.SecretName).To(Equal(render.ManagerInternalTLSSecretName))
-		Expect(dp.Spec.Template.Spec.Volumes[1].Name).To(Equal("tigera-ca-bundle"))
-		Expect(dp.Spec.Template.Spec.Volumes[1].ConfigMap.Name).To(Equal("tigera-ca-bundle"))
+		Expect(dp.Spec.Template.Spec.Volumes).To(HaveLen(1))
+		Expect(dp.Spec.Template.Spec.Volumes[0].Name).To(Equal("tigera-ca-bundle"))
+		Expect(dp.Spec.Template.Spec.Volumes[0].ConfigMap.Name).To(Equal("tigera-ca-bundle"))
 
 		clusterRole := rtest.GetResource(resources, kubecontrollers.EsKubeControllerRole, "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
 		Expect(len(clusterRole.Rules)).To(Equal(19))
@@ -395,7 +384,6 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		// Override configuration to match expected Enterprise config.
 		instance.Variant = operatorv1.TigeraSecureEnterprise
 		cfg.ManagementCluster = &operatorv1.ManagementCluster{}
-		cfg.ManagerInternalSecret = internalManagerTLSSecret
 		cfg.MetricsPort = 9094
 
 		component := kubecontrollers.NewCalicoKubeControllers(&cfg)
@@ -406,7 +394,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		// Should render the correct resources.
 		i := 0
 		for _, expectedRes := range expectedResources {
-			rtest.ExpectResource(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+			rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 			i++
 		}
 
@@ -419,14 +407,9 @@ var _ = Describe("kube-controllers rendering tests", func() {
 			Value: "node,service,federatedservices",
 		}))
 
-		Expect(len(dp.Spec.Template.Spec.Containers[0].VolumeMounts)).To(Equal(2))
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name).To(Equal(render.ManagerInternalTLSSecretName))
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath).To(Equal("/internal-manager-tls"))
+		Expect(len(dp.Spec.Template.Spec.Containers[0].VolumeMounts)).To(Equal(1))
 
-		Expect(len(dp.Spec.Template.Spec.Volumes)).To(Equal(2))
-		Expect(dp.Spec.Template.Spec.Volumes[0].Name).To(Equal(render.ManagerInternalTLSSecretName))
-		Expect(dp.Spec.Template.Spec.Volumes[0].Secret.SecretName).To(Equal(render.ManagerInternalTLSSecretName))
-
+		Expect(len(dp.Spec.Template.Spec.Volumes)).To(Equal(1))
 		Expect(dp.Spec.Template.Spec.Containers[0].Image).To(Equal("test-reg/tigera/kube-controllers:" + components.ComponentTigeraKubeControllers.Version))
 	})
 	It("should render all calico-kube-controllers resources for a default configuration using TigeraSecureEnterprise", func() {
@@ -476,16 +459,20 @@ var _ = Describe("kube-controllers rendering tests", func() {
 				},
 			},
 		}
+
 		scheme := runtime.NewScheme()
 		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
 		cli := fake.NewClientBuilder().WithScheme(scheme).Build()
-		certificateManager, err := certificatemanager.Create(cli, nil, dns.DefaultClusterDomain)
+
+		certificateManager, err := certificatemanager.Create(cli, nil, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
+
 		kubeControllerTLS, err = certificateManager.GetOrCreateKeyPair(cli,
 			kubecontrollers.KubeControllerPrometheusTLSSecret,
 			common.OperatorNamespace(),
 			dns.GetServiceDNSNames(kubecontrollers.KubeControllerMetrics, common.CalicoNamespace, dns.DefaultClusterDomain))
 		Expect(err).NotTo(HaveOccurred())
+
 		// Override configuration to match expected Enterprise config.
 		instance.Variant = operatorv1.TigeraSecureEnterprise
 		cfg.MetricsPort = 9094
@@ -499,7 +486,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		// Should render the correct resources.
 		i := 0
 		for _, expectedRes := range expectedResources {
-			rtest.ExpectResource(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+			rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 			i++
 		}
 
@@ -541,7 +528,6 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		cfg.LogStorageExists = true
 		cfg.ManagementCluster = &operatorv1.ManagementCluster{}
 		cfg.KubeControllersGatewaySecret = &testutils.KubeControllersUserSecret
-		cfg.ManagerInternalSecret = internalManagerTLSSecret
 		cfg.MetricsPort = 9094
 
 		component := kubecontrollers.NewElasticsearchKubeControllers(&cfg)
@@ -552,7 +538,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		// Should render the correct resources.
 		i := 0
 		for _, expectedRes := range expectedResources {
-			rtest.ExpectResource(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+			rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 			i++
 		}
 
@@ -565,17 +551,13 @@ var _ = Describe("kube-controllers rendering tests", func() {
 			Value: "authorization,elasticsearchconfiguration,managedcluster",
 		}))
 
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts).To(HaveLen(2))
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name).To(Equal(render.ManagerInternalTLSSecretName))
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath).To(Equal("/internal-manager-tls"))
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[1].Name).To(Equal("tigera-ca-bundle"))
-		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[1].MountPath).To(Equal("/etc/pki/tls/certs"))
+		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts).To(HaveLen(1))
+		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name).To(Equal("tigera-ca-bundle"))
+		Expect(dp.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath).To(Equal("/etc/pki/tls/certs"))
 
-		Expect(dp.Spec.Template.Spec.Volumes).To(HaveLen(2))
-		Expect(dp.Spec.Template.Spec.Volumes[0].Name).To(Equal(render.ManagerInternalTLSSecretName))
-		Expect(dp.Spec.Template.Spec.Volumes[0].Secret.SecretName).To(Equal(render.ManagerInternalTLSSecretName))
-		Expect(dp.Spec.Template.Spec.Volumes[1].Name).To(Equal("tigera-ca-bundle"))
-		Expect(dp.Spec.Template.Spec.Volumes[1].ConfigMap.Name).To(Equal("tigera-ca-bundle"))
+		Expect(dp.Spec.Template.Spec.Volumes).To(HaveLen(1))
+		Expect(dp.Spec.Template.Spec.Volumes[0].Name).To(Equal("tigera-ca-bundle"))
+		Expect(dp.Spec.Template.Spec.Volumes[0].ConfigMap.Name).To(Equal("tigera-ca-bundle"))
 
 		Expect(dp.Spec.Template.Spec.Containers[0].Image).To(Equal("test-reg/tigera/kube-controllers:" + components.ComponentTigeraKubeControllers.Version))
 
@@ -619,7 +601,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		// Should render the correct resources.
 		i := 0
 		for _, expectedRes := range expectedResources {
-			rtest.ExpectResource(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+			rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 			i++
 		}
 
@@ -694,7 +676,6 @@ var _ = Describe("kube-controllers rendering tests", func() {
 				break
 			}
 		}
-
 	})
 
 	It("should add the OIDC prefix env variables", func() {
@@ -702,7 +683,6 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		cfg.LogStorageExists = true
 		cfg.ManagementCluster = &operatorv1.ManagementCluster{}
 		cfg.KubeControllersGatewaySecret = &testutils.KubeControllersUserSecret
-		cfg.ManagerInternalSecret = internalManagerTLSSecret
 		cfg.MetricsPort = 9094
 		cfg.Authentication = &operatorv1.Authentication{Spec: operatorv1.AuthenticationSpec{
 			UsernamePrefix: "uOIDC:",
@@ -736,7 +716,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 	})
 
 	Context("With calico-kube-controllers overrides", func() {
-		var rr1 = corev1.ResourceRequirements{
+		rr1 := corev1.ResourceRequirements{
 			Limits: corev1.ResourceList{
 				"cpu":     resource.MustParse("2"),
 				"memory":  resource.MustParse("300Mi"),
@@ -748,7 +728,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 				"storage": resource.MustParse("10Gi"),
 			},
 		}
-		var rr2 = corev1.ResourceRequirements{
+		rr2 := corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{
 				corev1.ResourceCPU:    resource.MustParse("250m"),
 				corev1.ResourceMemory: resource.MustParse("64Mi"),
@@ -835,7 +815,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 			// - 1 added by the operator by default because TrustedBundle was set on kubecontrollerconfiguration.
 			// - 1 added by the calicoNodeDaemonSet override
 			Expect(d.Spec.Template.Annotations).To(HaveLen(2))
-			Expect(d.Spec.Template.Annotations).To(HaveKey("hash.operator.tigera.io/tigera-ca-private"))
+			Expect(d.Spec.Template.Annotations).To(HaveKey("tigera-operator.hash.operator.tigera.io/tigera-ca-private"))
 			Expect(d.Spec.Template.Annotations["template-level"]).To(Equal("annot2"))
 
 			Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
@@ -951,7 +931,6 @@ var _ = Describe("kube-controllers rendering tests", func() {
 			cfg.LogStorageExists = true
 			cfg.ManagementCluster = &operatorv1.ManagementCluster{}
 			cfg.KubeControllersGatewaySecret = &testutils.KubeControllersUserSecret
-			cfg.ManagerInternalSecret = internalManagerTLSSecret
 			cfg.MetricsPort = 9094
 			component := kubecontrollers.NewElasticsearchKubeControllers(&cfg)
 			resources, _ := component.Objects()
@@ -1035,7 +1014,6 @@ var _ = Describe("kube-controllers rendering tests", func() {
 					cfg.ManagementClusterConnection = nil
 				}
 				instance.Variant = operatorv1.TigeraSecureEnterprise
-				cfg.ManagerInternalSecret = internalManagerTLSSecret
 
 				component := kubecontrollers.NewCalicoKubeControllersPolicy(&cfg)
 				resources, _ := component.Objects()
@@ -1083,7 +1061,6 @@ var _ = Describe("kube-controllers rendering tests", func() {
 				instance.Variant = operatorv1.TigeraSecureEnterprise
 				cfg.LogStorageExists = true
 				cfg.KubeControllersGatewaySecret = &testutils.KubeControllersUserSecret
-				cfg.ManagerInternalSecret = internalManagerTLSSecret
 
 				component := kubecontrollers.NewElasticsearchKubeControllers(&cfg)
 				resources, _ := component.Objects()
@@ -1100,17 +1077,18 @@ var _ = Describe("kube-controllers rendering tests", func() {
 	})
 
 	It("should render init containers when certificate management is enabled", func() {
-
 		instance.Variant = operatorv1.TigeraSecureEnterprise
-		cfg.ManagerInternalSecret = internalManagerTLSSecret
 		cfg.MetricsPort = 9094
 		ca, _ := tls.MakeCA(rmeta.DefaultOperatorCASignerName())
 		cert, _, _ := ca.Config.GetPEMBytes() // create a valid pem block
 		cfg.Installation.CertificateManagement = &operatorv1.CertificateManagement{CACert: cert}
-		certificateManager, err := certificatemanager.Create(cli, cfg.Installation, dns.DefaultClusterDomain)
+
+		certificateManager, err := certificatemanager.Create(cli, cfg.Installation, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
+
 		tls, err := certificateManager.GetOrCreateKeyPair(cli, kubecontrollers.KubeControllerPrometheusTLSSecret, common.OperatorNamespace(), []string{""})
 		Expect(err).NotTo(HaveOccurred())
+
 		cfg.MetricsServerTLS = tls
 
 		resources, _ := kubecontrollers.NewCalicoKubeControllers(&cfg).Objects()

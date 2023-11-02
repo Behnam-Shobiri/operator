@@ -15,6 +15,7 @@
 package render
 
 import (
+	"crypto/x509"
 	"fmt"
 	"strings"
 
@@ -40,6 +41,7 @@ import (
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
+	"github.com/tigera/operator/pkg/tls/certkeyusage"
 )
 
 const (
@@ -84,6 +86,14 @@ var (
 	ComplianceSnapshotterSourceEntityRule = networkpolicy.CreateSourceEntityRule(ComplianceNamespace, ComplianceSnapshotterName)
 	ComplianceReporterSourceEntityRule    = networkpolicy.CreateSourceEntityRule(ComplianceNamespace, ComplianceReporterName)
 )
+
+// Register secret/certs that need Server and Client Key usage
+func init() {
+	certkeyusage.SetCertKeyUsage(ComplianceServerCertSecret, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth})
+	certkeyusage.SetCertKeyUsage(ComplianceSnapshotterSecret, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth})
+	certkeyusage.SetCertKeyUsage(ComplianceBenchmarkerSecret, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth})
+	certkeyusage.SetCertKeyUsage(ComplianceReporterSecret, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth})
+}
 
 func Compliance(cfg *ComplianceConfiguration) (Component, error) {
 	return &complianceComponent{
@@ -171,7 +181,6 @@ func (c *complianceComponent) SupportedOSType() rmeta.OSType {
 
 func (c *complianceComponent) Objects() ([]client.Object, []client.Object) {
 	complianceObjs := []client.Object{
-		CreateNamespace(ComplianceNamespace, c.cfg.Installation.KubernetesProvider, PSSPrivileged),
 		c.complianceAccessAllowTigeraNetworkPolicy(),
 		networkpolicy.AllowTigeraDefaultDeny(ComplianceNamespace),
 	}
@@ -654,7 +663,8 @@ func (c *complianceComponent) complianceReporterPodTemplate() *corev1.PodTemplat
 									Port: intstr.FromInt(9099),
 								},
 							},
-							PeriodSeconds: 300,
+							PeriodSeconds:  300,
+							TimeoutSeconds: 10,
 						},
 
 						// On OpenShift reporter needs privileged access to write compliance reports to host path volume
@@ -695,7 +705,7 @@ func (c *complianceComponent) externalLinseedRoleBinding() *rbacv1.RoleBinding {
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "ClusterRole",
-			Name:     linseed,
+			Name:     TigeraLinseedSecretsClusterRole,
 		},
 		Subjects: []rbacv1.Subject{
 			{
@@ -854,9 +864,8 @@ func (c *complianceComponent) complianceServerDeployment() *appsv1.Deployment {
 								Scheme: corev1.URISchemeHTTPS,
 							},
 						},
-						InitialDelaySeconds: 5,
-						PeriodSeconds:       10,
 						FailureThreshold:    5,
+						InitialDelaySeconds: 5,
 					},
 					ReadinessProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
@@ -866,9 +875,8 @@ func (c *complianceComponent) complianceServerDeployment() *appsv1.Deployment {
 								Scheme: corev1.URISchemeHTTPS,
 							},
 						},
-						InitialDelaySeconds: 5,
-						PeriodSeconds:       10,
 						FailureThreshold:    5,
+						InitialDelaySeconds: 5,
 					},
 					Args: []string{
 						fmt.Sprintf("-certpath=%s", c.cfg.ServerKeyPair.VolumeMountCertificateFilePath()),
@@ -1256,7 +1264,8 @@ func (c *complianceComponent) complianceBenchmarkerDaemonSet() *appsv1.DaemonSet
 								Port: intstr.FromInt(9099),
 							},
 						},
-						PeriodSeconds: 300,
+						PeriodSeconds:  300,
+						TimeoutSeconds: 10,
 					},
 				},
 			},
@@ -1624,12 +1633,12 @@ func (c *complianceComponent) complianceAccessAllowTigeraNetworkPolicy() *v3.Net
 		egressRules = append(egressRules, v3.Rule{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.ESGatewayEntityRule,
+			Destination: networkpolicy.DefaultHelper().ESGatewayEntityRule(),
 		})
 		egressRules = append(egressRules, v3.Rule{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.LinseedEntityRule,
+			Destination: networkpolicy.DefaultHelper().LinseedEntityRule(),
 		})
 	} else {
 		egressRules = append(egressRules, v3.Rule{
@@ -1666,12 +1675,12 @@ func (c *complianceComponent) complianceServerAllowTigeraNetworkPolicy() *v3.Net
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.ESGatewayEntityRule,
+			Destination: networkpolicy.DefaultHelper().ESGatewayEntityRule(),
 		},
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.LinseedEntityRule,
+			Destination: networkpolicy.DefaultHelper().LinseedEntityRule(),
 		},
 	}
 
@@ -1687,7 +1696,7 @@ func (c *complianceComponent) complianceServerAllowTigeraNetworkPolicy() *v3.Net
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: ManagerEntityRule,
+			Destination: networkpolicy.DefaultHelper().ManagerEntityRule(),
 		},
 	}...)
 
@@ -1695,7 +1704,7 @@ func (c *complianceComponent) complianceServerAllowTigeraNetworkPolicy() *v3.Net
 		{
 			Action:   v3.Allow,
 			Protocol: &networkpolicy.TCPProtocol,
-			Source:   ManagerSourceEntityRule,
+			Source:   networkpolicy.DefaultHelper().ManagerSourceEntityRule(),
 			Destination: v3.EntityRule{
 				Ports: networkpolicy.Ports(complianceServerPort),
 			},

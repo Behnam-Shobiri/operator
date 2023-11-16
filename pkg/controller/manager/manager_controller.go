@@ -554,6 +554,17 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 				r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the tunnel secret", err, logc)
 				return reconcile.Result{}, err
 			}
+		} else {
+			// Check controller references and remove any old APIServer ownership, since ownership of this resource has moved
+			// to the manager controller instead. Without this, we will hit an error when trying to update the secret as it will
+			// have two controllers set.
+			for i := 0; i < len(tunnelCASecret.OwnerReferences); i++ {
+				ref := tunnelCASecret.OwnerReferences[i]
+				if ref.Kind == "APIServer" && ref.Controller != nil && *ref.Controller {
+					tunnelCASecret.OwnerReferences = append(tunnelCASecret.OwnerReferences[:i], tunnelCASecret.OwnerReferences[i+1:]...)
+					i--
+				}
+			}
 		}
 
 		// We use the CA as the server cert.
@@ -588,8 +599,9 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 
 	trustedBundle := bundleMaker.(certificatemanagement.TrustedBundleRO)
 	if r.multiTenant {
-		// for multi-tenant systems, we load the pre-created bundle for this tenant instead of using the one we built here.
-		trustedBundle, err = certificateManager.LoadTrustedBundle(ctx, r.client, helper.InstallNamespace())
+		// For multi-tenant systems, we load the pre-created bundle for this tenant instead of using the one we built here.
+		// Multi-tenant managers need the bundle variant that includes system root certificates, in order to verify external auth providers.
+		trustedBundle, err = certificateManager.LoadMultiTenantTrustedBundleWithRootCertificates(ctx, r.client, helper.InstallNamespace())
 		if err != nil {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Error getting trusted bundle", err, logc)
 			return reconcile.Result{}, err

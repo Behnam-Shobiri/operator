@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,15 @@ package render_test
 
 import (
 	"fmt"
+	"reflect"
 	"strconv"
+
+	"github.com/tigera/operator/test"
+
+	"k8s.io/apimachinery/pkg/api/resource"
+
+	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
+	"github.com/tigera/operator/pkg/render/common/secret"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
@@ -43,7 +51,6 @@ import (
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/common/authentication"
-	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/podaffinity"
 	rtest "github.com/tigera/operator/pkg/render/common/test"
@@ -129,12 +136,23 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 		))
 
 		// es-proxy container
-		Expect(esProxy.Env).Should(ContainElements(
-			corev1.EnvVar{Name: "ELASTIC_INDEX_SUFFIX", Value: "clusterTestName"},
-			corev1.EnvVar{Name: "LINSEED_CLIENT_CERT", Value: "/internal-manager-tls/tls.crt"},
-			corev1.EnvVar{Name: "LINSEED_CLIENT_KEY", Value: "/internal-manager-tls/tls.key"},
-			corev1.EnvVar{Name: "VOLTRON_URL", Value: "https://tigera-manager.tigera-manager.svc:9443"},
-		))
+		esProxyExpectedEnvVars := []corev1.EnvVar{
+			{Name: "ELASTIC_LICENSE_TYPE", Value: "enterprise_trial"},
+			{Name: "ELASTIC_KIBANA_ENDPOINT", Value: "https://tigera-secure-es-gateway-http.tigera-elasticsearch.svc:5601"},
+			{Name: "FIPS_MODE_ENABLED", Value: "false"},
+			{Name: "LINSEED_CLIENT_CERT", Value: "/internal-manager-tls/tls.crt"},
+			{Name: "LINSEED_CLIENT_KEY", Value: "/internal-manager-tls/tls.key"},
+			{Name: "ELASTIC_KIBANA_DISABLED", Value: "false"},
+			{Name: "VOLTRON_URL", Value: "https://tigera-manager.tigera-manager.svc:9443"},
+			{Name: "ELASTIC_CA", Value: "/etc/pki/tls/certs/tigera-ca-bundle.crt"},
+			{Name: "ELASTIC_SCHEME", Value: "https"},
+			{Name: "ELASTIC_HOST", Value: "tigera-secure-es-gateway-http.tigera-elasticsearch.svc"},
+			{Name: "ELASTIC_PORT", Value: "9200"},
+			{Name: "ELASTIC_USER", ValueFrom: secret.GetEnvVarSource(render.ElasticsearchManagerUserSecret, "username", false)},
+			{Name: "ELASTIC_PASSWORD", ValueFrom: secret.GetEnvVarSource(render.ElasticsearchManagerUserSecret, "password", false)},
+			{Name: "ELASTIC_INDEX_SUFFIX", Value: "clusterTestName"},
+		}
+		Expect(esProxy.Env).To(Equal(esProxyExpectedEnvVars))
 
 		Expect(esProxy.VolumeMounts).To(HaveLen(2))
 		Expect(esProxy.VolumeMounts[0].Name).To(Equal("tigera-ca-bundle"))
@@ -695,9 +713,14 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 	// renderManager passes in as few parameters as possible to render.Manager without it
 	// panicing. It accepts variations on the installspec for testing purposes.
 	renderManager := func(i *operatorv1.InstallationSpec) *appsv1.Deployment {
+		var esConfigMap *relasticsearch.ClusterConfig
+		// We only require Elastic cluster configuration when Kibana is enabled.
+		if render.KibanaEnabled(nil, i) {
+			esConfigMap = relasticsearch.NewClusterConfig("clusterTestName", 1, 1, 1)
+		}
 		cfg := &render.ManagerConfiguration{
 			TrustedCertBundle:     bundle,
-			ClusterConfig:         &relasticsearch.ClusterConfig{},
+			ClusterConfig:         esConfigMap,
 			TLSKeyPair:            kp,
 			VoltronLinseedKeyPair: voltronLinseedKP,
 			Installation:          i,
@@ -837,6 +860,112 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 		Expect(deployment.Spec.Template.Spec.Containers[2].Env).To(ContainElement(corev1.EnvVar{Name: "VOLTRON_FIPS_MODE_ENABLED", Value: "true"}))
 	})
 
+	It("should override container's resource request with the value from Manager CR", func() {
+		managerResources := corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				"cpu":     resource.MustParse("2"),
+				"memory":  resource.MustParse("300Mi"),
+				"storage": resource.MustParse("20Gi"),
+			},
+			Requests: corev1.ResourceList{
+				"cpu":     resource.MustParse("1"),
+				"memory":  resource.MustParse("150Mi"),
+				"storage": resource.MustParse("10Gi"),
+			},
+		}
+
+		managercfg := operatorv1.Manager{
+			Spec: operatorv1.ManagerSpec{
+				ManagerDeployment: &operatorv1.ManagerDeployment{
+					Spec: &operatorv1.ManagerDeploymentSpec{
+						Template: &operatorv1.ManagerDeploymentPodTemplateSpec{
+							Spec: &operatorv1.ManagerDeploymentPodSpec{
+								Containers: []operatorv1.ManagerDeploymentContainer{{
+									Name:      "tigera-voltron",
+									Resources: &managerResources,
+								}},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		resources := renderObjects(renderConfig{
+			oidc:                    false,
+			managementCluster:       nil,
+			installation:            &operatorv1.InstallationSpec{ControlPlaneReplicas: &replicas},
+			compliance:              compliance,
+			complianceFeatureActive: true,
+			ns:                      render.ManagerNamespace,
+			manager:                 &managercfg,
+		})
+
+		d, ok := rtest.GetResource(resources, "tigera-manager", render.ManagerNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
+		Expect(ok).To(BeTrue())
+
+		Expect(d.Spec.Template.Spec.Containers).To(HaveLen(3))
+
+		container := test.GetContainer(d.Spec.Template.Spec.Containers, "tigera-voltron")
+		Expect(container).NotTo(BeNil())
+		Expect(container.Resources).To(Equal(managerResources))
+	})
+
+	It("should override init container's resource request with the value from Manager CR", func() {
+		ca, _ := tls.MakeCA(rmeta.DefaultOperatorCASignerName())
+		cert, _, _ := ca.Config.GetPEMBytes() // create a valid pem block
+		certificateManagement := &operatorv1.CertificateManagement{CACert: cert}
+
+		managerResources := corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				"cpu":     resource.MustParse("2"),
+				"memory":  resource.MustParse("300Mi"),
+				"storage": resource.MustParse("20Gi"),
+			},
+			Requests: corev1.ResourceList{
+				"cpu":     resource.MustParse("1"),
+				"memory":  resource.MustParse("150Mi"),
+				"storage": resource.MustParse("10Gi"),
+			},
+		}
+
+		managercfg := operatorv1.Manager{
+			Spec: operatorv1.ManagerSpec{
+				ManagerDeployment: &operatorv1.ManagerDeployment{
+					Spec: &operatorv1.ManagerDeploymentSpec{
+						Template: &operatorv1.ManagerDeploymentPodTemplateSpec{
+							Spec: &operatorv1.ManagerDeploymentPodSpec{
+								InitContainers: []operatorv1.ManagerDeploymentInitContainer{{
+									Name:      "manager-tls-key-cert-provisioner",
+									Resources: &managerResources,
+								}},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		resources := renderObjects(renderConfig{
+			oidc:                    false,
+			managementCluster:       nil,
+			installation:            &operatorv1.InstallationSpec{ControlPlaneReplicas: &replicas, CertificateManagement: certificateManagement},
+			compliance:              compliance,
+			complianceFeatureActive: true,
+			ns:                      render.ManagerNamespace,
+			manager:                 &managercfg,
+		})
+
+		d, ok := rtest.GetResource(resources, "tigera-manager", render.ManagerNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
+		Expect(ok).To(BeTrue())
+
+		Expect(d.Spec.Template.Spec.InitContainers).To(HaveLen(2))
+
+		initContainer := test.GetContainer(d.Spec.Template.Spec.InitContainers, "manager-tls-key-cert-provisioner")
+		Expect(initContainer).NotTo(BeNil())
+		Expect(initContainer.Resources).To(Equal(managerResources))
+	})
+
 	Context("allow-tigera rendering", func() {
 		policyName := types.NamespacedName{Name: "allow-tigera.manager-access", Namespace: "tigera-manager"}
 
@@ -968,7 +1097,7 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 		})
 
 		It("should render multi-tenant environment variables", func() {
-			tenantAResources := renderObjects(renderConfig{
+			resources := renderObjects(renderConfig{
 				oidc:                    false,
 				managementCluster:       nil,
 				installation:            installation,
@@ -985,13 +1114,81 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 					},
 				},
 			})
-			d := rtest.GetResource(tenantAResources, "tigera-manager", tenantANamespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
+			d := rtest.GetResource(resources, "tigera-manager", tenantANamespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
 			envs := d.Spec.Template.Spec.Containers[2].Env
 			esProxyEnv := d.Spec.Template.Spec.Containers[1].Env
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "VOLTRON_TENANT_NAMESPACE", Value: tenantANamespace}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "VOLTRON_TENANT_ID", Value: "tenant-a"}))
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "VOLTRON_REQUIRE_TENANT_CLAIM", Value: "true"}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "VOLTRON_LINSEED_ENDPOINT", Value: fmt.Sprintf("https://tigera-linseed.%s.svc", tenantANamespace)}))
 			Expect(esProxyEnv).To(ContainElement(corev1.EnvVar{Name: "VOLTRON_URL", Value: fmt.Sprintf("https://tigera-manager.%s.svc:9443", tenantANamespace)}))
+			Expect(esProxyEnv).To(ContainElement(corev1.EnvVar{Name: "TENANT_ID", Value: "tenant-a"}))
+			Expect(esProxyEnv).To(ContainElement(corev1.EnvVar{Name: "TENANT_NAMESPACE", Value: tenantANamespace}))
+		})
+
+		It("should not install UISettings / UISettingsGroups", func() {
+			resources := renderObjects(renderConfig{
+				oidc:                    false,
+				managementCluster:       nil,
+				installation:            installation,
+				compliance:              compliance,
+				complianceFeatureActive: true,
+				ns:                      tenantBNamespace,
+				bindingNamespaces:       []string{tenantANamespace, tenantBNamespace},
+				tenant: &operatorv1.Tenant{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tenant",
+						Namespace: tenantANamespace,
+					},
+					Spec: operatorv1.TenantSpec{
+						ID: "tenant-a",
+					},
+				},
+			})
+
+			// Expect no UISettings / UISettingsGroups to be installed.
+			for _, res := range resources {
+				Expect(reflect.TypeOf(res)).NotTo(Equal(reflect.TypeOf(&v3.UISettings{})), "Unexpected UISettings in multi-tenant mode")
+				Expect(reflect.TypeOf(res)).NotTo(Equal(reflect.TypeOf(&v3.UISettingsGroup{})), "Unexpected UISettingsGroup in multi-tenant mode")
+			}
+		})
+	})
+
+	Context("single-tenant rendering", func() {
+		It("should render single-tenant environment variables", func() {
+			tenantAResources := renderObjects(renderConfig{
+				oidc:                    false,
+				managementCluster:       nil,
+				installation:            installation,
+				compliance:              compliance,
+				complianceFeatureActive: true,
+				ns:                      render.ManagerNamespace,
+				tenant: &operatorv1.Tenant{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tenant",
+						Namespace: "",
+					},
+					Spec: operatorv1.TenantSpec{
+						ID: "tenant-a",
+					},
+				},
+			})
+			d := rtest.GetResource(tenantAResources, "tigera-manager", render.ManagerNamespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
+			envs := d.Spec.Template.Spec.Containers[2].Env
+			esProxyEnv := d.Spec.Template.Spec.Containers[1].Env
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "VOLTRON_TENANT_ID", Value: "tenant-a"}))
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "VOLTRON_REQUIRE_TENANT_CLAIM", Value: "true"}))
+			Expect(esProxyEnv).To(ContainElement(corev1.EnvVar{Name: "VOLTRON_URL", Value: fmt.Sprintf("https://tigera-manager.%s.svc:9443", render.ManagerNamespace)}))
+			Expect(esProxyEnv).To(ContainElement(corev1.EnvVar{Name: "TENANT_ID", Value: "tenant-a"}))
+
+			// Make sure we don't render multi-tenant environment variables
+			for _, env := range envs {
+				Expect(env.Name).NotTo(Equal("VOLTRON_TENANT_NAMESPACE"))
+				Expect(env.Name).NotTo(Equal("VOLTRON_LINSEED_ENDPOINT"))
+			}
+			for _, env := range esProxyEnv {
+				Expect(env.Name).NotTo(Equal("TENANT_NAMESPACE"))
+			}
 		})
 	})
 })
@@ -1006,6 +1203,7 @@ type renderConfig struct {
 	ns                      string
 	bindingNamespaces       []string
 	tenant                  *operatorv1.Tenant
+	manager                 *operatorv1.Manager
 }
 
 func renderObjects(roc renderConfig) []client.Object {
@@ -1050,7 +1248,11 @@ func renderObjects(roc renderConfig) []client.Object {
 		roc.bindingNamespaces = []string{roc.ns}
 	}
 
-	esConfigMap := relasticsearch.NewClusterConfig("clusterTestName", 1, 1, 1)
+	var esConfigMap *relasticsearch.ClusterConfig
+	// We only require Elastic cluster configuration when Kibana is enabled.
+	if render.KibanaEnabled(roc.tenant, roc.installation) {
+		esConfigMap = relasticsearch.NewClusterConfig("clusterTestName", 1, 1, 1)
+	}
 	cfg := &render.ManagerConfiguration{
 		KeyValidatorConfig:      dexCfg,
 		TrustedCertBundle:       bundle,
@@ -1072,6 +1274,7 @@ func renderObjects(roc renderConfig) []client.Object {
 		BindingNamespaces:       roc.bindingNamespaces,
 		TruthNamespace:          common.OperatorNamespace(),
 		Tenant:                  roc.tenant,
+		Manager:                 roc.manager,
 	}
 	component, err := render.Manager(cfg)
 	Expect(err).To(BeNil(), "Expected Manager to create successfully %s", err)

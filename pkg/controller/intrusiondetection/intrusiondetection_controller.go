@@ -18,6 +18,8 @@ import (
 	"context"
 	"fmt"
 
+	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
+
 	esv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/elasticsearch/v1"
 
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
@@ -36,7 +38,6 @@ import (
 	"github.com/tigera/operator/pkg/controller/utils/imageset"
 	"github.com/tigera/operator/pkg/render"
 	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
-	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	"github.com/tigera/operator/pkg/render/intrusiondetection/dpi"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 	batchv1 "k8s.io/api/batch/v1"
@@ -117,6 +118,7 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions, licenseAPIReady
 		dpiAPIReady:     dpiAPIReady,
 		tierWatchReady:  tierWatchReady,
 		usePSP:          opts.UsePSP,
+		elasticExternal: opts.ElasticExternal,
 	}
 	r.status.Run(opts.ShutdownContext)
 	return r
@@ -171,7 +173,6 @@ func add(mgr manager.Manager, c controller.Controller) error {
 	}
 
 	for _, secretName := range []string{
-		relasticsearch.PublicCertSecret,
 		render.ElasticsearchIntrusionDetectionUserSecret,
 		render.ElasticsearchIntrusionDetectionJobUserSecret,
 		render.ElasticsearchPerformanceHotspotsUserSecret,
@@ -188,11 +189,6 @@ func add(mgr manager.Manager, c controller.Controller) error {
 	}
 
 	if err = utils.AddSecretsWatch(c, render.ManagerInternalTLSSecretName, render.IntrusionDetectionNamespace); err != nil {
-		return fmt.Errorf("intrusiondetection-controller failed to watch the Secret resource: %v", err)
-	}
-
-	// These watches are here to catch a modification to the resources we create in reconcile so the changes would be corrected.
-	if err = utils.AddSecretsWatch(c, relasticsearch.PublicCertSecret, render.IntrusionDetectionNamespace); err != nil {
 		return fmt.Errorf("intrusiondetection-controller failed to watch the Secret resource: %v", err)
 	}
 
@@ -236,6 +232,7 @@ type ReconcileIntrusionDetection struct {
 	dpiAPIReady     *utils.ReadyFlag
 	tierWatchReady  *utils.ReadyFlag
 	usePSP          bool
+	elasticExternal bool
 }
 
 // Reconcile reads that state of the cluster for a IntrusionDetection object and makes changes based on the state read
@@ -308,7 +305,7 @@ func (r *ReconcileIntrusionDetection) Reconcile(ctx context.Context, request rec
 		return reconcile.Result{}, err
 	}
 
-	if !isManagedCluster {
+	if !isManagedCluster && !r.elasticExternal {
 		// check es-gateway to be available
 		elasticsearch, err := utils.GetElasticsearch(ctx, r.client)
 		if err != nil {
@@ -389,6 +386,15 @@ func (r *ReconcileIntrusionDetection) Reconcile(ctx context.Context, request rec
 		}
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get the elasticsearch cluster configuration", err, reqLogger)
 		return reconcile.Result{}, err
+	}
+
+	if isManagedCluster {
+		if esClusterConfig.ClusterName() == render.DefaultElasticsearchClusterName {
+			msg := fmt.Sprintf("%s/%s ConfigMap must contain a 'clusterName' field that is not '%s'", common.OperatorNamespace(), relasticsearch.ClusterConfigConfigMapName, render.DefaultElasticsearchClusterName)
+			err = fmt.Errorf("Elasticsearch cluster name must be non-default value in managed clusters")
+			r.status.SetDegraded(operatorv1.InvalidConfigurationError, msg, err, reqLogger)
+			return reconcile.Result{}, err
+		}
 	}
 
 	secrets := []string{
@@ -547,7 +553,6 @@ func (r *ReconcileIntrusionDetection) Reconcile(ctx context.Context, request rec
 		ManagementCluster:  isManagementCluster,
 		HasNoLicense:       hasNoLicense,
 		HasNoDPIResource:   hasNoDPIResource,
-		ESClusterConfig:    esClusterConfig,
 		ClusterDomain:      r.clusterDomain,
 		DPICertSecret:      dpiKeyPair,
 	})

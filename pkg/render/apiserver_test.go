@@ -1372,6 +1372,16 @@ var (
 			Resources: []string{"services"},
 			Verbs:     []string{"get", "list", "watch"},
 		},
+		{
+			APIGroups: []string{"projectcalico.org"},
+			Resources: []string{"felixconfigurations"},
+			Verbs:     []string{"get", "list"},
+		},
+		{
+			APIGroups: []string{"crd.projectcalico.org"},
+			Resources: []string{"securityeventwebhooks"},
+			Verbs:     []string{"get", "list"},
+		},
 	}
 	networkAdminPolicyRules = []rbacv1.PolicyRule{
 		{
@@ -1489,6 +1499,27 @@ var (
 			APIGroups: []string{""},
 			Resources: []string{"services"},
 			Verbs:     []string{"get", "list", "watch", "patch"},
+		},
+		{
+			APIGroups: []string{"projectcalico.org"},
+			Resources: []string{"felixconfigurations"},
+			Verbs:     []string{"get", "list"},
+		},
+		{
+			APIGroups: []string{"crd.projectcalico.org"},
+			Resources: []string{"securityeventwebhooks"},
+			Verbs:     []string{"get", "list", "update", "patch", "create", "delete"},
+		},
+		{
+			APIGroups: []string{""},
+			Resources: []string{"secrets"},
+			Verbs:     []string{"create"},
+		},
+		{
+			APIGroups:     []string{""},
+			Resources:     []string{"secrets"},
+			ResourceNames: []string{"webhooks-secret"},
+			Verbs:         []string{"patch"},
 		},
 	}
 )
@@ -2003,6 +2034,7 @@ var _ = Describe("API server rendering tests (Calico)", func() {
 			Expect(d.Spec.Template.Spec.Tolerations).To(HaveLen(1))
 			Expect(d.Spec.Template.Spec.Tolerations).To(ConsistOf(tol))
 		})
+
 		It("should render the correct env and/or images when FIPS mode is enabled (OSS)", func() {
 			fipsEnabled := operatorv1.FIPSModeEnabled
 			cfg.Installation.FIPSMode = &fipsEnabled
@@ -2015,6 +2047,24 @@ var _ = Describe("API server rendering tests (Calico)", func() {
 
 			d := rtest.GetResource(resources, "calico-apiserver", "calico-apiserver", "apps", "v1", "Deployment").(*appsv1.Deployment)
 			Expect(d.Spec.Template.Spec.Containers[0].Image).To(ContainSubstring("-fips"))
+		})
+	})
+
+	Context("multi-tenant", func() {
+		BeforeEach(func() {
+			cfg.MultiTenant = true
+		})
+
+		It("should not install tigera-network-admin and tigera-ui-user", func() {
+			component, err := render.APIServer(cfg)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Expect no UISettings / UISettingsGroups to be installed.
+			resources, _ := component.Objects()
+			obj := rtest.GetResource(resources, "tigera-network-admin", "", "rbac.authorization.k8s.io", "v1", "ClusterRole")
+			Expect(obj).To(BeNil())
+			obj = rtest.GetResource(resources, "tigera-ui-user", "", "rbac.authorization.k8s.io", "v1", "ClusterRole")
+			Expect(obj).To(BeNil())
 		})
 	})
 })

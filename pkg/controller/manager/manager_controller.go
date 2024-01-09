@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@ package manager
 import (
 	"context"
 	"fmt"
+
+	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -44,7 +46,6 @@ import (
 	"github.com/tigera/operator/pkg/render"
 	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
 	tigerakvc "github.com/tigera/operator/pkg/render/common/authentication/tigera/key_validator_config"
-	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/monitor"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
@@ -145,9 +146,9 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	}
 	for _, namespace := range namespacesToWatch {
 		for _, secretName := range []string{
-			render.ManagerTLSSecretName, relasticsearch.PublicCertSecret, render.ElasticsearchManagerUserSecret,
+			render.ManagerTLSSecretName, render.ElasticsearchManagerUserSecret,
 			render.VoltronTunnelSecretName, render.ComplianceServerCertSecret, render.PacketCaptureServerCert,
-			render.ManagerInternalTLSSecretName, monitor.PrometheusTLSSecretName, certificatemanagement.CASecretName,
+			render.ManagerInternalTLSSecretName, monitor.PrometheusServerTLSSecretName, certificatemanagement.CASecretName,
 		} {
 			if err = utils.AddSecretsWatch(managerController, secretName, namespace); err != nil {
 				return fmt.Errorf("manager-controller failed to watch the secret '%s' in '%s' namespace: %w", secretName, namespace, err)
@@ -167,8 +168,10 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		return fmt.Errorf("manager-controller failed to watch the '%s' namespace: %w", common.TigeraPrometheusNamespace, err)
 	}
 
-	if err = utils.AddConfigMapWatch(managerController, render.ECKLicenseConfigMapName, render.ECKOperatorNamespace, eventHandler); err != nil {
-		return fmt.Errorf("manager-controller failed to watch the ConfigMap resource: %v", err)
+	if !opts.ElasticExternal {
+		if err = utils.AddConfigMapWatch(managerController, render.ECKLicenseConfigMapName, render.ECKOperatorNamespace, eventHandler); err != nil {
+			return fmt.Errorf("manager-controller failed to watch the ConfigMap resource: %v", err)
+		}
 	}
 
 	return nil
@@ -186,6 +189,7 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions, licenseAPIReady
 		tierWatchReady:  tierWatchReady,
 		usePSP:          opts.UsePSP,
 		multiTenant:     opts.MultiTenant,
+		elasticExternal: opts.ElasticExternal,
 	}
 	c.status.Run(opts.ShutdownContext)
 	return c
@@ -207,7 +211,8 @@ type ReconcileManager struct {
 	usePSP          bool
 
 	// Whether or not the operator is running in multi-tenant mode.
-	multiTenant bool
+	multiTenant     bool
+	elasticExternal bool
 }
 
 // GetManager returns the default manager instance with defaults populated.
@@ -382,7 +387,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 	// Build a trusted bundle containing all of the certificates of components that communicate with the manager pod.
 	// This bundle contains the root CA used to sign all operator-generated certificates, as well as the explicitly named
 	// certificates, in case the user has provided their own cert in lieu of the default certificate.
-	var authenticationCR *operatorv1.Authentication
+
 	var trustedSecretNames []string
 	if !r.multiTenant {
 		// For multi-tenant systems, we don't support user-provided certs for all components. So, we don't need to include these,
@@ -390,10 +395,18 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		// any of them haven't been signed by the root CA.
 		trustedSecretNames = []string{
 			render.PacketCaptureServerCert,
-			monitor.PrometheusTLSSecretName,
-			relasticsearch.PublicCertSecret,
 			render.ProjectCalicoAPIServerTLSSecretName(installation.Variant),
 			render.TigeraLinseedSecret,
+		}
+		// If external prometheus is enabled, the secret will be signed by the Calico CA and no secret will be created. We can skip
+		// adding it to the bundle, as trusting the CA will suffice.
+		monitorCR := &operatorv1.Monitor{}
+		if err := r.client.Get(ctx, utils.DefaultTSEEInstanceKey, monitorCR); err != nil {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying required Monitor resource: ", err, logc)
+			return reconcile.Result{}, err
+		}
+		if monitorCR.Spec.ExternalPrometheus == nil {
+			trustedSecretNames = append(trustedSecretNames, monitor.PrometheusServerTLSSecretName)
 		}
 
 		if complianceLicenseFeatureActive && complianceCR != nil {
@@ -404,19 +417,21 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 			}
 			trustedSecretNames = append(trustedSecretNames, render.ComplianceServerCertSecret)
 		}
+	}
 
-		// Fetch the Authentication spec. If present, we use to configure user authentication.
-		authenticationCR, err = utils.GetAuthentication(ctx, r.client)
-		if err != nil && !errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Error while fetching Authentication", err, logc)
-			return reconcile.Result{}, err
-		}
-		if authenticationCR != nil && authenticationCR.Status.State != operatorv1.TigeraStatusReady {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, fmt.Sprintf("Authentication is not ready authenticationCR status: %s", authenticationCR.Status.State), nil, logc)
-			return reconcile.Result{}, nil
-		} else if authenticationCR != nil {
-			trustedSecretNames = append(trustedSecretNames, render.DexTLSSecretName)
-		}
+	var authenticationCR *operatorv1.Authentication
+	// Fetch the Authentication spec. If present, we use to configure user authentication.
+	authenticationCR, err = utils.GetAuthentication(ctx, r.client)
+	if err != nil && !errors.IsNotFound(err) {
+		r.status.SetDegraded(operatorv1.ResourceReadError, "Error while fetching Authentication", err, logc)
+		return reconcile.Result{}, err
+	}
+	if authenticationCR != nil && authenticationCR.Status.State != operatorv1.TigeraStatusReady {
+		r.status.SetDegraded(operatorv1.ResourceNotReady, fmt.Sprintf("Authentication is not ready authenticationCR status: %s", authenticationCR.Status.State), nil, logc)
+		return reconcile.Result{}, nil
+	} else if authenticationCR != nil && !utils.IsDexDisabled(authenticationCR) {
+		// Do not include DEX TLS Secret Name is authentication CR does not have type Dex
+		trustedSecretNames = append(trustedSecretNames, render.DexTLSSecretName)
 	}
 
 	bundleMaker := certificateManager.CreateTrustedBundle()
@@ -454,14 +469,18 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		return reconcile.Result{}, err
 	}
 
-	clusterConfig, err := utils.GetElasticsearchClusterConfig(context.Background(), r.client)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceNotFound, "Elasticsearch cluster configuration is not available, waiting for it to become available", err, logc)
-			return reconcile.Result{}, nil
+	var clusterConfig *relasticsearch.ClusterConfig
+	// We only require Elastic cluster configuration when Kibana is enabled.
+	if render.KibanaEnabled(tenant, installation) {
+		clusterConfig, err = utils.GetElasticsearchClusterConfig(context.Background(), r.client)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				r.status.SetDegraded(operatorv1.ResourceNotFound, "Elasticsearch cluster configuration is not available, waiting for it to become available", err, logc)
+				return reconcile.Result{}, nil
+			}
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get the elasticsearch cluster configuration", err, logc)
+			return reconcile.Result{}, err
 		}
-		r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get the elasticsearch cluster configuration", err, logc)
-		return reconcile.Result{}, err
 	}
 
 	var esSecrets []*corev1.Secret
@@ -578,8 +597,8 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		return reconcile.Result{}, err
 	}
 
-	var elasticLicenseType render.ElasticsearchLicenseType
-	if managementClusterConnection == nil {
+	elasticLicenseType := render.ElasticsearchLicenseTypeBasic
+	if !r.elasticExternal && managementClusterConnection == nil {
 		if elasticLicenseType, err = utils.GetElasticLicenseType(ctx, r.client, logc); err != nil {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get Elasticsearch license", err, logc)
 			return reconcile.Result{}, err
@@ -614,6 +633,12 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 	if err != nil {
 		return reconcile.Result{}, err
 	}
+	if tenant.MultiTenant() {
+		// In a multi-tenant environment, we need to grant access to the canonical tigera-manager:tigera-manager service account
+		// so that es-proxy passes Voltron's authorization checks when accessing managed clusters. This is because per-tenant manager instances
+		// impersonate as this serviceaccount on these flows.
+		namespaces = append(namespaces, render.ManagerNamespace)
+	}
 
 	managerCfg := &render.ManagerConfiguration{
 		KeyValidatorConfig:      keyValidatorConfig,
@@ -638,6 +663,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		TruthNamespace:          helper.TruthNamespace(),
 		Tenant:                  tenant,
 		BindingNamespaces:       namespaces,
+		Manager:                 instance,
 	}
 
 	// Render the desired objects from the CRD and create or update them.

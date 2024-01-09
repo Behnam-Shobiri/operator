@@ -18,6 +18,8 @@ import (
 	"context"
 	"fmt"
 
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	controllerruntime "sigs.k8s.io/controller-runtime"
 
 	. "github.com/onsi/ginkgo"
@@ -47,6 +49,7 @@ import (
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/kubecontrollers"
+	"github.com/tigera/operator/pkg/render/logstorage"
 	"github.com/tigera/operator/pkg/render/logstorage/esgateway"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 
@@ -65,6 +68,7 @@ func NewControllerWithShims(
 	provider operatorv1.Provider,
 	clusterDomain string,
 	multiTenant bool,
+	tierWatchReady *utils.ReadyFlag,
 ) (*ESKubeControllersController, error) {
 	opts := options.AddOptions{
 		DetectedProvider: provider,
@@ -74,10 +78,11 @@ func NewControllerWithShims(
 	}
 
 	r := &ESKubeControllersController{
-		client:        cli,
-		scheme:        scheme,
-		status:        status,
-		clusterDomain: opts.ClusterDomain,
+		client:         cli,
+		scheme:         scheme,
+		status:         status,
+		clusterDomain:  opts.ClusterDomain,
+		tierWatchReady: tierWatchReady,
 	}
 	r.status.Run(opts.ShutdownContext)
 	return r, nil
@@ -175,8 +180,12 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 		Expect(cli.Create(ctx, bundle.ConfigMap(common.CalicoNamespace))).ShouldNot(HaveOccurred())
 
 		// Create the reconciler for the tests.
-		r, err = NewControllerWithShims(cli, scheme, mockStatus, operatorv1.ProviderNone, dns.DefaultClusterDomain, false)
+		r, err = NewControllerWithShims(cli, scheme, mockStatus, operatorv1.ProviderNone, dns.DefaultClusterDomain, false, readyFlag)
 		Expect(err).ShouldNot(HaveOccurred())
+
+		// Create the allow-tigera Tier, since the controller blocks on its existence.
+		tier := &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}}
+		Expect(cli.Create(ctx, tier)).ShouldNot(HaveOccurred())
 	})
 
 	It("should wait for the cluster CA to be provisioned", func() {
@@ -190,6 +199,18 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 		_, err := r.Reconcile(ctx, reconcile.Request{})
 		Expect(err).Should(HaveOccurred())
 		Expect(err.Error()).Should(ContainSubstring("CA secret"))
+	})
+
+	It("should wait for elasticsearch to be provisioned", func() {
+		// Delete the Elasticsearch CR. This is created for ECK only.
+		Expect(cli.Delete(ctx, &esv1.Elasticsearch{
+			ObjectMeta: metav1.ObjectMeta{Name: render.ElasticsearchName, Namespace: render.ElasticsearchNamespace},
+		})).NotTo(HaveOccurred())
+
+		// Run the reconciler.
+		result, err := r.Reconcile(ctx, reconcile.Request{})
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(result).ShouldNot(Equal(successResult))
 	})
 
 	It("should reconcile resources for a standlone cluster", func() {
@@ -232,10 +253,10 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 					{Image: "tigera/kube-controllers", Digest: "sha256:kubecontrollershash"},
 					{Image: "tigera/kibana", Digest: "sha256:kibanahash"},
 					{Image: "tigera/eck-operator", Digest: "sha256:eckoperatorhash"},
-					{Image: "tigera/es-curator", Digest: "sha256:escuratorhash"},
 					{Image: "tigera/elasticsearch-metrics", Digest: "sha256:esmetricshash"},
 					{Image: "tigera/es-gateway", Digest: "sha256:esgatewayhash"},
 					{Image: "tigera/linseed", Digest: "sha256:linseedhash"},
+					{Image: "tigera/key-cert-provisioner", Digest: "sha256:deadbeef0123456789"},
 				},
 			},
 		})).ToNot(HaveOccurred())
@@ -271,5 +292,63 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 
 		err = Add(mgr, options)
 		Expect(err).To(BeNil())
+	})
+
+	Context("External ES mode", func() {
+		BeforeEach(func() {
+			// Delete the Elasticsearch CR. This is created for ECK only.
+			Expect(cli.Delete(ctx, &esv1.Elasticsearch{
+				ObjectMeta: metav1.ObjectMeta{Name: render.ElasticsearchName, Namespace: render.ElasticsearchNamespace},
+			})).NotTo(HaveOccurred())
+
+			// Create ESGW admin secret. For External ES, this is provisioned by the cluster admin into the
+			// tigera-operator namespace.
+			esAdminUserSecret := &corev1.Secret{}
+			esAdminUserSecret.Name = render.ElasticsearchAdminUserSecret
+			esAdminUserSecret.Namespace = common.OperatorNamespace()
+			esAdminUserSecret.Data = map[string][]byte{"username": []byte("password")}
+			Expect(cli.Create(ctx, esAdminUserSecret)).ShouldNot(HaveOccurred())
+
+			// Create a dummy secret mocking the client certificates needed for mTLS.
+			esClientSecret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: logstorage.ExternalCertsSecret, Namespace: common.OperatorNamespace()},
+				Data:       map[string][]byte{"client.crt": []byte("cert"), "client.key": []byte("key")},
+			}
+			Expect(cli.Create(ctx, esClientSecret)).ShouldNot(HaveOccurred())
+
+			// Update the reconciler to run in external ES mode for these tests.
+			r.elasticExternal = true
+		})
+
+		It("should reconcile resources for a cluster", func() {
+			// Run the reconciler.
+			result, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(result).Should(Equal(successResult))
+
+			// SetDegraded should not have been called.
+			mockStatus.AssertNumberOfCalls(GinkgoT(), "SetDegraded", 0)
+
+			// Check that kube-controllers was created as expected. We don't need to check every resource in detail, since
+			// the render package has its own tests which cover this in more detail.
+			dep := appsv1.Deployment{
+				TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      kubecontrollers.EsKubeController,
+					Namespace: common.CalicoNamespace,
+				},
+			}
+			Expect(test.GetResource(cli, &dep)).To(BeNil())
+
+			// We also expect es-gateway to be created.
+			dep = appsv1.Deployment{
+				TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      esgateway.DeploymentName,
+					Namespace: render.ElasticsearchNamespace,
+				},
+			}
+			Expect(test.GetResource(cli, &dep)).To(BeNil())
+		})
 	})
 })

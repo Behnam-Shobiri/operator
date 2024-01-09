@@ -36,7 +36,7 @@ test: fmt vet ut
 # The target architecture is select by setting the ARCH variable.
 # When ARCH is undefined it is set to the detected host architecture.
 # When ARCH differs from the host architecture a crossbuild will be performed.
-ARCHES ?= $(patsubst build/Dockerfile.%,%,$(wildcard build/Dockerfile.*))
+ARCHES ?= amd64 arm64 ppc64le s390x
 
 # BUILDARCH is the host architecture
 # ARCH is the target architecture
@@ -46,10 +46,10 @@ BUILDOS ?= $(shell uname -s | tr A-Z a-z)
 
 # canonicalized names for host architecture
 ifeq ($(BUILDARCH),aarch64)
-        BUILDARCH=arm64
+    BUILDARCH=arm64
 endif
 ifeq ($(BUILDARCH),x86_64)
-        BUILDARCH=amd64
+    BUILDARCH=amd64
 endif
 
 # unless otherwise set, I am building for my own architecture, i.e. not cross-compiling
@@ -57,26 +57,11 @@ ARCH ?= $(BUILDARCH)
 
 # canonicalized names for target architecture
 ifeq ($(ARCH),aarch64)
-        override ARCH=arm64
+    override ARCH=arm64
 endif
 ifeq ($(ARCH),x86_64)
-        override ARCH=amd64
+    override ARCH=amd64
 endif
-
-# Required to prevent `FROM SCRATCH` from pulling an amd64 image in the build phase.
-ifeq ($(ARCH),arm64)
-	TARGET_PLATFORM=arm64/v8
-endif
-ifeq ($(ARCH),ppc64le)
-	TARGET_PLATFORM=ppc64le
-endif
-ifeq ($(ARCH),amd64)
-	TARGET_PLATFORM=amd64
-endif
-ifeq ($(ARCH),s390x)
-	TARGET_PLATFORM=s390x
-endif
-EXTRA_DOCKER_ARGS += --platform=linux/$(TARGET_PLATFORM)
 
 # location of docker credentials to push manifests
 DOCKER_CONFIG ?= $(HOME)/.docker/config.json
@@ -88,22 +73,6 @@ DOCKER_CONFIG ?= $(HOME)/.docker/config.json
 # in the target, we then unescape them back
 escapefs = $(subst :,---,$(subst /,___,$(1)))
 unescapefs = $(subst ---,:,$(subst ___,/,$(1)))
-
-# these macros create a list of valid architectures for pushing manifests
-space :=
-space +=
-comma := ,
-prefix_linux = $(addprefix linux/,$(strip $1))
-join_platforms = $(subst $(space),$(comma),$(call prefix_linux,$(strip $1)))
-
-# Targets used when cross building.
-.PHONY: register
-# Enable binfmt adding support for miscellaneous binary formats.
-# This is only needed when running non-native binaries.
-register:
-ifneq ($(BUILDARCH),$(ARCH))
-	docker run --rm --privileged multiarch/qemu-user-static:register --reset || true
-endif
 
 # list of arches *not* to build when doing *-all
 EXCLUDEARCH ?=
@@ -122,15 +91,15 @@ endif
 
 PACKAGE_NAME?=github.com/tigera/operator
 LOCAL_USER_ID?=$(shell id -u $$USER)
-GO_BUILD_VER?=v0.88
-CALICO_BUILD?=calico/go-build:$(GO_BUILD_VER)-$(ARCH)
+GO_BUILD_VER?=v0.90
+CALICO_BUILD?=calico/go-build:$(GO_BUILD_VER)-$(BUILDARCH)
 SRC_FILES=$(shell find ./pkg -name '*.go')
 SRC_FILES+=$(shell find ./api -name '*.go')
 SRC_FILES+=$(shell find ./controllers -name '*.go')
 SRC_FILES+=$(shell find ./test -name '*.go')
 SRC_FILES+=main.go
 
-EXTRA_DOCKER_ARGS += -e GO111MODULE=on -e GOPRIVATE=github.com/tigera/*
+EXTRA_DOCKER_ARGS += -e GOPRIVATE=github.com/tigera/*
 ifeq ($(GIT_USE_SSH),true)
 	GIT_CONFIG_SSH ?= git config --global url."ssh://git@github.com/".insteadOf "https://github.com/";
 endif
@@ -157,6 +126,8 @@ CONTAINERIZED= mkdir -p .go-pkg-cache $(GOMOD_CACHE) && \
 		-e LOCAL_USER_ID=$(LOCAL_USER_ID) \
 		-e GOPATH=/go \
 		-e GOCACHE=/go-cache \
+		-e GOOS=linux \
+		-e GOARCH=$(ARCH) \
 		-e KUBECONFIG=/go/src/$(PACKAGE_NAME)/kubeconfig.yaml \
 		-e ACK_GINKGO_RC=true \
 		-e ACK_GINKGO_DEPRECATIONS=1.16.5 \
@@ -203,9 +174,8 @@ sub-push-%:
 
 push-manifests: imagetag  $(addprefix sub-manifest-,$(call escapefs,$(PUSH_MANIFEST_IMAGE_PREFIXES)))
 sub-manifest-%:
-	# Docker login to hub.docker.com required before running this target as we are using $(DOCKER_CONFIG) holds the docker login credentials
-	# path to credentials based on manifest-tool's requirements here https://github.com/estesp/manifest-tool#sample-usage
-	docker run -t --entrypoint /bin/sh -v $(DOCKER_CONFIG):/root/.docker/config.json $(CALICO_BUILD) -c "/usr/bin/manifest-tool push from-args --platforms $(call join_platforms,$(VALIDARCHES)) --template $(call unescapefs,$*$(BUILD_IMAGE):$(IMAGETAG))-ARCH --target $(call unescapefs,$*$(BUILD_IMAGE):$(IMAGETAG))"
+	docker manifest create $(call unescapefs,$*$(BUILD_IMAGE):$(IMAGETAG)) $(addprefix --amend ,$(addprefix $(call unescapefs,$*$(BUILD_IMAGE):$(IMAGETAG))-,$(VALIDARCHES)))
+	docker manifest push --purge $(call unescapefs,$*$(BUILD_IMAGE):$(IMAGETAG))
 
 ## push default amd64 arch where multi-arch manifest is not supported
 push-non-manifests: imagetag $(addprefix sub-non-manifest-,$(call escapefs,$(PUSH_NONMANIFEST_IMAGE_PREFIXES)))
@@ -260,14 +230,14 @@ endif
 image: build $(BUILD_IMAGE)
 
 $(BUILD_IMAGE): $(BUILD_IMAGE)-$(ARCH)
-$(BUILD_IMAGE)-$(ARCH): register $(BINDIR)/operator-$(ARCH)
-	docker build --pull -t $(BUILD_IMAGE):latest-$(ARCH) --platform=linux/$(TARGET_PLATFORM) --build-arg GIT_VERSION=$(GIT_VERSION) -f ./build/Dockerfile.$(ARCH) .
+$(BUILD_IMAGE)-$(ARCH): $(BINDIR)/operator-$(ARCH)
+	docker buildx build --load --platform=linux/$(ARCH) --pull -t $(BUILD_IMAGE):latest-$(ARCH) --build-arg GIT_VERSION=$(GIT_VERSION) -f build/Dockerfile .
 ifeq ($(ARCH),amd64)
 	docker tag $(BUILD_IMAGE):latest-$(ARCH) $(BUILD_IMAGE):latest
 endif
 
 .PHONY: images
-images: register image
+images: image
 
 # Build the images for the target architecture
 .PHONY: image-all
@@ -342,7 +312,7 @@ cluster-create: $(BINDIR)/kubectl $(BINDIR)/kind
 	# Wait for controller manager to be running and healthy.
 	while ! KUBECONFIG=$(KIND_KUBECONFIG) $(BINDIR)/kubectl get serviceaccount default; do echo "Waiting for default serviceaccount to be created..."; sleep 2; done
 
-IMAGE_REGISTRY := docker.io
+FV_IMAGE_REGISTRY := docker.io
 VERSION_TAG := master
 NODE_IMAGE := calico/node
 APISERVER_IMAGE := calico/apiserver
@@ -355,42 +325,42 @@ NODE_DRIVER_REGISTRAR_IMAGE := calico/node-driver-registrar
 
 .PHONY: calico-node.tar
 calico-node.tar:
-	docker pull $(IMAGE_REGISTRY)/$(NODE_IMAGE):$(VERSION_TAG)
+	docker pull $(FV_IMAGE_REGISTRY)/$(NODE_IMAGE):$(VERSION_TAG)
 	docker save --output $@ $(NODE_IMAGE):$(VERSION_TAG)
 
 .PHONY: calico-apiserver.tar
 calico-apiserver.tar:
-	docker pull $(IMAGE_REGISTRY)/$(APISERVER_IMAGE):$(VERSION_TAG)
+	docker pull $(FV_IMAGE_REGISTRY)/$(APISERVER_IMAGE):$(VERSION_TAG)
 	docker save --output $@ $(APISERVER_IMAGE):$(VERSION_TAG)
 
 .PHONY: calico-cni.tar
 calico-cni.tar:
-	docker pull $(IMAGE_REGISTRY)/$(CNI_IMAGE):$(VERSION_TAG)
+	docker pull $(FV_IMAGE_REGISTRY)/$(CNI_IMAGE):$(VERSION_TAG)
 	docker save --output $@ $(CNI_IMAGE):$(VERSION_TAG)
 
 .PHONY: calico-pod2daemon-flexvol.tar
 calico-pod2daemon-flexvol.tar:
-	docker pull $(IMAGE_REGISTRY)/$(FLEXVOL_IMAGE):$(VERSION_TAG)
+	docker pull $(FV_IMAGE_REGISTRY)/$(FLEXVOL_IMAGE):$(VERSION_TAG)
 	docker save --output $@ $(FLEXVOL_IMAGE):$(VERSION_TAG)
 
 .PHONY: calico-kube-controllers.tar
 calico-kube-controllers.tar:
-	docker pull $(IMAGE_REGISTRY)/$(KUBECONTROLLERS_IMAGE):$(VERSION_TAG)
+	docker pull $(FV_IMAGE_REGISTRY)/$(KUBECONTROLLERS_IMAGE):$(VERSION_TAG)
 	docker save --output $@ $(KUBECONTROLLERS_IMAGE):$(VERSION_TAG)
 
 .PHONY: calico-typha.tar
 calico-typha.tar:
-	docker pull $(IMAGE_REGISTRY)/$(TYPHA_IMAGE):$(VERSION_TAG)
+	docker pull $(FV_IMAGE_REGISTRY)/$(TYPHA_IMAGE):$(VERSION_TAG)
 	docker save --output $@ $(TYPHA_IMAGE):$(VERSION_TAG)
 
 .PHONY: calico-csi.tar
 calico-csi.tar:
-	docker pull $(IMAGE_REGISTRY)/$(CSI_IMAGE):$(VERSION_TAG)
+	docker pull $(FV_IMAGE_REGISTRY)/$(CSI_IMAGE):$(VERSION_TAG)
 	docker save --output $@ $(CSI_IMAGE):$(VERSION_TAG)
 
 .PHONY: calico-node-driver-registrar.tar
 calico-node-driver-registrar.tar:
-	docker pull $(IMAGE_REGISTRY)/$(NODE_DRIVER_REGISTRAR_IMAGE):$(VERSION_TAG)
+	docker pull $(FV_IMAGE_REGISTRY)/$(NODE_DRIVER_REGISTRAR_IMAGE):$(VERSION_TAG)
 	docker save --output $@ $(NODE_DRIVER_REGISTRAR_IMAGE):$(VERSION_TAG)
 
 IMAGE_TARS := calico-node.tar \
@@ -580,7 +550,7 @@ release-prep: var-require-all-GIT_PR_BRANCH_BASE-GIT_REPO_SLUG-VERSION-CALICO_VE
 	$(YQ_V4) ".title = \"$(COMMON_VERSION)\" | .components.key-cert-provisioner.version = \"$(COMMON_VERSION)\"" -i config/common_versions.yml
 	sed -i "s/\"gcr.io.*\"/\"quay.io\/\"/g" pkg/components/images.go
 	sed -i "s/\"gcr.io.*\"/\"quay.io\"/g" hack/gen-versions/main.go
-	$(MAKE) gen-versions release-prep/create-and-push-branch release-prep/create-pr release-prep/set-merge-when-ready-on-pr
+	$(MAKE) gen-versions release-prep/create-and-push-branch release-prep/create-pr release-prep/set-pr-labels
 
 GIT_REMOTE?=origin
 ifneq ($(if $(GIT_REPO_SLUG),$(shell dirname $(GIT_REPO_SLUG)),), $(shell dirname `git config remote.$(GIT_REMOTE).url | cut -d: -f2`))
@@ -605,9 +575,9 @@ release-prep/create-pr:
 	$(call github_pr_create,$(GIT_REPO_SLUG),[$(GIT_PR_BRANCH_BASE)] $(if $(SEMAPHORE), Semaphore,) Auto Release Update for $(VERSION),$(GIT_PR_BRANCH_HEAD),$(GIT_PR_BRANCH_BASE))
 	echo 'Created release update pull request for $(VERSION): $(PR_NUMBER)'
 
-release-prep/set-merge-when-ready-on-pr:
-	$(call github_pr_add_comment,$(GIT_REPO_SLUG),$(PR_NUMBER),/merge-when-ready delete-branch)
-	echo "Added '/merge-when-ready' comment command to pull request $(PR_NUMBER)"
+release-prep/set-pr-labels:
+	$(call github_pr_add_comment,$(GIT_REPO_SLUG),$(PR_NUMBER),/merge-when-ready release-note-not-required docs-not-required delete-branch)
+	echo "Added labels to pull request $(PR_NUMBER): merge-when-ready, release-note-not-required, docs-not-required & delete-branch"
 
 ###############################################################################
 # Utilities
@@ -792,7 +762,7 @@ fmt:
 	go fmt ./...'
 
 # Run go vet against code
-vet: register
+vet:
 	$(CONTAINERIZED) $(CALICO_BUILD) \
 	sh -c '$(GIT_CONFIG_SSH) \
 	go vet ./...'

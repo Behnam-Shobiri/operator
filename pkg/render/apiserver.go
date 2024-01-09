@@ -226,12 +226,19 @@ func (c *apiServerComponent) Objects() ([]client.Object, []client.Object) {
 		c.kubeControllerMgrTierGetterClusterRoleBinding(),
 		c.uisettingsgroupGetterClusterRole(),
 		c.kubeControllerMgrUisettingsgroupGetterClusterRoleBinding(),
-		c.tigeraUserClusterRole(),
-		c.tigeraNetworkAdminClusterRole(),
 		c.tieredPolicyPassthruClusterRole(),
 		c.tieredPolicyPassthruClusterRolebinding(),
 		c.uiSettingsPassthruClusterRole(),
 		c.uiSettingsPassthruClusterRolebinding(),
+	}
+
+	if !c.cfg.MultiTenant {
+		// These resources are only installed in zero-tenant clusters. Multi-tenant clusters don't use the default
+		// RBAC resources.
+		globalEnterpriseObjects = append(globalEnterpriseObjects,
+			c.tigeraUserClusterRole(),
+			c.tigeraNetworkAdminClusterRole(),
+		)
 	}
 
 	if c.cfg.ManagementCluster != nil {
@@ -1603,6 +1610,18 @@ func (c *apiServerComponent) tigeraUserClusterRole() *rbacv1.ClusterRole {
 			Resources: []string{"services"},
 			Verbs:     []string{"get", "list", "watch"},
 		},
+		// Allow the user to read felixconfigurations to detect if wireguard and/or other features are enabled.
+		{
+			APIGroups: []string{"projectcalico.org"},
+			Resources: []string{"felixconfigurations"},
+			Verbs:     []string{"get", "list"},
+		},
+		// Allow the user to only view securityeventwebhooks.
+		{
+			APIGroups: []string{"crd.projectcalico.org"},
+			Resources: []string{"securityeventwebhooks"},
+			Verbs:     []string{"get", "list"},
+		},
 	}
 
 	// Privileges for lma.tigera.io have no effect on managed clusters.
@@ -1758,6 +1777,37 @@ func (c *apiServerComponent) tigeraNetworkAdminClusterRole() *rbacv1.ClusterRole
 			APIGroups: []string{""},
 			Resources: []string{"services"},
 			Verbs:     []string{"get", "list", "watch", "patch"},
+		},
+		// Allow the user to read felixconfigurations to detect if wireguard and/or other features are enabled.
+		{
+			APIGroups: []string{"projectcalico.org"},
+			Resources: []string{"felixconfigurations"},
+			Verbs:     []string{"get", "list"},
+		},
+		// Allow the user to perform CRUD operations on securityeventwebhooks.
+		{
+			APIGroups: []string{"crd.projectcalico.org"},
+			Resources: []string{"securityeventwebhooks"},
+			Verbs:     []string{"get", "list", "update", "patch", "create", "delete"},
+		},
+		// Allow the user to create secrets.
+		{
+			APIGroups: []string{""},
+			Resources: []string{
+				"secrets",
+			},
+			Verbs: []string{"create"},
+		},
+		// Allow the user to patch webhooks-secret secret.
+		{
+			APIGroups: []string{""},
+			Resources: []string{
+				"secrets",
+			},
+			ResourceNames: []string{
+				"webhooks-secret",
+			},
+			Verbs: []string{"patch"},
 		},
 	}
 

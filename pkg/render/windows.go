@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -56,7 +56,6 @@ type WindowsConfiguration struct {
 	TLS                     *TyphaNodeTLS
 	PrometheusServerTLS     certificatemanagement.KeyPairInterface
 	NodeReporterMetricsPort int
-	AmazonCloudIntegration  *operatorv1.AmazonCloudIntegration
 	VXLANVNI                int
 }
 
@@ -576,6 +575,7 @@ func (c *windowsComponent) windowsEnvVars() []corev1.EnvVar {
 		windowsEnv = append(windowsEnv, corev1.EnvVar{Name: "FELIX_TYPHAURISAN", Value: c.cfg.TLS.TyphaURISAN})
 	}
 
+	kubeNetwork := "Calico.*"
 	if c.cfg.Installation.CNI != nil && c.cfg.Installation.CNI.Type == operatorv1.PluginCalico {
 		// If using Calico CNI, we need to manage CNI credential rotation on the host.
 		windowsEnv = append(windowsEnv, corev1.EnvVar{Name: "CALICO_MANAGE_CNI", Value: "true"})
@@ -585,16 +585,12 @@ func (c *windowsComponent) windowsEnvVars() []corev1.EnvVar {
 
 	if c.cfg.Installation.CNI != nil && c.cfg.Installation.CNI.Type == operatorv1.PluginAmazonVPC {
 		windowsEnv = append(windowsEnv, corev1.EnvVar{Name: "FELIX_BPFEXTTOSERVICECONNMARK", Value: "0x80"})
-	}
-
-	// Set the KUBE_NETWORK env var based on the Provider
-	kubeNetwork := "Calico.*"
-	switch c.cfg.Installation.KubernetesProvider {
-	case operatorv1.ProviderAKS:
-		kubeNetwork = "azure.*"
-	case operatorv1.ProviderEKS:
 		kubeNetwork = "vpc.*"
 	}
+	if c.cfg.Installation.CNI != nil && c.cfg.Installation.CNI.Type == operatorv1.PluginAzureVNET {
+		kubeNetwork = "azure.*"
+	}
+
 	windowsEnv = append(windowsEnv, corev1.EnvVar{Name: "KUBE_NETWORK", Value: kubeNetwork})
 
 	// Determine MTU to use. If specified explicitly, use that. Otherwise, set defaults based on an overall
@@ -712,18 +708,6 @@ func (c *windowsComponent) windowsEnvVars() []corev1.EnvVar {
 
 	if c.cfg.Installation.CNI.Type != operatorv1.PluginCalico {
 		windowsEnv = append(windowsEnv, corev1.EnvVar{Name: "FELIX_ROUTESOURCE", Value: "WorkloadIPs"})
-	}
-
-	if c.cfg.AmazonCloudIntegration != nil {
-		windowsEnv = append(windowsEnv, GetTigeraSecurityGroupEnvVariables(c.cfg.AmazonCloudIntegration)...)
-		windowsEnv = append(windowsEnv, corev1.EnvVar{
-			Name:  "FELIX_FAILSAFEINBOUNDHOSTPORTS",
-			Value: "tcp:22,udp:68,tcp:179,tcp:443,tcp:5473,tcp:6443",
-		})
-		windowsEnv = append(windowsEnv, corev1.EnvVar{
-			Name:  "FELIX_FAILSAFEOUTBOUNDHOSTPORTS",
-			Value: "udp:53,udp:67,tcp:179,tcp:443,tcp:5473,tcp:6443",
-		})
 	}
 
 	windowsEnv = append(windowsEnv, c.cfg.K8sServiceEp.EnvVars(true, c.cfg.Installation.KubernetesProvider)...)

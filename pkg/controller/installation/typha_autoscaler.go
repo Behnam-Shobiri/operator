@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -233,10 +233,6 @@ func (t *typhaAutoscaler) getNodeCounts() (int, int, error) {
 	for _, obj := range t.nodeIndexInformer.GetIndexer().List() {
 		n := obj.(*v1.Node)
 		if n.Spec.Unschedulable {
-			continue
-		}
-		if n.GetObjectMeta().GetLabels()["projectcalico.org/operator-node-migration"] == "pre-operator" {
-			// This node hasn't been migrated to the operator yet. Don't include it in the number of desired Typhas.
 			continue
 		}
 

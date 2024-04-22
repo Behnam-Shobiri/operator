@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -37,6 +37,12 @@ var (
 	ComponentCalicoCNIWindows = component{
 		Version:  "master",
 		Image:    "calico/cni-windows",
+		Registry: "",
+	}
+
+	ComponentCalicoCSRInitContainer = component{
+		Version:  "master",
+		Image:    "calico/key-cert-provisioner",
 		Registry: "",
 	}
 
@@ -82,7 +88,7 @@ var (
 		Registry: "",
 	}
 
-	ComponentFlexVolume = component{
+	ComponentCalicoFlexVolume = component{
 		Version:  "master",
 		Image:    "calico/pod2daemon-flexvol",
 		Registry: "",
@@ -132,6 +138,7 @@ var (
 		ComponentCalicoCNI,
 		ComponentCalicoCNIFIPS,
 		ComponentCalicoCNIWindows,
+		ComponentCalicoCSRInitContainer,
 		ComponentCalicoKubeControllers,
 		ComponentCalicoKubeControllersFIPS,
 		ComponentCalicoNode,
@@ -139,7 +146,7 @@ var (
 		ComponentCalicoNodeWindows,
 		ComponentCalicoTypha,
 		ComponentCalicoTyphaFIPS,
-		ComponentFlexVolume,
+		ComponentCalicoFlexVolume,
 		ComponentOperatorInit,
 		ComponentCalicoAPIServer,
 		ComponentCalicoAPIServerFIPS,

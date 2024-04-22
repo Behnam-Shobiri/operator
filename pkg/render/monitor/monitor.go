@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,11 +32,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/common/authentication"
+	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	"github.com/tigera/operator/pkg/render/common/configmap"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
@@ -274,12 +276,18 @@ func (mc *monitorComponent) prometheusOperatorClusterRole() *rbacv1.ClusterRole 
 			Resources: []string{
 				"alertmanagers",
 				"alertmanagers/finalizers",
+				"alertmanagers/status",
 				"alertmanagerconfigs",
 				"prometheuses",
 				"prometheuses/finalizers",
 				"prometheuses/status",
+				"prometheusagents",
+				"prometheusagents/finalizers",
+				"prometheusagents/status",
 				"thanosrulers",
 				"thanosrulers/finalizers",
+				"thanosrulers/status",
+				"scrapeconfigs",
 				"servicemonitors",
 				"podmonitors",
 				"probes",
@@ -316,10 +324,10 @@ func (mc *monitorComponent) prometheusOperatorClusterRole() *rbacv1.ClusterRole 
 				"endpoints",
 			},
 			Verbs: []string{
-				"create",
-				"delete",
 				"get",
+				"create",
 				"update",
+				"delete",
 			},
 		},
 		{
@@ -346,6 +354,13 @@ func (mc *monitorComponent) prometheusOperatorClusterRole() *rbacv1.ClusterRole 
 				"get",
 				"list",
 				"watch",
+			},
+		},
+		{
+			APIGroups: []string{"storage.k8s.io"},
+			Resources: []string{"storageclasses"},
+			Verbs: []string{
+				"get",
 			},
 		},
 	}
@@ -390,7 +405,16 @@ func (mc *monitorComponent) prometheusOperatorPodSecurityPolicy() *policyv1beta1
 }
 
 func (mc *monitorComponent) alertmanager() *monitoringv1.Alertmanager {
-	return &monitoringv1.Alertmanager{
+
+	resources := corev1.ResourceRequirements{}
+
+	if mc.cfg.Monitor.AlertManager != nil {
+		if mc.cfg.Monitor.AlertManager.AlertManagerSpec != nil {
+			resources = mc.cfg.Monitor.AlertManager.AlertManagerSpec.Resources
+		}
+	}
+
+	am := &monitoringv1.Alertmanager{
 		TypeMeta: metav1.TypeMeta{Kind: monitoringv1.AlertmanagersKind, APIVersion: MonitoringAPIVersion},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      CalicoNodeAlertmanager,
@@ -406,8 +430,10 @@ func (mc *monitorComponent) alertmanager() *monitoringv1.Alertmanager {
 			ServiceAccountName: PrometheusServiceAccountName,
 			Tolerations:        mc.cfg.Installation.ControlPlaneTolerations,
 			Version:            components.ComponentCoreOSAlertmanager.Version,
+			Resources:          resources,
 		},
 	}
+	return am
 }
 
 func (mc *monitorComponent) alertmanagerService() *corev1.Service {
@@ -494,7 +520,7 @@ func (mc *monitorComponent) prometheus() *monitoringv1.Prometheus {
 		env = append(env, mc.cfg.KeyValidatorConfig.RequiredEnv("")...)
 	}
 
-	return &monitoringv1.Prometheus{
+	prometheus := &monitoringv1.Prometheus{
 		TypeMeta: metav1.TypeMeta{Kind: monitoringv1.PrometheusesKind, APIVersion: MonitoringAPIVersion},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      CalicoNodePrometheus,
@@ -575,6 +601,12 @@ func (mc *monitorComponent) prometheus() *monitoringv1.Prometheus {
 			}},
 		},
 	}
+
+	if overrides := mc.cfg.Monitor.Prometheus; overrides != nil {
+		rcomponents.ApplyPrometheusOverrides(prometheus, overrides)
+	}
+
+	return prometheus
 }
 
 func (mc *monitorComponent) prometheusServiceAccount() *corev1.ServiceAccount {
@@ -1090,14 +1122,6 @@ func allowTigeraPrometheusPolicy(cfg *Config) *v3.NetworkPolicy {
 			Action:   v3.Allow,
 			Protocol: &networkpolicy.TCPProtocol,
 			Destination: v3.EntityRule{
-				// Egress access for Kube controller port metrics.
-				Ports: networkpolicy.Ports(uint16(cfg.KubeControllerPort)),
-			},
-		},
-		{
-			Action:   v3.Allow,
-			Protocol: &networkpolicy.TCPProtocol,
-			Destination: v3.EntityRule{
 				Selector: alertManagerSelector,
 				Ports:    networkpolicy.Ports(AlertmanagerPort),
 			},
@@ -1108,6 +1132,17 @@ func allowTigeraPrometheusPolicy(cfg *Config) *v3.NetworkPolicy {
 			Destination: render.DexEntityRule,
 		},
 	}...)
+
+	if cfg.KubeControllerPort != 0 {
+		egressRules = append(egressRules, v3.Rule{
+			Action:   v3.Allow,
+			Protocol: &networkpolicy.TCPProtocol,
+			Destination: v3.EntityRule{
+				// Egress access for Kube controller port metrics.
+				Ports: networkpolicy.Ports(uint16(cfg.KubeControllerPort)),
+			},
+		})
+	}
 
 	typhaMetricsPort := cfg.Installation.TyphaMetricsPort
 	if typhaMetricsPort != nil {

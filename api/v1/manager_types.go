@@ -24,9 +24,6 @@ import (
 
 // ManagerSpec defines configuration for the Calico Enterprise manager GUI.
 type ManagerSpec struct {
-	// Deprecated. Please use the Authentication CR for configuring authentication.
-	// +optional
-	Auth *Auth `json:"auth,omitempty"`
 
 	// ManagerDeployment configures the Manager Deployment.
 	// +optional
@@ -75,6 +72,7 @@ type ManagerDeploymentPodSpec struct {
 // ManagerDeploymentContainer is a Manager Deployment container.
 type ManagerDeploymentContainer struct {
 	// Name is an enum which identifies the Manager Deployment container by name.
+	// Supported values are: tigera-voltron, tigera-manager, tigera-es-proxy
 	// +kubebuilder:validation:Enum=tigera-voltron;tigera-manager;tigera-es-proxy
 	Name string `json:"name"`
 
@@ -88,6 +86,7 @@ type ManagerDeploymentContainer struct {
 // ManagerDeploymentInitContainer is a Manager Deployment init container.
 type ManagerDeploymentInitContainer struct {
 	// Name is an enum which identifies the Manager Deployment init container by name.
+	// Supported values are: manager-tls-key-cert-provisioner, internal-manager-tls-key-cert-provisioner, tigera-voltron-linseed-tls-key-cert-provisioner
 	// +kubebuilder:validation:Enum=manager-tls-key-cert-provisioner;internal-manager-tls-key-cert-provisioner;tigera-voltron-linseed-tls-key-cert-provisioner
 	Name string `json:"name"`
 
@@ -101,9 +100,6 @@ type ManagerDeploymentInitContainer struct {
 
 // ManagerStatus defines the observed state of the Calico Enterprise manager GUI.
 type ManagerStatus struct {
-	// Deprecated. Please use the Authentication CR for configuring authentication.
-	// +optional
-	Auth *Auth `json:"auth,omitempty"`
 
 	// State provides user-readable status.
 	State string `json:"state,omitempty"`
@@ -113,33 +109,6 @@ type ManagerStatus struct {
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
-
-// Auth defines authentication configuration.
-type Auth struct {
-	// Type configures the type of authentication used by the manager.
-	// Default: Token
-	// +kubebuilder:validation:Enum=Token;Basic;OIDC;OAuth
-	Type AuthType `json:"type,omitempty"`
-
-	// Authority configures the OAuth2/OIDC authority/issuer when using OAuth2 or OIDC login.
-	// +optional
-	Authority string `json:"authority,omitempty"`
-
-	// ClientId configures the OAuth2/OIDC client ID to use for OAuth2 or OIDC login.
-	// +optional
-	ClientID string `json:"clientID,omitempty"`
-}
-
-// AuthType represents the type of authentication to use. Valid
-// options are: Token, Basic, OIDC, OAuth
-type AuthType string
-
-const (
-	AuthTypeToken = "Token"
-	AuthTypeBasic = "Basic"
-	AuthTypeOIDC  = "OIDC"
-	AuthTypeOAuth = "OAuth"
-)
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
@@ -247,6 +216,10 @@ func (c *ManagerDeployment) GetTerminationGracePeriodSeconds() *int64 {
 
 func (c *ManagerDeployment) GetDeploymentStrategy() *appsv1.DeploymentStrategy {
 	return nil
+}
+
+func (c *ManagerDeployment) GetPriorityClassName() string {
+	return ""
 }
 
 func init() {

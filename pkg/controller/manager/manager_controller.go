@@ -18,8 +18,6 @@ import (
 	"context"
 	"fmt"
 
-	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
-
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -31,9 +29,9 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
@@ -42,11 +40,14 @@ import (
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
 	"github.com/tigera/operator/pkg/controller/utils/imageset"
+	"github.com/tigera/operator/pkg/ctrlruntime"
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
 	tigerakvc "github.com/tigera/operator/pkg/render/common/authentication/tigera/key_validator_config"
+	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
+	rmanager "github.com/tigera/operator/pkg/render/manager"
 	"github.com/tigera/operator/pkg/render/monitor"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
@@ -70,7 +71,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	reconciler := newReconciler(mgr, opts, licenseAPIReady, tierWatchReady)
 
 	// Create a new controller
-	managerController, err := controller.New("cmanager-controller", mgr, controller.Options{Reconciler: reconciler})
+	c, err := ctrlruntime.NewController("manager-controller", mgr, controller.Options{Reconciler: reconciler})
 	if err != nil {
 		return fmt.Errorf("failed to create manager-controller: %w", err)
 	}
@@ -91,50 +92,60 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	// Make a helper for determining which namespaces to use based on tenancy mode.
 	helper := utils.NewNamespaceHelper(opts.MultiTenant, render.ManagerNamespace, "")
 
-	if err := utils.AddSecretsWatch(managerController, render.VoltronLinseedTLS, helper.InstallNamespace()); err != nil {
+	if err := utils.AddSecretsWatch(c, render.VoltronLinseedTLS, helper.InstallNamespace()); err != nil {
 		return err
 	}
 
-	go utils.WaitToAddLicenseKeyWatch(managerController, k8sClient, log, licenseAPIReady)
-	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, managerController, k8sClient, log, tierWatchReady)
-	go utils.WaitToAddNetworkPolicyWatches(managerController, k8sClient, log, []types.NamespacedName{
+	go utils.WaitToAddLicenseKeyWatch(c, k8sClient, log, licenseAPIReady)
+	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, k8sClient, log, tierWatchReady)
+	go utils.WaitToAddNetworkPolicyWatches(c, k8sClient, log, []types.NamespacedName{
 		{Name: render.ManagerPolicyName, Namespace: helper.InstallNamespace()},
 		{Name: networkpolicy.TigeraComponentDefaultDenyPolicyName, Namespace: helper.InstallNamespace()},
 	})
 
 	// Watch for changes to primary resource Manager
-	err = managerController.Watch(&source.Kind{Type: &operatorv1.Manager{}}, &handler.EnqueueRequestForObject{})
+	err = c.WatchObject(&operatorv1.Manager{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return fmt.Errorf("manager-controller failed to watch primary resource: %w", err)
 	}
 
+	err = c.WatchObject(&operatorv1.TLSTerminatedRoute{}, &handler.EnqueueRequestForObject{})
+	if err != nil {
+		return fmt.Errorf("manager-controller failed to watch TLSTerminatedRoutes: %w", err)
+	}
+
+	err = c.WatchObject(&operatorv1.TLSPassThroughRoute{}, &handler.EnqueueRequestForObject{})
+	if err != nil {
+		return fmt.Errorf("manager-controller failed to watch TLSPassThroughRoutes: %w", err)
+	}
+
 	// Watch for other operator.tigera.io resources.
-	if err = managerController.Watch(&source.Kind{Type: &operatorv1.Installation{}}, eventHandler); err != nil {
+	if err = c.WatchObject(&operatorv1.Installation{}, eventHandler); err != nil {
 		return fmt.Errorf("manager-controller failed to watch Installation resource: %w", err)
 	}
-	if err = managerController.Watch(&source.Kind{Type: &operatorv1.APIServer{}}, eventHandler); err != nil {
+	if err = c.WatchObject(&operatorv1.APIServer{}, eventHandler); err != nil {
 		return fmt.Errorf("manager-controller failed to watch APIServer resource: %w", err)
 	}
-	if err = managerController.Watch(&source.Kind{Type: &operatorv1.Compliance{}}, eventHandler); err != nil {
+	if err = c.WatchObject(&operatorv1.Compliance{}, eventHandler); err != nil {
 		return fmt.Errorf("manager-controller failed to watch APIServer resource: %w", err)
 	}
-	if err = managerController.Watch(&source.Kind{Type: &operatorv1.ManagementCluster{}}, eventHandler); err != nil {
+	if err = c.WatchObject(&operatorv1.ManagementCluster{}, eventHandler); err != nil {
 		return fmt.Errorf("manager-controller failed to watch primary resource: %w", err)
 	}
-	if err = managerController.Watch(&source.Kind{Type: &operatorv1.ManagementClusterConnection{}}, eventHandler); err != nil {
+	if err = c.WatchObject(&operatorv1.ManagementClusterConnection{}, eventHandler); err != nil {
 		return fmt.Errorf("manager-controller failed to watch primary resource: %w", err)
 	}
-	if err = managerController.Watch(&source.Kind{Type: &operatorv1.Authentication{}}, eventHandler); err != nil {
+	if err = c.WatchObject(&operatorv1.Authentication{}, eventHandler); err != nil {
 		return fmt.Errorf("manager-controller failed to watch resource: %w", err)
 	}
-	if err = utils.AddTigeraStatusWatch(managerController, ResourceName); err != nil {
+	if err = utils.AddTigeraStatusWatch(c, ResourceName); err != nil {
 		return fmt.Errorf("manager-controller failed to watch manager Tigerastatus: %w", err)
 	}
-	if err = managerController.Watch(&source.Kind{Type: &operatorv1.ImageSet{}}, eventHandler); err != nil {
+	if err = c.WatchObject(&operatorv1.ImageSet{}, eventHandler); err != nil {
 		return fmt.Errorf("manager-controller failed to watch ImageSet: %w", err)
 	}
 	if opts.MultiTenant {
-		if err = managerController.Watch(&source.Kind{Type: &operatorv1.Tenant{}}, &handler.EnqueueRequestForObject{}); err != nil {
+		if err = c.WatchObject(&operatorv1.Tenant{}, &handler.EnqueueRequestForObject{}); err != nil {
 			return fmt.Errorf("manager-controller failed to watch Tenant resource: %w", err)
 		}
 	}
@@ -146,30 +157,32 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	}
 	for _, namespace := range namespacesToWatch {
 		for _, secretName := range []string{
-			render.ManagerTLSSecretName, render.ElasticsearchManagerUserSecret,
+			// We need to watch for es-gateway certificate because es-proxy still creates a
+			// client to talk to elastic via es-gateway
+			render.ManagerTLSSecretName, render.ElasticsearchManagerUserSecret, relasticsearch.PublicCertSecret,
 			render.VoltronTunnelSecretName, render.ComplianceServerCertSecret, render.PacketCaptureServerCert,
 			render.ManagerInternalTLSSecretName, monitor.PrometheusServerTLSSecretName, certificatemanagement.CASecretName,
 		} {
-			if err = utils.AddSecretsWatch(managerController, secretName, namespace); err != nil {
+			if err = utils.AddSecretsWatch(c, secretName, namespace); err != nil {
 				return fmt.Errorf("manager-controller failed to watch the secret '%s' in '%s' namespace: %w", secretName, namespace, err)
 			}
 		}
 	}
 
-	if err = utils.AddConfigMapWatch(managerController, tigerakvc.StaticWellKnownJWKSConfigMapName, common.OperatorNamespace(), &handler.EnqueueRequestForObject{}); err != nil {
+	if err = utils.AddConfigMapWatch(c, tigerakvc.StaticWellKnownJWKSConfigMapName, common.OperatorNamespace(), &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("manager-controller failed to watch ConfigMap resource %s: %w", tigerakvc.StaticWellKnownJWKSConfigMapName, err)
 	}
 
-	if err = utils.AddConfigMapWatch(managerController, relasticsearch.ClusterConfigConfigMapName, common.OperatorNamespace(), eventHandler); err != nil {
+	if err = utils.AddConfigMapWatch(c, relasticsearch.ClusterConfigConfigMapName, common.OperatorNamespace(), eventHandler); err != nil {
 		return fmt.Errorf("compliance-controller failed to watch the ConfigMap resource: %w", err)
 	}
 
-	if err = utils.AddNamespaceWatch(managerController, common.TigeraPrometheusNamespace); err != nil {
+	if err = utils.AddNamespaceWatch(c, common.TigeraPrometheusNamespace); err != nil {
 		return fmt.Errorf("manager-controller failed to watch the '%s' namespace: %w", common.TigeraPrometheusNamespace, err)
 	}
 
 	if !opts.ElasticExternal {
-		if err = utils.AddConfigMapWatch(managerController, render.ECKLicenseConfigMapName, render.ECKOperatorNamespace, eventHandler); err != nil {
+		if err = utils.AddConfigMapWatch(c, render.ECKLicenseConfigMapName, render.ECKOperatorNamespace, eventHandler); err != nil {
 			return fmt.Errorf("manager-controller failed to watch the ConfigMap resource: %v", err)
 		}
 	}
@@ -228,10 +241,7 @@ func GetManager(ctx context.Context, cli client.Client, mt bool, ns string) (*op
 	if err != nil {
 		return nil, err
 	}
-	if instance.Spec.Auth != nil && instance.Spec.Auth.Type != operatorv1.AuthTypeToken {
-		return nil, fmt.Errorf("auth types other than 'Token' can no longer be configured using the Manager CR, " +
-			"please use the Authentication CR instead")
-	}
+
 	return instance, nil
 }
 
@@ -305,7 +315,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 	// Ensure the allow-tigera tier exists, before rendering any network policies within it.
 	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.TigeraComponentTierName}, &v3.Tier{}); err != nil {
 		if errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for allow-tigera tier to be created", err, logc)
+			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for allow-tigera tier to be created, see the 'tiers' TigeraStatus for more information", err, logc)
 			return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 		} else {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying allow-tigera tier", err, logc)
@@ -378,7 +388,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 
 	// Determine if compliance is enabled.
 	complianceLicenseFeatureActive := utils.IsFeatureActive(license, common.ComplianceFeature)
-	complianceCR, err := compliance.GetCompliance(ctx, r.client)
+	complianceCR, err := compliance.GetCompliance(ctx, r.client, r.multiTenant, request.Namespace)
 	if err != nil && !errors.IsNotFound(err) {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying compliance: ", err, logc)
 		return reconcile.Result{}, err
@@ -398,6 +408,17 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 			render.ProjectCalicoAPIServerTLSSecretName(installation.Variant),
 			render.TigeraLinseedSecret,
 		}
+		// This is necessary because prior to v3.13 secrets were not signed by a single CA, so we need to include each individually
+		// in the trusted bundle
+		esgwCertificate, err := certificateManager.GetCertificate(r.client, relasticsearch.PublicCertSecret, common.OperatorNamespace())
+		if err != nil {
+			r.status.SetDegraded(operatorv1.ResourceReadError, fmt.Sprintf("Failed to retrieve / validate  %s", relasticsearch.PublicCertSecret), err, logc)
+			return reconcile.Result{}, err
+		}
+		if esgwCertificate != nil {
+			trustedSecretNames = append(trustedSecretNames, relasticsearch.PublicCertSecret)
+		}
+
 		// If external prometheus is enabled, the secret will be signed by the Calico CA and no secret will be created. We can skip
 		// adding it to the bundle, as trusting the CA will suffice.
 		monitorCR := &operatorv1.Monitor{}
@@ -640,7 +661,14 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		namespaces = append(namespaces, render.ManagerNamespace)
 	}
 
+	routeConfig, err := getVoltronRouteConfig(ctx, r.client, helper.InstallNamespace())
+	if err != nil {
+		r.status.SetDegraded(operatorv1.InternalServerError, "Failed to create Voltron Route Configuration", err, logc)
+		return reconcile.Result{}, err
+	}
+
 	managerCfg := &render.ManagerConfiguration{
+		VoltronRouteConfig:      routeConfig,
 		KeyValidatorConfig:      keyValidatorConfig,
 		ESSecrets:               esSecrets,
 		TrustedCertBundle:       trustedBundle,
@@ -658,10 +686,12 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		Replicas:                replicas,
 		Compliance:              complianceCR,
 		ComplianceLicenseActive: complianceLicenseFeatureActive,
+		ComplianceNamespace:     utils.NewNamespaceHelper(r.multiTenant, render.ComplianceNamespace, request.Namespace).InstallNamespace(),
 		UsePSP:                  r.usePSP,
 		Namespace:               helper.InstallNamespace(),
 		TruthNamespace:          helper.TruthNamespace(),
 		Tenant:                  tenant,
+		ExternalElastic:         r.elasticExternal,
 		BindingNamespaces:       namespaces,
 		Manager:                 instance,
 	}
@@ -727,4 +757,62 @@ func fillDefaults(mc *operatorv1.ManagementCluster) {
 	if mc.Spec.TLS.SecretName == "" {
 		mc.Spec.TLS.SecretName = render.VoltronTunnelSecretName
 	}
+}
+
+func getVoltronRouteConfig(ctx context.Context, cli client.Client, managerNamespace string) (*rmanager.VoltronRouteConfig, error) {
+	terminatedRouteList := &operatorv1.TLSTerminatedRouteList{}
+	if err := cli.List(ctx, terminatedRouteList); err != nil {
+		return nil, err
+	}
+
+	passThroughRouteList := &operatorv1.TLSPassThroughRouteList{}
+	if err := cli.List(ctx, passThroughRouteList); err != nil {
+		return nil, err
+	}
+
+	if len(terminatedRouteList.Items) == 0 && len(passThroughRouteList.Items) == 0 {
+		return nil, nil
+	}
+
+	builder := rmanager.NewVoltronRouteConfigBuilder()
+	for _, route := range terminatedRouteList.Items {
+		if route.Spec.CABundle != nil {
+			cm := &corev1.ConfigMap{}
+			// Verify that the ConfigMap exists in the manager namespace.
+			if err := cli.Get(ctx, client.ObjectKey{Name: route.Spec.CABundle.Name, Namespace: managerNamespace}, cm); err != nil {
+				return nil, fmt.Errorf("failed to retrieve the ConfigMap containing the CA for TLS terminated route %s: %w", route.Name, err)
+			}
+
+			// Add the config map to the builder to rerender the annotations if it changes.
+			builder.AddConfigMap(cm)
+		}
+
+		if route.Spec.ForwardingMTLSCert != nil {
+			certSecret := &corev1.Secret{}
+			// Verify that the MTLS cert secret exist in the manager namespace.
+			if err := cli.Get(ctx, client.ObjectKey{Name: route.Spec.ForwardingMTLSCert.Name, Namespace: managerNamespace}, certSecret); err != nil {
+				return nil, fmt.Errorf("failed to retrieve the Secret containing the MTLS certificate for TLS terminated route %s: %w", route.Name, err)
+			}
+
+			builder.AddSecret(certSecret)
+		}
+
+		if route.Spec.ForwardingMTLSKey != nil {
+			keySecret := &corev1.Secret{}
+			// Verify that the MTLS secrets exist in the manager namespace.
+			if err := cli.Get(ctx, client.ObjectKey{Name: route.Spec.ForwardingMTLSKey.Name, Namespace: managerNamespace}, keySecret); err != nil {
+				return nil, fmt.Errorf("failed to retrieve the Secret containing the MTLS key for TLS terminated route %s: %w", route.Name, err)
+			}
+
+			builder.AddSecret(keySecret)
+		}
+
+		builder.AddTLSTerminatedRoute(route)
+	}
+
+	for _, route := range passThroughRouteList.Items {
+		builder.AddTLSPassThroughRoute(route)
+	}
+
+	return builder.Build()
 }

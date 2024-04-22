@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
@@ -41,8 +40,10 @@ import (
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/monitor"
+	"github.com/tigera/operator/test"
 )
 
 var _ = Describe("Monitor controller tests", func() {
@@ -63,7 +64,7 @@ var _ = Describe("Monitor controller tests", func() {
 
 		// Create a client that will have a crud interface of k8s objects.
 		ctx = context.Background()
-		cli = fake.NewClientBuilder().WithScheme(scheme).Build()
+		cli = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 
 		// Create an object we can use throughout the test to do the monitor reconcile loops.
 		mockStatus = &status.MockStatus{}
@@ -191,7 +192,7 @@ var _ = Describe("Monitor controller tests", func() {
 			mockStatus.On("SetMetaData", mock.Anything).Return()
 			r.status = mockStatus
 
-			utils.ExpectWaitForTierWatch(ctx, &r, mockStatus)
+			test.ExpectWaitForTierWatch(ctx, &r, mockStatus)
 
 			policies := v3.NetworkPolicyList{}
 			Expect(cli.List(ctx, &policies)).ToNot(HaveOccurred())

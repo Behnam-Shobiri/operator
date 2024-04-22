@@ -1,4 +1,4 @@
-// Copyright (c) 2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 
+	pcv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -82,7 +83,7 @@ type InstallationSpec struct {
 	// If the specified value is not empty, the Operator will still attempt auto-detection, but
 	// will additionally compare the auto-detected value to the specified value to confirm they match.
 	// +optional
-	// +kubebuilder:validation:Enum="";EKS;GKE;AKS;OpenShift;DockerEnterprise;RKE2;
+	// +kubebuilder:validation:Enum="";EKS;GKE;AKS;OpenShift;DockerEnterprise;RKE2;TKG;
 	KubernetesProvider Provider `json:"kubernetesProvider,omitempty"`
 
 	// CNI specifies the CNI that will be used by this installation.
@@ -287,7 +288,7 @@ type ComponentResource struct {
 }
 
 // Provider represents a particular provider or flavor of Kubernetes. Valid options
-// are: EKS, GKE, AKS, RKE2, OpenShift, DockerEnterprise.
+// are: EKS, GKE, AKS, RKE2, OpenShift, DockerEnterprise, TKG.
 type Provider string
 
 var (
@@ -298,6 +299,7 @@ var (
 	ProviderRKE2      Provider = "RKE2"
 	ProviderOpenShift Provider = "OpenShift"
 	ProviderDockerEE  Provider = "DockerEnterprise"
+	ProviderTKG       Provider = "TKG"
 )
 
 // ProductVariant represents the variant of the product.
@@ -434,6 +436,7 @@ type CalicoNetworkSpec struct {
 	// IPPools contains a list of IP pools to create if none exist. At most one IP pool of each
 	// address family may be specified. If omitted, a single pool will be configured if needed.
 	// +optional
+	// +kubebuilder:validation:MaxItems=25
 	IPPools []IPPool `json:"ipPools,omitempty"`
 
 	// MTU specifies the maximum transmission unit to use on the pod network.
@@ -473,6 +476,19 @@ type CalicoNetworkSpec struct {
 	// Sysctl configures sysctl parameters for tuning plugin
 	// +optional
 	Sysctl []Sysctl `json:"sysctl,omitempty"`
+
+	// LinuxPolicySetupTimeoutSeconds delays new pods from running containers
+	// until their policy has been programmed in the dataplane.
+	// The specified delay defines the maximum amount of time
+	// that the Calico CNI plugin will wait for policy to be programmed.
+	//
+	// Only applies to pods created on Linux nodes.
+	//
+	// * A value of 0 disables pod startup delays.
+	//
+	// Default: 0
+	// +optional
+	LinuxPolicySetupTimeoutSeconds *int32 `json:"linuxPolicySetupTimeoutSeconds,omitempty"`
 }
 
 // NodeAddressAutodetection provides configuration options for auto-detecting node addresses. At most one option
@@ -579,6 +595,9 @@ func (nt NATOutgoingType) String() string {
 const NodeSelectorDefault string = "all()"
 
 type IPPool struct {
+	// Name is the name of the IP pool. If omitted, this will be generated.
+	Name string `json:"name,omitempty"`
+
 	// CIDR contains the address range for the IP Pool in classless inter-domain routing format.
 	CIDR string `json:"cidr"`
 
@@ -611,6 +630,117 @@ type IPPool struct {
 	// +optional
 	// +kubebuilder:default:=false
 	DisableBGPExport *bool `json:"disableBGPExport,omitempty"`
+
+	// AllowedUse controls what the IP pool will be used for.  If not specified or empty, defaults to
+	// ["Tunnel", "Workload"] for back-compatibility
+	AllowedUses []IPPoolAllowedUse `json:"allowedUses,omitempty" validate:"omitempty"`
+}
+
+type IPPoolAllowedUse string
+
+const (
+	IPPoolAllowedUseWorkload IPPoolAllowedUse = "Workload"
+	IPPoolAllowedUseTunnel   IPPoolAllowedUse = "Tunnel"
+)
+
+// ToProjectCalicoV1 converts an IPPool to a crd.projectcalico.org/v1 IPPool resource.
+func (p *IPPool) ToProjectCalicoV1() (*pcv1.IPPool, error) {
+	pool := pcv1.IPPool{
+		TypeMeta: metav1.TypeMeta{Kind: "IPPool", APIVersion: "crd.projectcalico.org/v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   p.Name,
+			Labels: map[string]string{},
+		},
+		Spec: pcv1.IPPoolSpec{CIDR: p.CIDR},
+	}
+
+	// Set encap.
+	switch p.Encapsulation {
+	case EncapsulationIPIP:
+		pool.Spec.IPIPMode = pcv1.IPIPModeAlways
+		pool.Spec.VXLANMode = pcv1.VXLANModeNever
+	case EncapsulationIPIPCrossSubnet:
+		pool.Spec.IPIPMode = pcv1.IPIPModeCrossSubnet
+		pool.Spec.VXLANMode = pcv1.VXLANModeNever
+	case EncapsulationVXLAN:
+		pool.Spec.VXLANMode = pcv1.VXLANModeAlways
+		pool.Spec.IPIPMode = pcv1.IPIPModeNever
+	case EncapsulationVXLANCrossSubnet:
+		pool.Spec.VXLANMode = pcv1.VXLANModeCrossSubnet
+		pool.Spec.IPIPMode = pcv1.IPIPModeNever
+	}
+
+	// Set NAT
+	switch p.NATOutgoing {
+	case NATOutgoingEnabled:
+		pool.Spec.NATOutgoing = true
+	}
+
+	// Set BlockSize
+	if p.BlockSize != nil {
+		pool.Spec.BlockSize = int(*p.BlockSize)
+	}
+
+	// Set selector.
+	pool.Spec.NodeSelector = p.NodeSelector
+
+	// Set BGP export.
+	if p.DisableBGPExport != nil {
+		pool.Spec.DisableBGPExport = *p.DisableBGPExport
+	}
+
+	for _, use := range p.AllowedUses {
+		pool.Spec.AllowedUses = append(pool.Spec.AllowedUses, pcv1.IPPoolAllowedUse(use))
+	}
+
+	return &pool, nil
+}
+
+// FromProjectCalicoV1 populates the IP pool with the data from the given
+// crd.projectcalico.org/v1 IP pool. It is the direct inverse of ToProjectCalicoV1,
+// and should be updated with every new field added to the IP pool structure.
+func (p *IPPool) FromProjectCalicoV1(crd pcv1.IPPool) {
+	p.Name = crd.Name
+	p.CIDR = crd.Spec.CIDR
+
+	// Set encap.
+	switch crd.Spec.IPIPMode {
+	case pcv1.IPIPModeAlways:
+		p.Encapsulation = EncapsulationIPIP
+	case pcv1.IPIPModeCrossSubnet:
+		p.Encapsulation = EncapsulationIPIPCrossSubnet
+	}
+	switch crd.Spec.VXLANMode {
+	case pcv1.VXLANModeAlways:
+		p.Encapsulation = EncapsulationVXLAN
+	case pcv1.VXLANModeCrossSubnet:
+		p.Encapsulation = EncapsulationVXLANCrossSubnet
+	}
+
+	// Set NAT
+	if crd.Spec.NATOutgoing {
+		p.NATOutgoing = NATOutgoingEnabled
+	}
+
+	// Set BlockSize
+	blockSize := int32(crd.Spec.BlockSize)
+	p.BlockSize = &blockSize
+
+	// Set selector.
+	p.NodeSelector = crd.Spec.NodeSelector
+
+	// Set BGP export.
+	if crd.Spec.DisableBGPExport {
+		t := true
+		p.DisableBGPExport = &t
+	} else {
+		f := false
+		p.DisableBGPExport = &f
+	}
+
+	for _, use := range crd.Spec.AllowedUses {
+		p.AllowedUses = append(p.AllowedUses, IPPoolAllowedUse(use))
+	}
 }
 
 // CNIPluginType describes the type of CNI plugin used.
@@ -755,6 +885,14 @@ type Installation struct {
 	Spec InstallationSpec `json:"spec,omitempty"`
 	// Most recently observed state for the Calico or Calico Enterprise installation.
 	Status InstallationStatus `json:"status,omitempty"`
+}
+
+// BPFEnabled is an extension method that returns true if the Installation resource
+// has Calico Network Linux Dataplane set and equal to value "BPF" otherwise false.
+func (installation *InstallationSpec) BPFEnabled() bool {
+	return installation.CalicoNetwork != nil &&
+		installation.CalicoNetwork.LinuxDataplane != nil &&
+		*installation.CalicoNetwork.LinuxDataplane == LinuxDataplaneBPF
 }
 
 // +kubebuilder:object:root=true

@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,6 +32,10 @@ type ApplicationLayerSpec struct {
 	ApplicationLayerPolicy *ApplicationLayerPolicyStatusType `json:"applicationLayerPolicy,omitempty"`
 	// User-configurable settings for the Envoy proxy.
 	EnvoySettings *EnvoySettings `json:"envoy,omitempty"`
+
+	// L7LogCollectorDaemonSet configures the L7LogCollector DaemonSet.
+	// +optional
+	L7LogCollectorDaemonSet *L7LogCollectorDaemonSet `json:"l7LogCollectorDaemonSet,omitempty"`
 }
 
 type LogCollectionStatusType string

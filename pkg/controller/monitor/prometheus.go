@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,10 +19,7 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/utils/clock"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 
 	"github.com/go-logr/logr"
@@ -30,59 +27,60 @@ import (
 
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/controller/utils"
+	"github.com/tigera/operator/pkg/ctrlruntime"
 	"github.com/tigera/operator/pkg/render/monitor"
 )
 
-func addAlertmanagerWatch(c controller.Controller) error {
+func addAlertmanagerWatch(c ctrlruntime.Controller) error {
 	return utils.AddNamespacedWatch(c, &monitoringv1.Alertmanager{
 		TypeMeta:   metav1.TypeMeta{Kind: monitoringv1.AlertmanagersKind, APIVersion: monitor.MonitoringAPIVersion},
 		ObjectMeta: metav1.ObjectMeta{Name: monitor.CalicoNodeAlertmanager, Namespace: common.TigeraPrometheusNamespace},
 	}, &handler.EnqueueRequestForObject{})
 }
 
-func addPrometheusWatch(c controller.Controller) error {
+func addPrometheusWatch(c ctrlruntime.Controller) error {
 	return utils.AddNamespacedWatch(c, &monitoringv1.Prometheus{
 		TypeMeta:   metav1.TypeMeta{Kind: monitoringv1.PrometheusesKind, APIVersion: monitor.MonitoringAPIVersion},
 		ObjectMeta: metav1.ObjectMeta{Name: monitor.CalicoNodePrometheus, Namespace: common.TigeraPrometheusNamespace},
 	}, &handler.EnqueueRequestForObject{})
 }
 
-func addPrometheusRuleWatch(c controller.Controller) error {
+func addPrometheusRuleWatch(c ctrlruntime.Controller) error {
 	return utils.AddNamespacedWatch(c, &monitoringv1.PrometheusRule{
 		TypeMeta:   metav1.TypeMeta{Kind: monitoringv1.PrometheusRuleKind, APIVersion: monitor.MonitoringAPIVersion},
 		ObjectMeta: metav1.ObjectMeta{Name: monitor.TigeraPrometheusDPRate, Namespace: common.TigeraPrometheusNamespace},
 	}, &handler.EnqueueRequestForObject{})
 }
 
-func addServiceMonitorCalicoNodeWatch(c controller.Controller) error {
+func addServiceMonitorCalicoNodeWatch(c ctrlruntime.Controller) error {
 	return utils.AddNamespacedWatch(c, &monitoringv1.ServiceMonitor{
 		TypeMeta:   metav1.TypeMeta{Kind: monitoringv1.ServiceMonitorsKind, APIVersion: monitor.MonitoringAPIVersion},
 		ObjectMeta: metav1.ObjectMeta{Name: monitor.CalicoNodeMonitor, Namespace: common.TigeraPrometheusNamespace},
 	}, &handler.EnqueueRequestForObject{})
 }
 
-func addServiceMonitorElasticsearchWatch(c controller.Controller) error {
+func addServiceMonitorElasticsearchWatch(c ctrlruntime.Controller) error {
 	return utils.AddNamespacedWatch(c, &monitoringv1.ServiceMonitor{
 		TypeMeta:   metav1.TypeMeta{Kind: monitoringv1.ServiceMonitorsKind, APIVersion: monitor.MonitoringAPIVersion},
 		ObjectMeta: metav1.ObjectMeta{Name: monitor.ElasticsearchMetrics, Namespace: common.TigeraPrometheusNamespace},
 	}, &handler.EnqueueRequestForObject{})
 }
 
-func addServiceMonitorFluentdWatch(c controller.Controller) error {
+func addServiceMonitorFluentdWatch(c ctrlruntime.Controller) error {
 	return utils.AddNamespacedWatch(c, &monitoringv1.ServiceMonitor{
 		TypeMeta:   metav1.TypeMeta{Kind: monitoringv1.ServiceMonitorsKind, APIVersion: monitor.MonitoringAPIVersion},
 		ObjectMeta: metav1.ObjectMeta{Name: monitor.FluentdMetrics, Namespace: common.TigeraPrometheusNamespace},
 	}, &handler.EnqueueRequestForObject{})
 }
 
-func addServiceMonitorKubeControllerWatch(c controller.Controller) error {
+func addServiceMonitorKubeControllerWatch(c ctrlruntime.Controller) error {
 	return utils.AddNamespacedWatch(c, &monitoringv1.ServiceMonitor{
 		TypeMeta:   metav1.TypeMeta{Kind: monitoringv1.ServiceMonitorsKind, APIVersion: monitor.MonitoringAPIVersion},
 		ObjectMeta: metav1.ObjectMeta{Name: monitor.KubeControllerMetrics, Namespace: common.TigeraPrometheusNamespace},
 	}, &handler.EnqueueRequestForObject{})
 }
 
-func addWatch(c controller.Controller) error {
+func addWatch(c ctrlruntime.Controller) error {
 	var err error
 	if err = addAlertmanagerWatch(c); err != nil {
 		return fmt.Errorf("failed to watch Alertmanager resource: %w", err)
@@ -155,20 +153,22 @@ func requiresPrometheusResources(client kubernetes.Interface) error {
 	return nil
 }
 
-func waitToAddPrometheusWatch(c controller.Controller, client kubernetes.Interface, log logr.Logger, readyFlag *utils.ReadyFlag) {
+func waitToAddPrometheusWatch(c ctrlruntime.Controller, client kubernetes.Interface, log logr.Logger, readyFlag *utils.ReadyFlag) {
 	const (
-		initBackoff   = 30 * time.Second
-		maxBackoff    = 8 * time.Minute
-		resetDuration = time.Hour
-		backoffFactor = 2.0
-		jitter        = 0.1
+		initBackoff = 30 * time.Second
+		maxBackoff  = 8 * time.Minute
 	)
-	clock := &clock.RealClock{}
 
-	backoffMgr := wait.NewExponentialBackoffManager(initBackoff, maxBackoff, resetDuration, backoffFactor, jitter, clock)
-	defer backoffMgr.Backoff().Stop()
+	duration := initBackoff
+	ticker := time.NewTicker(duration)
+	defer ticker.Stop()
+	for range ticker.C {
+		duration = duration * 2
+		if duration >= maxBackoff {
+			duration = maxBackoff
+		}
+		ticker.Reset(duration)
 
-	for {
 		if err := requiresPrometheusResources(client); err != nil {
 			log.Info(fmt.Sprintf("%v. monitor-controller will retry.", err))
 		} else {
@@ -180,7 +180,5 @@ func waitToAddPrometheusWatch(c controller.Controller, client kubernetes.Interfa
 				return
 			}
 		}
-
-		<-backoffMgr.Backoff().C()
 	}
 }

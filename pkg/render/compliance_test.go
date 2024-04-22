@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,29 +17,35 @@ package render_test
 import (
 	"fmt"
 
+	"k8s.io/apiserver/pkg/authentication/serviceaccount"
+
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	rtest "github.com/tigera/operator/pkg/render/common/test"
 	"github.com/tigera/operator/pkg/render/testutils"
 	"github.com/tigera/operator/pkg/tls"
+	"github.com/tigera/operator/test"
 )
 
 var _ = Describe("compliance rendering tests", func() {
@@ -56,10 +62,23 @@ var _ = Describe("compliance rendering tests", func() {
 	expectedComplianceServerPolicy := testutils.GetExpectedPolicyFromFile("testutils/expected_policies/compliance-server.json")
 	expectedComplianceServerPolicyForOpenshift := testutils.GetExpectedPolicyFromFile("testutils/expected_policies/compliance-server_ocp.json")
 
+	complianceResources := corev1.ResourceRequirements{
+		Limits: corev1.ResourceList{
+			"cpu":     resource.MustParse("2"),
+			"memory":  resource.MustParse("300Mi"),
+			"storage": resource.MustParse("20Gi"),
+		},
+		Requests: corev1.ResourceList{
+			"cpu":     resource.MustParse("1"),
+			"memory":  resource.MustParse("150Mi"),
+			"storage": resource.MustParse("10Gi"),
+		},
+	}
+
 	BeforeEach(func() {
 		scheme := runtime.NewScheme()
 		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
-		cli = fake.NewClientBuilder().WithScheme(scheme).Build()
+		cli = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 
 		certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
@@ -90,6 +109,7 @@ var _ = Describe("compliance rendering tests", func() {
 			ClusterDomain:      clusterDomain,
 			TrustedBundle:      bundle,
 			UsePSP:             true,
+			Namespace:          render.ComplianceNamespace,
 		}
 	})
 
@@ -115,6 +135,189 @@ var _ = Describe("compliance rendering tests", func() {
 		resources, _ := component.Objects()
 		d := rtest.GetResource(resources, "compliance-server", ns, "apps", "v1", "Deployment").(*appsv1.Deployment)
 		Expect(d.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "FIPS_MODE_ENABLED", Value: "true"}))
+	})
+
+	It("should render resource requests and limits for compliance components", func() {
+		cfg.Compliance = &operatorv1.Compliance{
+			Spec: operatorv1.ComplianceSpec{
+				ComplianceServerDeployment: &operatorv1.ComplianceServerDeployment{
+					Spec: &operatorv1.ComplianceServerDeploymentSpec{
+						Template: &operatorv1.ComplianceServerDeploymentPodTemplateSpec{
+							Spec: &operatorv1.ComplianceServerDeploymentPodSpec{
+								Containers: []operatorv1.ComplianceServerDeploymentContainer{{
+									Name:      "compliance-server",
+									Resources: &complianceResources,
+								}},
+							},
+						},
+					},
+				},
+				ComplianceControllerDeployment: &operatorv1.ComplianceControllerDeployment{
+					Spec: &operatorv1.ComplianceControllerDeploymentSpec{
+						Template: &operatorv1.ComplianceControllerDeploymentPodTemplateSpec{
+							Spec: &operatorv1.ComplianceControllerDeploymentPodSpec{
+								Containers: []operatorv1.ComplianceControllerDeploymentContainer{{
+									Name:      "compliance-controller",
+									Resources: &complianceResources,
+								}},
+							},
+						},
+					},
+				},
+				ComplianceSnapshotterDeployment: &operatorv1.ComplianceSnapshotterDeployment{
+					Spec: &operatorv1.ComplianceSnapshotterDeploymentSpec{
+						Template: &operatorv1.ComplianceSnapshotterDeploymentPodTemplateSpec{
+							Spec: &operatorv1.ComplianceSnapshotterDeploymentPodSpec{
+								Containers: []operatorv1.ComplianceSnapshotterDeploymentContainer{{
+									Name:      "compliance-snapshotter",
+									Resources: &complianceResources,
+								}},
+							},
+						},
+					},
+				},
+
+				ComplianceBenchmarkerDaemonSet: &operatorv1.ComplianceBenchmarkerDaemonSet{
+					Spec: &operatorv1.ComplianceBenchmarkerDaemonSetSpec{
+						Template: &operatorv1.ComplianceBenchmarkerDaemonSetPodTemplateSpec{
+							Spec: &operatorv1.ComplianceBenchmarkerDaemonSetPodSpec{
+								Containers: []operatorv1.ComplianceBenchmarkerDaemonSetContainer{{
+									Name:      "compliance-benchmarker",
+									Resources: &complianceResources,
+								}},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		component, err := render.Compliance(cfg)
+		Expect(err).ShouldNot(HaveOccurred())
+		resources, _ := component.Objects()
+		d, ok := rtest.GetResource(resources, "compliance-server", ns, "apps", "v1", "Deployment").(*appsv1.Deployment)
+		Expect(ok).To(BeTrue())
+		Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
+		container := test.GetContainer(d.Spec.Template.Spec.Containers, "compliance-server")
+		Expect(container).NotTo(BeNil())
+		Expect(container.Resources).To(Equal(complianceResources))
+
+		d, ok = rtest.GetResource(resources, "compliance-controller", ns, "apps", "v1", "Deployment").(*appsv1.Deployment)
+		Expect(ok).To(BeTrue())
+		Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
+		container = test.GetContainer(d.Spec.Template.Spec.Containers, "compliance-controller")
+		Expect(container).NotTo(BeNil())
+		Expect(container.Resources).To(Equal(complianceResources))
+
+		d, ok = rtest.GetResource(resources, "compliance-snapshotter", ns, "apps", "v1", "Deployment").(*appsv1.Deployment)
+		Expect(ok).To(BeTrue())
+		Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
+		container = test.GetContainer(d.Spec.Template.Spec.Containers, "compliance-snapshotter")
+		Expect(container).NotTo(BeNil())
+		Expect(container.Resources).To(Equal(complianceResources))
+
+		ds, ok := rtest.GetResource(resources, "compliance-benchmarker", ns, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
+		Expect(ok).To(BeTrue())
+		Expect(ds.Spec.Template.Spec.Containers).To(HaveLen(1))
+		container = test.GetContainer(ds.Spec.Template.Spec.Containers, "compliance-benchmarker")
+		Expect(container).NotTo(BeNil())
+		Expect(container.Resources).To(Equal(complianceResources))
+	})
+
+	It("should render without resource requests and limits for compliance resources when not set", func() {
+		cfg.Compliance = &operatorv1.Compliance{
+			Spec: operatorv1.ComplianceSpec{
+				ComplianceSnapshotterDeployment: &operatorv1.ComplianceSnapshotterDeployment{
+					Spec: &operatorv1.ComplianceSnapshotterDeploymentSpec{
+						Template: &operatorv1.ComplianceSnapshotterDeploymentPodTemplateSpec{
+							Spec: &operatorv1.ComplianceSnapshotterDeploymentPodSpec{
+								Containers: []operatorv1.ComplianceSnapshotterDeploymentContainer{{
+									Name:      "compliance-snapshotter",
+									Resources: &complianceResources,
+								}},
+							},
+						},
+					},
+				},
+				ComplianceBenchmarkerDaemonSet: &operatorv1.ComplianceBenchmarkerDaemonSet{
+					Spec: &operatorv1.ComplianceBenchmarkerDaemonSetSpec{
+						Template: &operatorv1.ComplianceBenchmarkerDaemonSetPodTemplateSpec{
+							Spec: &operatorv1.ComplianceBenchmarkerDaemonSetPodSpec{
+								Containers: []operatorv1.ComplianceBenchmarkerDaemonSetContainer{{
+									Name:      "compliance-benchmarker",
+									Resources: &complianceResources,
+								}},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		component, err := render.Compliance(cfg)
+		Expect(err).ShouldNot(HaveOccurred())
+		resources, _ := component.Objects()
+
+		// Compliance-server should NOT have resource values when not set
+		d, ok := rtest.GetResource(resources, "compliance-server", ns, "apps", "v1", "Deployment").(*appsv1.Deployment)
+		Expect(ok).To(BeTrue())
+		Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
+		container := test.GetContainer(d.Spec.Template.Spec.Containers, "compliance-server")
+		Expect(container).NotTo(BeNil())
+		Expect(container.Resources).To(Equal(corev1.ResourceRequirements{}))
+
+		// Compliance-controller should NOT have resource values when not set
+		d, ok = rtest.GetResource(resources, "compliance-controller", ns, "apps", "v1", "Deployment").(*appsv1.Deployment)
+		Expect(ok).To(BeTrue())
+		Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
+		container = test.GetContainer(d.Spec.Template.Spec.Containers, "compliance-controller")
+		Expect(container).NotTo(BeNil())
+		Expect(container.Resources).To(Equal(corev1.ResourceRequirements{}))
+
+		// Compliance-snapshotter should have resource values set
+		d, ok = rtest.GetResource(resources, "compliance-snapshotter", ns, "apps", "v1", "Deployment").(*appsv1.Deployment)
+		Expect(ok).To(BeTrue())
+		Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
+		container = test.GetContainer(d.Spec.Template.Spec.Containers, "compliance-snapshotter")
+		Expect(container).NotTo(BeNil())
+		Expect(container.Resources).To(Equal(complianceResources))
+
+		// Compliance-benchmark should have resource values set
+		ds, ok := rtest.GetResource(resources, "compliance-benchmarker", ns, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
+		Expect(ok).To(BeTrue())
+		Expect(ds.Spec.Template.Spec.Containers).To(HaveLen(1))
+		container = test.GetContainer(ds.Spec.Template.Spec.Containers, "compliance-benchmarker")
+		Expect(container).NotTo(BeNil())
+		Expect(container.Resources).To(Equal(complianceResources))
+
+	})
+
+	It("should render resource requests and limits for compliance report", func() {
+		cfg.Compliance = &operatorv1.Compliance{
+			Spec: operatorv1.ComplianceSpec{
+				ComplianceReporterPodTemplate: &operatorv1.ComplianceReporterPodTemplate{
+					Template: &operatorv1.ComplianceReporterPodTemplateSpec{
+						Spec: &operatorv1.ComplianceReporterPodSpec{
+							Containers: []operatorv1.ComplianceReporterPodTemplateContainer{{
+								Name:      "reporter",
+								Resources: &complianceResources,
+							}},
+						},
+					},
+				},
+			},
+		}
+
+		component, err := render.Compliance(cfg)
+		Expect(err).ShouldNot(HaveOccurred())
+		resources, _ := component.Objects()
+
+		reporter, ok := rtest.GetResource(resources, "tigera.io.report", ns, "", "v1", "PodTemplate").(*corev1.PodTemplate)
+		Expect(ok).To(BeTrue())
+		Expect(reporter.Template.Spec.Containers).To(HaveLen(1))
+		container := test.GetContainer(reporter.Template.Spec.Containers, "reporter")
+		Expect(container.Resources).To(Equal(complianceResources))
+
 	})
 
 	Context("Standalone cluster", func() {
@@ -509,6 +712,7 @@ var _ = Describe("compliance rendering tests", func() {
 	})
 
 	Context("Certificate management enabled", func() {
+
 		It("should render init containers and volume changes", func() {
 			ca, _ := tls.MakeCA(rmeta.DefaultOperatorCASignerName())
 			cert, _, _ := ca.Config.GetPEMBytes() // create a valid pem block
@@ -540,7 +744,6 @@ var _ = Describe("compliance rendering tests", func() {
 			component, err := render.Compliance(cfg)
 			Expect(err).ShouldNot(HaveOccurred())
 			resources, _ := component.Objects()
-
 			expectedResources := []struct {
 				name    string
 				ns      string
@@ -614,6 +817,135 @@ var _ = Describe("compliance rendering tests", func() {
 			Expect(reporter.Template.Spec.InitContainers).To(HaveLen(1))
 			csrInitContainer = reporter.Template.Spec.InitContainers[0]
 			Expect(csrInitContainer.Name).To(Equal(fmt.Sprintf("%v-key-cert-provisioner", render.ComplianceReporterSecret)))
+		})
+		It("should render init containers with resource requests and limits", func() {
+			ca, _ := tls.MakeCA(rmeta.DefaultOperatorCASignerName())
+			cert, _, _ := ca.Config.GetPEMBytes() // create a valid pem block
+			cfg.Installation.CertificateManagement = &operatorv1.CertificateManagement{CACert: cert}
+
+			certificateManager, err := certificatemanager.Create(cli, cfg.Installation, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
+			Expect(err).NotTo(HaveOccurred())
+
+			complianceTLS, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceServerCertSecret, common.OperatorNamespace(), []string{""})
+			Expect(err).NotTo(HaveOccurred())
+			cfg.ServerKeyPair = complianceTLS
+
+			controllerKeyPair, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceControllerSecret, common.OperatorNamespace(), []string{""})
+			Expect(err).NotTo(HaveOccurred())
+			cfg.ControllerKeyPair = controllerKeyPair
+
+			benchmarkerKeyPair, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceBenchmarkerSecret, common.OperatorNamespace(), []string{""})
+			Expect(err).NotTo(HaveOccurred())
+			cfg.BenchmarkerKeyPair = benchmarkerKeyPair
+
+			snapshotterKeyPair, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceSnapshotterSecret, common.OperatorNamespace(), []string{""})
+			Expect(err).NotTo(HaveOccurred())
+			cfg.SnapshotterKeyPair = snapshotterKeyPair
+
+			reporterKeyPair, err := certificateManager.GetOrCreateKeyPair(cli, render.ComplianceReporterSecret, common.OperatorNamespace(), []string{""})
+			Expect(err).NotTo(HaveOccurred())
+			cfg.ReporterKeyPair = reporterKeyPair
+			cfg.Compliance = &operatorv1.Compliance{
+				Spec: operatorv1.ComplianceSpec{
+					ComplianceServerDeployment: &operatorv1.ComplianceServerDeployment{
+						Spec: &operatorv1.ComplianceServerDeploymentSpec{
+							Template: &operatorv1.ComplianceServerDeploymentPodTemplateSpec{
+								Spec: &operatorv1.ComplianceServerDeploymentPodSpec{
+									InitContainers: []operatorv1.ComplianceServerDeploymentInitContainer{{
+										Name:      "tigera-compliance-server-tls-key-cert-provisioner",
+										Resources: &complianceResources,
+									}},
+								},
+							},
+						},
+					},
+					ComplianceControllerDeployment: &operatorv1.ComplianceControllerDeployment{
+						Spec: &operatorv1.ComplianceControllerDeploymentSpec{
+							Template: &operatorv1.ComplianceControllerDeploymentPodTemplateSpec{
+								Spec: &operatorv1.ComplianceControllerDeploymentPodSpec{
+									InitContainers: []operatorv1.ComplianceControllerDeploymentInitContainer{{
+										Name:      "tigera-compliance-controller-tls-key-cert-provisioner",
+										Resources: &complianceResources,
+									}},
+								},
+							},
+						},
+					},
+					ComplianceSnapshotterDeployment: &operatorv1.ComplianceSnapshotterDeployment{
+						Spec: &operatorv1.ComplianceSnapshotterDeploymentSpec{
+							Template: &operatorv1.ComplianceSnapshotterDeploymentPodTemplateSpec{
+								Spec: &operatorv1.ComplianceSnapshotterDeploymentPodSpec{
+									InitContainers: []operatorv1.ComplianceSnapshotterDeploymentInitContainer{{
+										Name:      "tigera-compliance-snapshotter-tls-key-cert-provisioner",
+										Resources: &complianceResources,
+									}},
+								},
+							},
+						},
+					},
+
+					ComplianceBenchmarkerDaemonSet: &operatorv1.ComplianceBenchmarkerDaemonSet{
+						Spec: &operatorv1.ComplianceBenchmarkerDaemonSetSpec{
+							Template: &operatorv1.ComplianceBenchmarkerDaemonSetPodTemplateSpec{
+								Spec: &operatorv1.ComplianceBenchmarkerDaemonSetPodSpec{
+									InitContainers: []operatorv1.ComplianceBenchmarkerDaemonSetInitContainer{{
+										Name:      "tigera-compliance-benchmarker-tls-key-cert-provisioner",
+										Resources: &complianceResources,
+									}},
+								},
+							},
+						},
+					},
+					ComplianceReporterPodTemplate: &operatorv1.ComplianceReporterPodTemplate{
+						Template: &operatorv1.ComplianceReporterPodTemplateSpec{
+							Spec: &operatorv1.ComplianceReporterPodSpec{
+								InitContainers: []operatorv1.ComplianceReporterPodTemplateInitContainer{{
+									Name:      "tigera-compliance-reporter-tls-key-cert-provisioner",
+									Resources: &complianceResources,
+								}},
+							},
+						},
+					},
+				},
+			}
+			component, err := render.Compliance(cfg)
+			Expect(err).ShouldNot(HaveOccurred())
+			resources, _ := component.Objects()
+
+			server, ok := rtest.GetResource(resources, "compliance-server", ns, "apps", "v1", "Deployment").(*appsv1.Deployment)
+			Expect(ok).To(BeTrue())
+			Expect(server.Spec.Template.Spec.InitContainers).To(HaveLen(1))
+			initContainer := test.GetContainer(server.Spec.Template.Spec.InitContainers, "tigera-compliance-server-tls-key-cert-provisioner")
+			Expect(initContainer).NotTo(BeNil())
+			Expect(initContainer.Resources).To(Equal(complianceResources))
+
+			controller := rtest.GetResource(resources, "compliance-controller", ns, "apps", "v1", "Deployment").(*appsv1.Deployment)
+			Expect(ok).To(BeTrue())
+			Expect(controller.Spec.Template.Spec.InitContainers).To(HaveLen(1))
+			initContainer = test.GetContainer(controller.Spec.Template.Spec.InitContainers, "tigera-compliance-controller-tls-key-cert-provisioner")
+			Expect(initContainer).NotTo(BeNil())
+			Expect(initContainer.Resources).To(Equal(complianceResources))
+
+			benchmarker := rtest.GetResource(resources, "compliance-benchmarker", ns, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
+			Expect(ok).To(BeTrue())
+			Expect(benchmarker.Spec.Template.Spec.InitContainers).To(HaveLen(1))
+			initContainer = test.GetContainer(benchmarker.Spec.Template.Spec.InitContainers, "tigera-compliance-benchmarker-tls-key-cert-provisioner")
+			Expect(initContainer).NotTo(BeNil())
+			Expect(initContainer.Resources).To(Equal(complianceResources))
+
+			snapshotter := rtest.GetResource(resources, "compliance-snapshotter", ns, "apps", "v1", "Deployment").(*appsv1.Deployment)
+			Expect(ok).To(BeTrue())
+			Expect(snapshotter.Spec.Template.Spec.InitContainers).To(HaveLen(1))
+			initContainer = test.GetContainer(snapshotter.Spec.Template.Spec.InitContainers, "tigera-compliance-snapshotter-tls-key-cert-provisioner")
+			Expect(initContainer).NotTo(BeNil())
+			Expect(initContainer.Resources).To(Equal(complianceResources))
+
+			reporter := rtest.GetResource(resources, "tigera.io.report", ns, "", "v1", "PodTemplate").(*corev1.PodTemplate)
+			Expect(ok).To(BeTrue())
+			Expect(reporter.Template.Spec.InitContainers).To(HaveLen(1))
+			initContainer = test.GetContainer(reporter.Template.Spec.InitContainers, "tigera-compliance-reporter-tls-key-cert-provisioner")
+			Expect(initContainer).NotTo(BeNil())
+			Expect(initContainer.Resources).To(Equal(complianceResources))
 		})
 	})
 
@@ -720,5 +1052,427 @@ var _ = Describe("compliance rendering tests", func() {
 			Entry("for managed, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: true, Openshift: false}),
 			Entry("for managed, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: true, Openshift: true}),
 		)
+	})
+
+	Context("multi-tenant rendering", func() {
+		tenantANamespace := "tenant-a"
+		tenantBNamespace := "tenant-b"
+		It("should render expected components inside expected namespace for each compliance instance", func() {
+			cfg.Namespace = tenantANamespace
+			cfg.ExternalElastic = true
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tenantA",
+					Namespace: tenantANamespace,
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-a-id",
+				},
+			}
+			tenantACompliance, err := render.Compliance(cfg)
+			Expect(err).NotTo(HaveOccurred())
+
+			tenantAResources, _ := tenantACompliance.Objects()
+
+			// Should render the correct resources
+			tenantAExpectedResources := []client.Object{
+				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "tigera-compliance-server", Namespace: tenantANamespace}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-compliance-server"}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.MultiTenantComplianceManagedClustersAccessClusterRoleName}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.MultiTenantComplianceManagedClustersAccessClusterRoleName}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceSnapshotterServiceAccount}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceSnapshotterServiceAccount}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceBenchmarkerServiceAccount}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceBenchmarkerServiceAccount}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceControllerServiceAccount}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceControllerServiceAccount}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceReporterServiceAccount}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceReporterServiceAccount}},
+				&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera.compliance-server", Namespace: tenantANamespace}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "tigera-compliance-server"}},
+				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "compliance", Namespace: tenantANamespace}},
+				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "compliance-server", Namespace: tenantANamespace}},
+				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-benchmarker"}},
+				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-controller"}},
+				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-reporter"}},
+				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-server"}},
+				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-snapshotter"}},
+			}
+
+			rtest.ExpectResources(tenantAResources, tenantAExpectedResources)
+
+			for _, deploymentName := range []string{"compliance-server"} {
+				deployment := rtest.GetResource(tenantAResources, deploymentName, tenantANamespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
+				envs := deployment.Spec.Template.Spec.Containers[0].Env
+				Expect(envs).To(ContainElement(corev1.EnvVar{Name: "TIGERA_COMPLIANCE_JOB_NAMESPACE", Value: tenantANamespace}))
+			}
+
+			cfg.Namespace = tenantBNamespace
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tenantB",
+					Namespace: tenantBNamespace,
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-b-id",
+				},
+			}
+			tenantBCompliance, err := render.Compliance(cfg)
+			Expect(err).NotTo(HaveOccurred())
+
+			tenantBResources, _ := tenantBCompliance.Objects()
+
+			// Should render the correct resources
+			tenantBExpectedResources := []client.Object{
+				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "tigera-compliance-server", Namespace: tenantBNamespace}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-compliance-server"}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.MultiTenantComplianceManagedClustersAccessClusterRoleName}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.MultiTenantComplianceManagedClustersAccessClusterRoleName}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceSnapshotterServiceAccount}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceSnapshotterServiceAccount}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceBenchmarkerServiceAccount}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceBenchmarkerServiceAccount}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceControllerServiceAccount}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceControllerServiceAccount}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceReporterServiceAccount}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceReporterServiceAccount}},
+				&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera.compliance-server", Namespace: tenantBNamespace}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "tigera-compliance-server"}},
+				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "compliance", Namespace: tenantBNamespace}},
+				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "compliance-server", Namespace: tenantBNamespace}},
+				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-benchmarker"}},
+				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-controller"}},
+				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-reporter"}},
+				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-server"}},
+				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-snapshotter"}},
+			}
+
+			rtest.ExpectResources(tenantBResources, tenantBExpectedResources)
+
+			for _, deploymentName := range []string{"compliance-server"} {
+				deployment := rtest.GetResource(tenantBResources, deploymentName, tenantBNamespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
+				envs := deployment.Spec.Template.Spec.Containers[0].Env
+				Expect(envs).To(ContainElement(corev1.EnvVar{Name: "TIGERA_COMPLIANCE_JOB_NAMESPACE", Value: tenantBNamespace}))
+			}
+		})
+
+		It("should render multi-tenant environment variables", func() {
+			cfg.Namespace = tenantANamespace
+			cfg.ExternalElastic = true
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tenantA",
+					Namespace: tenantANamespace,
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-a-id",
+				},
+			}
+			tenantACompliance, err := render.Compliance(cfg)
+			Expect(err).NotTo(HaveOccurred())
+
+			tenantAResources, _ := tenantACompliance.Objects()
+			d := rtest.GetResource(tenantAResources, render.ComplianceServerName, cfg.Namespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
+			envs := d.Spec.Template.Spec.Containers[0].Env
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "TENANT_ID", Value: cfg.Tenant.Spec.ID}))
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "TENANT_NAMESPACE", Value: cfg.Tenant.Namespace}))
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: fmt.Sprintf("https://tigera-manager.%s.svc:9443", cfg.Tenant.Namespace)}))
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "LINSEED_URL", Value: fmt.Sprintf("https://tigera-linseed.%s.svc", cfg.Tenant.Namespace)}))
+		})
+
+		It("should render impersonation permissions as part of tigera-compliance-server ClusterRole", func() {
+			cfg.Namespace = tenantANamespace
+			cfg.ExternalElastic = true
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tenantA",
+					Namespace: tenantANamespace,
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-a-id",
+				},
+			}
+			tenantACompliance, err := render.Compliance(cfg)
+			Expect(err).NotTo(HaveOccurred())
+			resources, _ := tenantACompliance.Objects()
+			cr := rtest.GetResource(resources, render.ComplianceServerServiceAccount, "", rbacv1.GroupName, "v1", "ClusterRole").(*rbacv1.ClusterRole)
+			expectedRules := []rbacv1.PolicyRule{
+				{
+					APIGroups:     []string{""},
+					Resources:     []string{"serviceaccounts"},
+					Verbs:         []string{"impersonate"},
+					ResourceNames: []string{render.ComplianceServerServiceAccount},
+				},
+				{
+					APIGroups: []string{""},
+					Resources: []string{"groups"},
+					Verbs:     []string{"impersonate"},
+					ResourceNames: []string{
+						serviceaccount.AllServiceAccountsGroup,
+						"system:authenticated",
+						fmt.Sprintf("%s%s", serviceaccount.ServiceAccountGroupPrefix, render.ComplianceNamespace),
+					},
+				},
+			}
+			Expect(cr.Rules).To(ContainElements(expectedRules))
+		})
+
+		It("should render managed cluster permissions as part of compliance-server-managed-cluster-access ClusterRole", func() {
+			cfg.Namespace = tenantANamespace
+			cfg.ExternalElastic = true
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tenantA",
+					Namespace: tenantANamespace,
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-a-id",
+				},
+			}
+			tenantACompliance, err := render.Compliance(cfg)
+			Expect(err).NotTo(HaveOccurred())
+			resources, _ := tenantACompliance.Objects()
+			cr := rtest.GetResource(resources, render.MultiTenantComplianceManagedClustersAccessClusterRoleName, "", rbacv1.GroupName, "v1", "ClusterRole").(*rbacv1.ClusterRole)
+			expectedRules := []rbacv1.PolicyRule{
+				{
+					APIGroups: []string{"projectcalico.org"},
+					Resources: []string{"managedclusters"},
+					Verbs: []string{
+						"get",
+					},
+				},
+			}
+			Expect(cr.Rules).To(ContainElements(expectedRules))
+			rb := rtest.GetResource(resources, render.MultiTenantComplianceManagedClustersAccessClusterRoleName, "", rbacv1.GroupName, "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
+			Expect(rb.RoleRef.Kind).To(Equal("ClusterRole"))
+			Expect(rb.RoleRef.Name).To(Equal(render.MultiTenantComplianceManagedClustersAccessClusterRoleName))
+			Expect(rb.Subjects).To(ContainElements([]rbacv1.Subject{
+				{
+					Kind:      "ServiceAccount",
+					Name:      render.ComplianceServerServiceAccount,
+					Namespace: render.ComplianceNamespace,
+				},
+			}))
+		})
+
+		It("should render linseed API permissions as part of tigera-compliance-snapshotter ClusterRole", func() {
+			cfg.Namespace = tenantANamespace
+			cfg.ExternalElastic = true
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tenantA",
+					Namespace: tenantANamespace,
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-a-id",
+				},
+			}
+			tenantACompliance, err := render.Compliance(cfg)
+			Expect(err).NotTo(HaveOccurred())
+			resources, _ := tenantACompliance.Objects()
+			cr := rtest.GetResource(resources, render.ComplianceSnapshotterServiceAccount, "", rbacv1.GroupName, "v1", "ClusterRole").(*rbacv1.ClusterRole)
+			expectedRules := []rbacv1.PolicyRule{
+				{
+					APIGroups: []string{"linseed.tigera.io"},
+					Resources: []string{"snapshots"},
+					Verbs: []string{
+						"get", "create",
+					},
+				},
+			}
+			Expect(cr.Rules).To(ContainElements(expectedRules))
+			rb := rtest.GetResource(resources, render.ComplianceSnapshotterServiceAccount, "", rbacv1.GroupName, "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
+			Expect(rb.RoleRef.Kind).To(Equal("ClusterRole"))
+			Expect(rb.RoleRef.Name).To(Equal(render.ComplianceSnapshotterServiceAccount))
+			Expect(rb.Subjects).To(ContainElements([]rbacv1.Subject{
+				{
+					Kind:      "ServiceAccount",
+					Name:      render.ComplianceSnapshotterServiceAccount,
+					Namespace: tenantANamespace,
+				},
+			}))
+		})
+
+		It("should render linseed API permissions as part of tigera-compliance-benchmarker ClusterRole", func() {
+			cfg.Namespace = tenantANamespace
+			cfg.ExternalElastic = true
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tenantA",
+					Namespace: tenantANamespace,
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-a-id",
+				},
+			}
+			tenantACompliance, err := render.Compliance(cfg)
+			Expect(err).NotTo(HaveOccurred())
+			resources, _ := tenantACompliance.Objects()
+			cr := rtest.GetResource(resources, render.ComplianceBenchmarkerServiceAccount, "", rbacv1.GroupName, "v1", "ClusterRole").(*rbacv1.ClusterRole)
+			expectedRules := []rbacv1.PolicyRule{
+				{
+					APIGroups: []string{"linseed.tigera.io"},
+					Resources: []string{"benchmarks"},
+					Verbs: []string{
+						"get", "create",
+					},
+				},
+			}
+			Expect(cr.Rules).To(ContainElements(expectedRules))
+			rb := rtest.GetResource(resources, render.ComplianceBenchmarkerServiceAccount, "", rbacv1.GroupName, "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
+			Expect(rb.RoleRef.Kind).To(Equal("ClusterRole"))
+			Expect(rb.RoleRef.Name).To(Equal(render.ComplianceBenchmarkerServiceAccount))
+			Expect(rb.Subjects).To(ContainElements([]rbacv1.Subject{
+				{
+					Kind:      "ServiceAccount",
+					Name:      render.ComplianceBenchmarkerServiceAccount,
+					Namespace: tenantANamespace,
+				},
+			}))
+		})
+
+		It("should render linseed API permissions as part of tigera-compliance-controller ClusterRole", func() {
+			cfg.Namespace = tenantANamespace
+			cfg.ExternalElastic = true
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tenantA",
+					Namespace: tenantANamespace,
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-a-id",
+				},
+			}
+			tenantACompliance, err := render.Compliance(cfg)
+			Expect(err).NotTo(HaveOccurred())
+			resources, _ := tenantACompliance.Objects()
+			cr := rtest.GetResource(resources, render.ComplianceControllerServiceAccount, "", rbacv1.GroupName, "v1", "ClusterRole").(*rbacv1.ClusterRole)
+			expectedRules := []rbacv1.PolicyRule{
+				{
+					APIGroups: []string{"linseed.tigera.io"},
+					Resources: []string{"compliancereports"},
+					Verbs: []string{
+						"create", "get",
+					},
+				},
+			}
+			Expect(cr.Rules).To(ContainElements(expectedRules))
+			rb := rtest.GetResource(resources, render.ComplianceControllerServiceAccount, "", rbacv1.GroupName, "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
+			Expect(rb.RoleRef.Kind).To(Equal("ClusterRole"))
+			Expect(rb.RoleRef.Name).To(Equal(render.ComplianceControllerServiceAccount))
+			Expect(rb.Subjects).To(ContainElements([]rbacv1.Subject{
+				{
+					Kind:      "ServiceAccount",
+					Name:      render.ComplianceControllerServiceAccount,
+					Namespace: tenantANamespace,
+				},
+			}))
+		})
+
+		It("should render linseed API permissions as part of tigera-compliance-reporter ClusterRole", func() {
+			cfg.Namespace = tenantANamespace
+			cfg.ExternalElastic = true
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tenantA",
+					Namespace: tenantANamespace,
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-a-id",
+				},
+			}
+			tenantACompliance, err := render.Compliance(cfg)
+			Expect(err).NotTo(HaveOccurred())
+			resources, _ := tenantACompliance.Objects()
+			cr := rtest.GetResource(resources, render.ComplianceReporterServiceAccount, "", rbacv1.GroupName, "v1", "ClusterRole").(*rbacv1.ClusterRole)
+			expectedRules := []rbacv1.PolicyRule{
+				{
+					APIGroups: []string{"linseed.tigera.io"},
+					Resources: []string{"compliancereports"},
+					Verbs: []string{
+						"create",
+					},
+				},
+			}
+			Expect(cr.Rules).To(ContainElements(expectedRules))
+			rb := rtest.GetResource(resources, render.ComplianceReporterServiceAccount, "", rbacv1.GroupName, "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
+			Expect(rb.RoleRef.Kind).To(Equal("ClusterRole"))
+			Expect(rb.RoleRef.Name).To(Equal(render.ComplianceReporterServiceAccount))
+			Expect(rb.Subjects).To(ContainElements([]rbacv1.Subject{
+				{
+					Kind:      "ServiceAccount",
+					Name:      render.ComplianceReporterServiceAccount,
+					Namespace: tenantANamespace,
+				},
+			}))
+		})
+	})
+
+	Context("single-tenant rendering", func() {
+
+		It("should NOT render impersonation permissions as part of tigera-compliance-server ClusterRole", func() {
+			cfg.ExternalElastic = true
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "tenantA",
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-a-id",
+				},
+			}
+			tenantACompliance, err := render.Compliance(cfg)
+			Expect(err).NotTo(HaveOccurred())
+			resources, _ := tenantACompliance.Objects()
+			cr := rtest.GetResource(resources, render.ComplianceServerServiceAccount, "", rbacv1.GroupName, "v1", "ClusterRole").(*rbacv1.ClusterRole)
+			expectedRules := []rbacv1.PolicyRule{
+				{
+					APIGroups:     []string{""},
+					Resources:     []string{"serviceaccounts"},
+					Verbs:         []string{"impersonate"},
+					ResourceNames: []string{render.ComplianceServerServiceAccount},
+				},
+				{
+					APIGroups: []string{""},
+					Resources: []string{"groups"},
+					Verbs:     []string{"impersonate"},
+					ResourceNames: []string{
+						serviceaccount.AllServiceAccountsGroup,
+						"system:authenticated",
+						fmt.Sprintf("%s%s", serviceaccount.ServiceAccountGroupPrefix, render.ComplianceNamespace),
+					},
+				},
+			}
+			Expect(cr.Rules).NotTo(ContainElements(expectedRules))
+		})
+
+		It("should render single-tenant environment variables", func() {
+			cfg.ExternalElastic = true
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "tenantA",
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-a-id",
+				},
+			}
+			compliance, err := render.Compliance(cfg)
+			Expect(err).NotTo(HaveOccurred())
+
+			resources, _ := compliance.Objects()
+			server := rtest.GetResource(resources, render.ComplianceServerName, cfg.Namespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
+			Expect(server.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "TENANT_ID", Value: cfg.Tenant.Spec.ID}))
+
+			controller := rtest.GetResource(resources, render.ComplianceControllerName, cfg.Namespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
+			Expect(controller.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "TENANT_ID", Value: cfg.Tenant.Spec.ID}))
+
+			reporterTemplate := rtest.GetResource(resources, "tigera.io.report", cfg.Namespace, corev1.GroupName, "v1", "PodTemplate").(*corev1.PodTemplate)
+			Expect(reporterTemplate.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "TENANT_ID", Value: cfg.Tenant.Spec.ID}))
+
+			snapshotter := rtest.GetResource(resources, render.ComplianceSnapshotterName, cfg.Namespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
+			Expect(snapshotter.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "TENANT_ID", Value: cfg.Tenant.Spec.ID}))
+
+			benchmarker := rtest.GetResource(resources, render.ComplianceBenchmarkerName, cfg.Namespace, appsv1.GroupName, "v1", "DaemonSet").(*appsv1.DaemonSet)
+			Expect(benchmarker.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "TENANT_ID", Value: cfg.Tenant.Spec.ID}))
+		})
 	})
 })

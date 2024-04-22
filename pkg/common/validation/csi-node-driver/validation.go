@@ -1,4 +1,4 @@
-// Copyright (c) 2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,8 +21,8 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation/field"
 )
 
-// ValidateTyphaDeploymentContainer validates the given container is a valid typha Deployment container.
-func ValidateCSIDaemonsetContainer(container corev1.Container) error {
+// ValidateCSINodeDriverDaemonSetContainer validates the given container is a valid csi-node-driver DaemonSet container.
+func ValidateCSINodeDriverDaemonSetContainer(container corev1.Container) error {
 	errs := k8svalidation.ValidateResourceRequirements(&container.Resources, field.NewPath("spec", "template", "spec", "containers"))
 	return errs.ToAggregate()
 }

@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2022,2023 Tigera, Inc. All rights reserved.
+Copyright (c) 2022-2024 Tigera, Inc. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,7 +24,8 @@ import (
 // CSINodeDriverDaemonSetContainer is a csi-node-driver DaemonSet container.
 type CSINodeDriverDaemonSetContainer struct {
 	// Name is an enum which identifies the csi-node-driver DaemonSet container by name.
-	// +kubebuilder:validation:Enum=csi-node-driver
+	// Supported values are: calico-csi, csi-node-driver-registrar.
+	// +kubebuilder:validation:Enum=calico-csi;csi-node-driver-registrar;csi-node-driver
 	Name string `json:"name"`
 
 	// Resources allows customization of limits and requests for compute resources such as cpu and memory.
@@ -193,4 +194,8 @@ func (c *CSINodeDriverDaemonSet) GetTerminationGracePeriodSeconds() *int64 {
 
 func (c *CSINodeDriverDaemonSet) GetDeploymentStrategy() *appsv1.DeploymentStrategy {
 	return nil
+}
+
+func (c *CSINodeDriverDaemonSet) GetPriorityClassName() string {
+	return ""
 }

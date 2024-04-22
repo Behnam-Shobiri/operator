@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,27 +19,28 @@ import (
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/render"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	rtest "github.com/tigera/operator/pkg/render/common/test"
 	"github.com/tigera/operator/pkg/render/testutils"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 var _ = Describe("Rendering tests", func() {
@@ -61,7 +62,7 @@ var _ = Describe("Rendering tests", func() {
 		}
 		scheme := runtime.NewScheme()
 		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
-		cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+		cli := ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 
 		certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
@@ -246,7 +247,7 @@ var _ = Describe("guardian", func() {
 		BeforeEach(func() {
 			scheme := runtime.NewScheme()
 			Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
-			cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+			cli := ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 
 			certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 			Expect(err).NotTo(HaveOccurred())
@@ -289,6 +290,50 @@ var _ = Describe("guardian", func() {
 			deployment := rtest.GetResource(resources, render.GuardianDeploymentName, render.GuardianNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
 			container := rtest.GetContainer(deployment.Spec.Template.Spec.Containers, "tigera-guardian")
 			rtest.ExpectEnv(container.Env, "GUARDIAN_VOLTRON_CA_TYPE", "Public")
+		})
+		It("should render guardian with resource requests and limits when configured", func() {
+
+			guardianResources := corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					"cpu":     resource.MustParse("2"),
+					"memory":  resource.MustParse("300Mi"),
+					"storage": resource.MustParse("20Gi"),
+				},
+				Requests: corev1.ResourceList{
+					"cpu":     resource.MustParse("1"),
+					"memory":  resource.MustParse("150Mi"),
+					"storage": resource.MustParse("10Gi"),
+				},
+			}
+
+			cfg.ManagementClusterConnection = &operatorv1.ManagementClusterConnection{
+				Spec: operatorv1.ManagementClusterConnectionSpec{
+					GuardianDeployment: &operatorv1.GuardianDeployment{
+						Spec: &operatorv1.GuardianDeploymentSpec{
+							Template: &operatorv1.GuardianDeploymentPodTemplateSpec{
+								Spec: &operatorv1.GuardianDeploymentPodSpec{
+									Containers: []operatorv1.GuardianDeploymentContainer{{
+										Name:      "tigera-guardian",
+										Resources: &guardianResources,
+									}},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			g := render.Guardian(cfg)
+			resources, _ := g.Objects()
+			Expect(resources).ToNot(BeNil())
+
+			deployment, ok := rtest.GetResource(resources, render.GuardianDeploymentName, render.GuardianNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
+			Expect(ok).To(BeTrue())
+			container := rtest.GetContainer(deployment.Spec.Template.Spec.Containers, "tigera-guardian")
+			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(1))
+
+			Expect(container).NotTo(BeNil())
+			Expect(container.Resources).To(Equal(guardianResources))
 		})
 	})
 })

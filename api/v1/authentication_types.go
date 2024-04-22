@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -58,6 +58,10 @@ type AuthenticationSpec struct {
 	// LDAP contains the configuration needed to setup LDAP authentication.
 	// +optional
 	LDAP *AuthenticationLDAP `json:"ldap,omitempty"`
+
+	// DexDeployment configures the Dex Deployment.
+	// +optional
+	DexDeployment *DexDeployment `json:"dexDeployment,omitempty"`
 }
 
 // AuthenticationStatus defines the observed state of Authentication

@@ -1,4 +1,4 @@
-// Copyright (c) 2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +25,7 @@ import (
 // EGWDeploymentContainer is a Egress Gateway Deployment container.
 type EGWDeploymentContainer struct {
 	// Name is an enum which identifies the EGW Deployment container by name.
+	// Supported values are: calico-egw
 	// +kubebuilder:validation:Enum=calico-egw
 	Name string `json:"name"`
 
@@ -39,6 +40,7 @@ type EGWDeploymentContainer struct {
 // EGWDeploymentInitContainer is a Egress Gateway Deployment init container.
 type EGWDeploymentInitContainer struct {
 	// Name is an enum which identifies the EGW Deployment init container by name.
+	// Supported values are: egress-gateway-init
 	// +kubebuilder:validation:Enum=egress-gateway-init
 	Name string `json:"name"`
 
@@ -131,6 +133,10 @@ type EgressGatewayDeploymentPodSpec struct {
 	// If omitted, the EGW Deployment will use its default value for tolerations.
 	// +optional
 	Tolerations []v1.Toleration `json:"tolerations,omitempty"`
+
+	// PriorityClassName allows to specify a PriorityClass resource to be used.
+	// +optional
+	PriorityClassName string `json:"priorityClassName,omitempty"`
 }
 
 // EgressGatewayDeploymentPodTemplateSpec is the EGW Deployment's PodTemplateSpec
@@ -396,6 +402,16 @@ func (c *EgressGateway) GetTolerations() []v1.Toleration {
 	}
 
 	return nil
+}
+
+func (c *EgressGateway) GetPriorityClassName() string {
+	if c.Spec.Template != nil {
+		if c.Spec.Template.Spec != nil {
+			return c.Spec.Template.Spec.PriorityClassName
+		}
+	}
+
+	return ""
 }
 
 func (c *EgressGateway) GetPodTemplateMetadata() *Metadata {

@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,12 +38,11 @@ import (
 	kfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
-	osconfigv1 "github.com/openshift/api/config/v1"
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	"github.com/tigera/api/pkg/lib/numorstring"
+
 	operator "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
 	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
@@ -52,6 +51,7 @@ import (
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/common/secret"
@@ -81,6 +81,15 @@ func (f *fakeNamespaceMigration) CleanupMigration(ctx context.Context) error {
 }
 
 var _ = Describe("Testing core-controller installation", func() {
+	var c client.Client
+	var cs *kfake.Clientset
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var r ReconcileInstallation
+	var cr *operator.Installation
+	var scheme *runtime.Scheme
+	var mockStatus *status.MockStatus
+
 	table.DescribeTable("checking rendering configuration",
 		func(detectedProvider, configuredProvider operator.Provider, expectedErr error) {
 			configuredInstallation := &operator.Installation{}
@@ -99,231 +108,11 @@ var _ = Describe("Testing core-controller installation", func() {
 		table.Entry("Same detected/configured managed provider", operator.ProviderEKS, operator.ProviderEKS, nil),
 	)
 
-	table.DescribeTable("test cidrWithinCidr function",
-		func(CIDR, pool string, expectedResult bool) {
-			if expectedResult {
-				Expect(cidrWithinCidr(CIDR, pool)).To(BeTrue(), "Expected pool %s to be within CIDR %s", pool, CIDR)
-			} else {
-				Expect(cidrWithinCidr(CIDR, pool)).To(BeFalse(), "Expected pool %s to not be within CIDR %s", pool, CIDR)
-			}
-		},
-
-		table.Entry("Default as CIDR and pool", "192.168.0.0/16", "192.168.0.0/16", true),
-		table.Entry("Pool larger than CIDR should fail", "192.168.0.0/16", "192.168.0.0/15", false),
-		table.Entry("Pool larger than CIDR should fail", "192.168.2.0/24", "192.168.0.0/16", false),
-		table.Entry("Non overlapping CIDR and pool should fail", "192.168.0.0/16", "172.168.0.0/16", false),
-		table.Entry("CIDR with smaller pool", "192.168.0.0/16", "192.168.2.0/24", true),
-		table.Entry("IPv6 matching CIDR and pool", "fd00:1234::/32", "fd00:1234::/32", true),
-		table.Entry("IPv6 Pool larger than CIDR should fail", "fd00:1234::/32", "fd00:1234::/31", false),
-		table.Entry("IPv6 Pool larger than CIDR should fail", "fd00:1234:5600::/40", "fd00:1234::/32", false),
-		table.Entry("IPv6 Non overlapping CIDR and pool should fail", "fd00:1234::/32", "fd00:5678::/32", false),
-		table.Entry("IPv6 CIDR with smaller pool", "fd00:1234::/32", "fd00:1234:5600::/40", true),
-	)
-	var defaultMTU int32 = 1440
-	var twentySix int32 = 26
-	var hpEnabled operator.HostPortsType = operator.HostPortsEnabled
-	var hpDisabled operator.HostPortsType = operator.HostPortsDisabled
-	table.DescribeTable("Installation and Openshift should be merged and defaulted by mergeAndFillDefaults",
-		func(i *operator.Installation, on *osconfigv1.Network, expectSuccess bool, calicoNet *operator.CalicoNetworkSpec) {
-			if expectSuccess {
-				Expect(mergeAndFillDefaults(i, on, nil, nil)).To(BeNil())
-			} else {
-				Expect(mergeAndFillDefaults(i, on, nil, nil)).ToNot(BeNil())
-				return
-			}
-
-			if calicoNet == nil {
-				Expect(i.Spec.CalicoNetwork).To(BeNil())
-				return
-			}
-			if calicoNet.IPPools == nil {
-				Expect(i.Spec.CalicoNetwork).To(BeNil())
-				return
-			}
-			if len(calicoNet.IPPools) == 0 {
-				Expect(i.Spec.CalicoNetwork.IPPools).To(HaveLen(0))
-				return
-			}
-			Expect(i.Spec.CalicoNetwork.IPPools).To(HaveLen(1))
-			pool := i.Spec.CalicoNetwork.IPPools[0]
-			pExpect := calicoNet.IPPools[0]
-			Expect(pool).To(Equal(pExpect))
-			Expect(i.Spec.CalicoNetwork.HostPorts).To(Equal(calicoNet.HostPorts))
-		},
-
-		table.Entry("Empty config (with OpenShift) defaults IPPool", &operator.Installation{},
-			&osconfigv1.Network{
-				Spec: osconfigv1.NetworkSpec{
-					ClusterNetwork: []osconfigv1.ClusterNetworkEntry{
-						{CIDR: "192.168.0.0/16"},
-					},
-				},
-			}, true,
-			&operator.CalicoNetworkSpec{
-				IPPools: []operator.IPPool{
-					{
-						CIDR:          "192.168.0.0/16",
-						Encapsulation: "IPIP",
-						NATOutgoing:   "Enabled",
-						NodeSelector:  "all()",
-						BlockSize:     &twentySix,
-					},
-				},
-				MTU:       &defaultMTU,
-				HostPorts: &hpEnabled,
-			}),
-		table.Entry("Openshift only CIDR",
-			&operator.Installation{
-				Spec: operator.InstallationSpec{
-					CalicoNetwork: &operator.CalicoNetworkSpec{},
-				},
-			}, &osconfigv1.Network{
-				Spec: osconfigv1.NetworkSpec{
-					ClusterNetwork: []osconfigv1.ClusterNetworkEntry{
-						{CIDR: "10.0.0.0/8"},
-					},
-				},
-			}, true,
-			&operator.CalicoNetworkSpec{
-				IPPools: []operator.IPPool{
-					{
-						CIDR:          "10.0.0.0/8",
-						Encapsulation: "IPIP",
-						NATOutgoing:   "Enabled",
-						NodeSelector:  "all()",
-						BlockSize:     &twentySix,
-					},
-				},
-				MTU:       &defaultMTU,
-				HostPorts: &hpEnabled,
-			}),
-		table.Entry("CIDR specified from OpenShift config and Calico config",
-			&operator.Installation{
-				Spec: operator.InstallationSpec{
-					CalicoNetwork: &operator.CalicoNetworkSpec{
-						IPPools: []operator.IPPool{
-							{
-								CIDR:          "10.0.0.0/24",
-								Encapsulation: "VXLAN",
-								NATOutgoing:   "Disabled",
-							},
-						},
-					},
-				},
-			}, &osconfigv1.Network{
-				Spec: osconfigv1.NetworkSpec{
-					ClusterNetwork: []osconfigv1.ClusterNetworkEntry{
-						{CIDR: "10.0.0.0/8"},
-					},
-				},
-			}, true,
-			&operator.CalicoNetworkSpec{
-				IPPools: []operator.IPPool{
-					{
-						CIDR:          "10.0.0.0/24",
-						Encapsulation: "VXLAN",
-						NATOutgoing:   "Disabled",
-						NodeSelector:  "all()",
-						BlockSize:     &twentySix,
-					},
-				},
-				MTU:       &defaultMTU,
-				HostPorts: &hpEnabled,
-			}),
-		table.Entry("Failure when IPPool is smaller than OpenShift Network",
-			&operator.Installation{
-				Spec: operator.InstallationSpec{
-					CalicoNetwork: &operator.CalicoNetworkSpec{
-						IPPools: []operator.IPPool{
-							{
-								CIDR:          "10.0.0.0/16",
-								Encapsulation: "VXLAN",
-								NATOutgoing:   "Disabled",
-							},
-						},
-					},
-				},
-			}, &osconfigv1.Network{
-				Spec: osconfigv1.NetworkSpec{
-					ClusterNetwork: []osconfigv1.ClusterNetworkEntry{
-						{CIDR: "10.0.0.0/24"},
-					},
-				},
-			}, false, nil),
-		table.Entry("Empty IPPool list results in no IPPool with OpenShift",
-			&operator.Installation{
-				Spec: operator.InstallationSpec{
-					CalicoNetwork: &operator.CalicoNetworkSpec{
-						IPPools: []operator.IPPool{},
-					},
-				},
-			}, &osconfigv1.Network{
-				Spec: osconfigv1.NetworkSpec{
-					ClusterNetwork: []osconfigv1.ClusterNetworkEntry{
-						{CIDR: "10.0.0.0/8"},
-					},
-				},
-			}, true,
-			&operator.CalicoNetworkSpec{
-				IPPools:   []operator.IPPool{},
-				MTU:       &defaultMTU,
-				HostPorts: &hpEnabled,
-			}),
-		table.Entry("Normal defaults with no IPPools",
-			&operator.Installation{
-				Spec: operator.InstallationSpec{
-					CalicoNetwork: &operator.CalicoNetworkSpec{},
-				},
-			}, nil, true,
-			&operator.CalicoNetworkSpec{
-				IPPools: []operator.IPPool{
-					{
-						CIDR:          "192.168.0.0/16",
-						Encapsulation: "IPIP",
-						NATOutgoing:   "Enabled",
-						NodeSelector:  "all()",
-						BlockSize:     &twentySix,
-					},
-				},
-				MTU:       &defaultMTU,
-				HostPorts: &hpEnabled,
-			}),
-		table.Entry("HostPorts disabled",
-			&operator.Installation{
-				Spec: operator.InstallationSpec{
-					CalicoNetwork: &operator.CalicoNetworkSpec{
-						HostPorts: &hpDisabled,
-					},
-				},
-			}, nil, true,
-			&operator.CalicoNetworkSpec{
-				IPPools: []operator.IPPool{
-					{
-						CIDR:          "192.168.0.0/16",
-						Encapsulation: "IPIP",
-						NATOutgoing:   "Enabled",
-						NodeSelector:  "all()",
-						BlockSize:     &twentySix,
-					},
-				},
-				MTU:       &defaultMTU,
-				HostPorts: &hpDisabled,
-			}),
-	)
-
 	notReady := &utils.ReadyFlag{}
 	ready := &utils.ReadyFlag{}
 	ready.MarkAsReady()
 
 	Context("image reconciliation tests", func() {
-		var c client.Client
-		var cs *kfake.Clientset
-		var ctx context.Context
-		var cancel context.CancelFunc
-		var r ReconcileInstallation
-		var scheme *runtime.Scheme
-		var mockStatus *status.MockStatus
-
 		BeforeEach(func() {
 			// The schema contains all objects that should be known to the fake client when the test runs.
 			scheme = runtime.NewScheme()
@@ -335,7 +124,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(storagev1.SchemeBuilder.AddToScheme(scheme)).NotTo(HaveOccurred())
 
 			// Create a client that will have a crud interface of k8s objects.
-			c = fake.NewClientBuilder().WithScheme(scheme).Build()
+			c = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 			ctx, cancel = context.WithCancel(context.Background())
 
 			// Create a fake clientset for the autoscaler.
@@ -389,7 +178,6 @@ var _ = Describe("Testing core-controller installation", func() {
 				status:               mockStatus,
 				typhaAutoscaler:      newTyphaAutoscaler(cs, nodeIndexInformer, test.NewTyphaListWatch(cs), mockStatus),
 				namespaceMigration:   &fakeNamespaceMigration{},
-				amazonCRDExists:      true,
 				enterpriseCRDsExist:  true,
 				migrationChecked:     true,
 				tierWatchReady:       ready,
@@ -398,11 +186,14 @@ var _ = Describe("Testing core-controller installation", func() {
 			r.typhaAutoscaler.start(ctx)
 			certificateManager, err := certificatemanager.Create(c, nil, "", common.OperatorNamespace(), certificatemanager.AllowCACreation())
 			Expect(err).NotTo(HaveOccurred())
+
 			prometheusTLS, err := certificateManager.GetOrCreateKeyPair(c, monitor.PrometheusClientTLSSecretName, common.OperatorNamespace(), []string{monitor.PrometheusClientTLSSecretName})
 			Expect(err).NotTo(HaveOccurred())
+
 			Expect(c.Create(ctx, prometheusTLS.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, certificateManager.KeyPair().Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+
 			// We start off with a 'standard' installation, with nothing special
 			Expect(c.Create(
 				ctx,
@@ -422,7 +213,22 @@ var _ = Describe("Testing core-controller installation", func() {
 						},
 					},
 				})).NotTo(HaveOccurred())
+
+			// In most clusters, the IP pool controller is responsible for creating IP pools. The Installation controller waits for this,
+			// so we need to create those pools here.
+			pool := crdv1.IPPool{
+				ObjectMeta: metav1.ObjectMeta{Name: "default-pool-v4"},
+				Spec: crdv1.IPPoolSpec{
+					CIDR:         "192.168.0.0/16",
+					NATOutgoing:  true,
+					BlockSize:    26,
+					NodeSelector: "all()",
+					VXLANMode:    crdv1.VXLANModeAlways,
+				},
+			}
+			Expect(c.Create(ctx, &pool)).NotTo(HaveOccurred())
 		})
+
 		AfterEach(func() {
 			cancel()
 		})
@@ -467,8 +273,8 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(csrinit).ToNot(BeNil())
 			Expect(csrinit.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s:%s",
-					components.ComponentCSRInitContainer.Image,
-					components.ComponentCSRInitContainer.Version)))
+					components.ComponentTigeraCSRInitContainer.Image,
+					components.ComponentTigeraCSRInitContainer.Version)))
 
 			ds := appsv1.DaemonSet{
 				TypeMeta: metav1.TypeMeta{Kind: "DaemonSet", APIVersion: "apps/v1"},
@@ -490,8 +296,8 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(fv).ToNot(BeNil())
 			Expect(fv.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s:%s",
-					components.ComponentFlexVolumePrivate.Image,
-					components.ComponentFlexVolumePrivate.Version)))
+					components.ComponentTigeraFlexVolume.Image,
+					components.ComponentTigeraFlexVolume.Version)))
 			cni := test.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni")
 			Expect(cni).ToNot(BeNil())
 			Expect(cni.Image).To(Equal(
@@ -502,15 +308,16 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(csrinit).ToNot(BeNil())
 			Expect(csrinit.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s:%s",
-					components.ComponentCSRInitContainer.Image,
-					components.ComponentCSRInitContainer.Version)))
+					components.ComponentTigeraCSRInitContainer.Image,
+					components.ComponentTigeraCSRInitContainer.Version)))
 			csrinit2 := test.GetContainer(ds.Spec.Template.Spec.InitContainers, fmt.Sprintf("%s-key-cert-provisioner", render.NodePrometheusTLSServerSecret))
 			Expect(csrinit2).ToNot(BeNil())
 			Expect(csrinit2.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s:%s",
-					components.ComponentCSRInitContainer.Image,
-					components.ComponentCSRInitContainer.Version)))
+					components.ComponentTigeraCSRInitContainer.Image,
+					components.ComponentTigeraCSRInitContainer.Version)))
 		})
+
 		It("should use images from imageset", func() {
 			imageSet := &operator.ImageSet{
 				ObjectMeta: metav1.ObjectMeta{Name: "enterprise-" + components.EnterpriseRelease},
@@ -568,7 +375,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(csrinit).ToNot(BeNil())
 			Expect(csrinit.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s@%s",
-					components.ComponentCSRInitContainer.Image,
+					components.ComponentTigeraCSRInitContainer.Image,
 					"sha256:calicocsrinithash")))
 
 			ds := appsv1.DaemonSet{
@@ -591,7 +398,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(fv).ToNot(BeNil())
 			Expect(fv.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s@%s",
-					components.ComponentFlexVolumePrivate.Image,
+					components.ComponentTigeraFlexVolume.Image,
 					"sha256:calicoflexvolhash")))
 			cni := test.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni")
 			Expect(cni).ToNot(BeNil())
@@ -603,13 +410,13 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(csrinit).ToNot(BeNil())
 			Expect(csrinit.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s@%s",
-					components.ComponentCSRInitContainer.Image,
+					components.ComponentTigeraCSRInitContainer.Image,
 					"sha256:calicocsrinithash")))
 			csrinit2 := test.GetContainer(ds.Spec.Template.Spec.InitContainers, fmt.Sprintf("%s-key-cert-provisioner", render.NodePrometheusTLSServerSecret))
 			Expect(csrinit2).ToNot(BeNil())
 			Expect(csrinit2.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s@%s",
-					components.ComponentCSRInitContainer.Image,
+					components.ComponentTigeraCSRInitContainer.Image,
 					"sha256:calicocsrinithash")))
 
 			inst := operator.Installation{
@@ -624,16 +431,21 @@ var _ = Describe("Testing core-controller installation", func() {
 		It("should update version", func() {
 			instance := &operator.Installation{}
 			Expect(c.Get(ctx, types.NamespacedName{Name: "default"}, instance)).NotTo(HaveOccurred())
+
 			instance.Status.CalicoVersion = "v3.14"
 			Expect(c.Update(ctx, instance)).NotTo(HaveOccurred())
+
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
+
 			Expect(c.Get(ctx, types.NamespacedName{Name: "default"}, instance)).NotTo(HaveOccurred())
 			Expect(instance.Status.CalicoVersion).To(Equal(components.EnterpriseRelease))
 			Expect(c.Get(ctx, types.NamespacedName{Name: "default"}, instance)).NotTo(HaveOccurred())
+
 			instance.Status.CalicoVersion = "v3.23"
 			instance.Spec.Variant = operator.Calico
 			Expect(c.Update(ctx, instance)).NotTo(HaveOccurred())
+
 			_, err = r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(c.Get(ctx, types.NamespacedName{Name: "default"}, instance)).NotTo(HaveOccurred())
@@ -648,8 +460,20 @@ var _ = Describe("Testing core-controller installation", func() {
 					KubernetesProvider: operator.ProviderDockerEE,
 				},
 			}
-			Expect(mergeAndFillDefaults(installation, nil, nil, nil)).To(BeNil())
+			currentPools := crdv1.IPPoolList{}
+			currentPools.Items = append(currentPools.Items, crdv1.IPPool{
+				ObjectMeta: metav1.ObjectMeta{Name: "default-pool-v4"},
+				Spec: crdv1.IPPoolSpec{
+					CIDR:         "192.168.0.0/16",
+					NATOutgoing:  true,
+					BlockSize:    26,
+					NodeSelector: "all()",
+					VXLANMode:    crdv1.VXLANModeAlways,
+				},
+			})
+			Expect(MergeAndFillDefaults(installation, nil, &currentPools)).To(BeNil())
 			Expect(installation.Spec.CalicoNetwork.NodeAddressAutodetectionV4.SkipInterface).Should(Equal("^br-.*"))
+			Expect(installation.Spec.CalicoNetwork.NodeAddressAutodetectionV6).Should(BeNil())
 		})
 	})
 
@@ -660,7 +484,7 @@ var _ = Describe("Testing core-controller installation", func() {
 					KubernetesProvider: provider,
 				},
 			}
-			Expect(mergeAndFillDefaults(installation, nil, nil, nil)).To(BeNil())
+			Expect(MergeAndFillDefaults(installation, nil, nil)).To(BeNil())
 			if expected {
 				Expect(installation.Spec.TyphaAffinity).ToNot(BeNil())
 				Expect(installation.Spec.TyphaAffinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms).Should(Equal(result))
@@ -693,16 +517,6 @@ var _ = Describe("Testing core-controller installation", func() {
 	)
 
 	Context("management cluster exists", func() {
-		var c client.Client
-		var cs *kfake.Clientset
-		var ctx context.Context
-		var cancel context.CancelFunc
-		var r ReconcileInstallation
-		var cr *operator.Installation
-
-		var scheme *runtime.Scheme
-		var mockStatus *status.MockStatus
-
 		var expectedDNSNames []string
 		var certificateManager certificatemanager.CertificateManager
 
@@ -717,7 +531,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(storagev1.SchemeBuilder.AddToScheme(scheme)).NotTo(HaveOccurred())
 
 			// Create a client that will have a crud interface of k8s objects.
-			c = fake.NewClientBuilder().WithScheme(scheme).Build()
+			c = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 			ctx, cancel = context.WithCancel(context.Background())
 
 			// Create a fake clientset for the autoscaler.
@@ -799,11 +613,22 @@ var _ = Describe("Testing core-controller installation", func() {
 			// We start off with a 'standard' installation, with nothing special
 			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
 
-			Expect(c.Create(
-				ctx,
-				&operator.ManagementCluster{
-					ObjectMeta: metav1.ObjectMeta{Name: utils.DefaultTSEEInstanceKey.Name},
-				})).NotTo(HaveOccurred())
+			// In most clusters, the IP pool controller is responsible for creating IP pools. The Installation controller waits for this,
+			// so we need to create those pools here.
+			pool := crdv1.IPPool{
+				ObjectMeta: metav1.ObjectMeta{Name: "default-pool-v4"},
+				Spec: crdv1.IPPoolSpec{
+					CIDR:         "192.168.0.0/16",
+					NATOutgoing:  true,
+					BlockSize:    26,
+					NodeSelector: "all()",
+					VXLANMode:    crdv1.VXLANModeAlways,
+				},
+			}
+			Expect(c.Create(ctx, &pool)).NotTo(HaveOccurred())
+
+			// Configure ourselves as a management cluster.
+			Expect(c.Create(ctx, &operator.ManagementCluster{ObjectMeta: metav1.ObjectMeta{Name: utils.DefaultTSEEInstanceKey.Name}})).NotTo(HaveOccurred())
 
 			expectedDNSNames = dns.GetServiceDNSNames(render.ManagerServiceName, render.ManagerNamespace, dns.DefaultClusterDomain)
 			expectedDNSNames = append(expectedDNSNames, "localhost")
@@ -816,6 +641,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(c.Create(ctx, prometheusTLS.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
 		})
+
 		AfterEach(func() {
 			cancel()
 		})
@@ -884,15 +710,21 @@ var _ = Describe("Testing core-controller installation", func() {
 	})
 
 	Context("Reconcile tests", func() {
-		var c client.Client
-		var cs *kfake.Clientset
-		var ctx context.Context
-		var cancel context.CancelFunc
-		var r ReconcileInstallation
-		var scheme *runtime.Scheme
-		var mockStatus *status.MockStatus
-
-		var cr *operator.Installation
+		createNodeDaemonSet := func() {
+			Expect(c.Create(
+				ctx,
+				&appsv1.DaemonSet{
+					ObjectMeta: metav1.ObjectMeta{Name: common.NodeDaemonSetName, Namespace: common.CalicoNamespace},
+					Spec: appsv1.DaemonSetSpec{
+						Template: corev1.PodTemplateSpec{
+							ObjectMeta: metav1.ObjectMeta{},
+							Spec: corev1.PodSpec{
+								Containers: []corev1.Container{{Name: render.CalicoNodeObjectName}},
+							},
+						},
+					},
+				})).NotTo(HaveOccurred())
+		}
 
 		BeforeEach(func() {
 			// The schema contains all objects that should be known to the fake client when the test runs.
@@ -905,7 +737,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(storagev1.SchemeBuilder.AddToScheme(scheme)).NotTo(HaveOccurred())
 
 			// Create a client that will have a crud interface of k8s objects.
-			c = fake.NewClientBuilder().WithScheme(scheme).Build()
+			c = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 			ctx, cancel = context.WithCancel(context.Background())
 
 			// Create a fake clientset for the autoscaler.
@@ -983,6 +815,21 @@ var _ = Describe("Testing core-controller installation", func() {
 			ca, err := tls.MakeCA("test")
 			Expect(err).NotTo(HaveOccurred())
 			cert, _, _ := ca.Config.GetPEMBytes() // create a valid pem block
+
+			// In most clusters, the IP pool controller is responsible for creating IP pools. The Installation controller waits for this,
+			// so we need to create those pools here.
+			pool := crdv1.IPPool{
+				ObjectMeta: metav1.ObjectMeta{Name: "default-pool-v4"},
+				Spec: crdv1.IPPoolSpec{
+					CIDR:         "192.168.0.0/16",
+					NATOutgoing:  true,
+					BlockSize:    26,
+					NodeSelector: "all()",
+					VXLANMode:    crdv1.VXLANModeAlways,
+				},
+			}
+			Expect(c.Create(ctx, &pool)).NotTo(HaveOccurred())
+
 			// We start off with a 'standard' installation, with nothing special
 			cr = &operator.Installation{
 				ObjectMeta: metav1.ObjectMeta{Name: "default"},
@@ -991,6 +838,7 @@ var _ = Describe("Testing core-controller installation", func() {
 					Registry:              "some.registry.org/",
 					CertificateManagement: &operator.CertificateManagement{CACert: cert},
 				},
+				Status: operator.InstallationStatus{},
 			}
 			certificateManager, err := certificatemanager.Create(c, nil, "", common.OperatorNamespace(), certificatemanager.AllowCACreation())
 			Expect(err).NotTo(HaveOccurred())
@@ -999,6 +847,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(c.Create(ctx, prometheusTLS.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
 		})
+
 		AfterEach(func() {
 			cancel()
 		})
@@ -1017,6 +866,102 @@ var _ = Describe("Testing core-controller installation", func() {
 
 			// This is only set on EKS / GKE.
 			Expect(fc.Spec.RouteTableRange).To(BeNil())
+
+			// Should set correct annoation and BPFEnabled field.
+			Expect(fc.Annotations).NotTo(BeNil())
+			Expect(fc.Annotations[render.BPFOperatorAnnotation]).To(Equal("false"))
+			Expect(fc.Spec.BPFEnabled).NotTo(BeNil())
+			Expect(*fc.Spec.BPFEnabled).To(BeFalse())
+		})
+
+		It("should set BPFEnabled to ture on FelixConfiguration if BPF is enabled on installation", func() {
+			createNodeDaemonSet()
+
+			network := operator.LinuxDataplaneBPF
+			cr.Spec.CalicoNetwork = &operator.CalicoNetworkSpec{LinuxDataplane: &network}
+			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
+			_, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			fc := &crdv1.FelixConfiguration{}
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			// Should set correct annoation and BPFEnabled field.
+			Expect(fc.Annotations).NotTo(BeNil())
+			Expect(fc.Annotations[render.BPFOperatorAnnotation]).To(Equal("true"))
+			Expect(fc.Spec.BPFEnabled).NotTo(BeNil())
+			Expect(*fc.Spec.BPFEnabled).To(BeTrue())
+		})
+
+		It("should set BPFEnabled to false on FelixConfiguration if BPF is disabled on installation", func() {
+			createNodeDaemonSet()
+
+			// Enable BPF.
+			network := operator.LinuxDataplaneBPF
+			cr.Spec.CalicoNetwork = &operator.CalicoNetworkSpec{LinuxDataplane: &network}
+			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
+			_, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			fc := &crdv1.FelixConfiguration{}
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			// Should set correct annoation and BPFEnabled field.
+			Expect(fc.Annotations).NotTo(BeNil())
+			Expect(fc.Annotations[render.BPFOperatorAnnotation]).To(Equal("true"))
+			Expect(fc.Spec.BPFEnabled).NotTo(BeNil())
+			Expect(*fc.Spec.BPFEnabled).To(BeTrue())
+
+			// Set dataplane to IPTables.
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, cr)
+			Expect(err).ShouldNot(HaveOccurred())
+			network = operator.LinuxDataplaneIptables
+			cr.Spec.CalicoNetwork = &operator.CalicoNetworkSpec{LinuxDataplane: &network}
+			Expect(c.Update(ctx, cr)).NotTo(HaveOccurred())
+			_, err = r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			fc = &crdv1.FelixConfiguration{}
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			// Should set correct annoation and BPFEnabled field.
+			Expect(fc.Annotations).NotTo(BeNil())
+			Expect(fc.Annotations[render.BPFOperatorAnnotation]).To(Equal("false"))
+			Expect(fc.Spec.BPFEnabled).NotTo(BeNil())
+			Expect(*fc.Spec.BPFEnabled).To(BeFalse())
+		})
+
+		It("should set BPFEnabled on FelixConfiguration if FELIX_BPFENABLED Env var is set by old version of operator", func() {
+			createNodeDaemonSet()
+
+			ds := &appsv1.DaemonSet{}
+			err := c.Get(ctx,
+				types.NamespacedName{Name: common.NodeDaemonSetName, Namespace: common.CalicoNamespace},
+				ds)
+			Expect(err).NotTo(HaveOccurred())
+			ds.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{
+				{Name: "FELIX_BPFENABLED", Value: "true", ValueFrom: nil},
+			}
+			Expect(c.Update(ctx, ds)).NotTo(HaveOccurred())
+
+			network := operator.LinuxDataplaneBPF
+			cr.Spec.CalicoNetwork = &operator.CalicoNetworkSpec{LinuxDataplane: &network}
+			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
+			_, err = r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			fc := &crdv1.FelixConfiguration{}
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			// Should set correct annoation and BPFEnabled field.
+			Expect(fc.Annotations).NotTo(BeNil())
+			Expect(fc.Annotations[render.BPFOperatorAnnotation]).To(Equal("true"))
+			Expect(fc.Spec.BPFEnabled).NotTo(BeNil())
+			Expect(*fc.Spec.BPFEnabled).To(BeTrue())
 		})
 
 		It("generates FelixConfiguration with correct DNS service for Rancher", func() {
@@ -1167,6 +1112,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(test.GetResource(c, &cm)).To(BeNil())
 			Expect(cm.Data["active-namespace"]).To(Equal("tigera-operator"))
 		})
+
 		It("should exit Reconcile when active operator is a different namespace", func() {
 			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, &corev1.ConfigMap{
@@ -1184,6 +1130,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(err).Should(HaveOccurred())
 			Expect(exited).Should(BeTrue())
 		})
+
 		It("should not exit Reconcile when active operator is current namespace", func() {
 			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, &corev1.ConfigMap{
@@ -1210,6 +1157,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(test.GetResource(c, &cm)).To(BeNil())
 			Expect(cm.Data["active-namespace"]).To(Equal("tigera-operator"))
 		})
+
 		It("should not overwrite active-operator CM when it already exists", func() {
 			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, &corev1.ConfigMap{
@@ -1294,6 +1242,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(cr.Status.Conditions).To(HaveLen(0))
 		})
+
 		It("should reconcile with creating new installation status with multiple conditions as true", func() {
 			generation := int64(2)
 			ts := &operator.TigeraStatus{
@@ -1491,6 +1440,142 @@ var _ = Describe("Testing core-controller installation", func() {
 			policies := v3.NetworkPolicyList{}
 			Expect(c.List(ctx, &policies)).ToNot(HaveOccurred())
 			Expect(policies.Items).To(HaveLen(0))
+		})
+	})
+
+	Context("Using EKS networking", func() {
+		var certificateManager certificatemanager.CertificateManager
+
+		BeforeEach(func() {
+			// The schema contains all objects that should be known to the fake client when the test runs.
+			scheme = runtime.NewScheme()
+			Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+			Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+			Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+			Expect(schedv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+			Expect(operator.SchemeBuilder.AddToScheme(scheme)).NotTo(HaveOccurred())
+			Expect(storagev1.SchemeBuilder.AddToScheme(scheme)).NotTo(HaveOccurred())
+
+			// Create a client that will have a crud interface of k8s objects.
+			c = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
+			ctx, cancel = context.WithCancel(context.Background())
+
+			// Create a fake clientset for the autoscaler.
+			var replicas int32 = 1
+			objs := []runtime.Object{
+				&corev1.Node{
+					TypeMeta: metav1.TypeMeta{},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:   "node1",
+						Labels: map[string]string{"kubernetes.io/os": "linux"},
+					},
+					Spec: corev1.NodeSpec{},
+				},
+				&appsv1.Deployment{
+					TypeMeta:   metav1.TypeMeta{},
+					ObjectMeta: metav1.ObjectMeta{Name: "calico-typha", Namespace: "calico-system"},
+					Spec: appsv1.DeploymentSpec{
+						Replicas: &replicas,
+					},
+				},
+			}
+			cs = kfake.NewSimpleClientset(objs...)
+
+			// Create an object we can use throughout the test to do the compliance reconcile loops.
+			mockStatus = &status.MockStatus{}
+			mockStatus.On("AddDaemonsets", mock.Anything).Return()
+			mockStatus.On("AddDeployments", mock.Anything).Return()
+			mockStatus.On("AddStatefulSets", mock.Anything).Return()
+			mockStatus.On("AddCronJobs", mock.Anything)
+			mockStatus.On("IsAvailable").Return(true)
+			mockStatus.On("OnCRFound").Return()
+			mockStatus.On("ClearDegraded")
+			mockStatus.On("AddCertificateSigningRequests", mock.Anything)
+			mockStatus.On("RemoveCertificateSigningRequests", mock.Anything)
+			mockStatus.On("ReadyToMonitor")
+			mockStatus.On("SetMetaData", mock.Anything).Return()
+
+			// Create the indexer and informer used by the typhaAutoscaler
+			nlw := test.NewNodeListWatch(cs)
+			nodeIndexInformer := cache.NewSharedIndexInformer(nlw, &corev1.Node{}, 0, cache.Indexers{})
+
+			go nodeIndexInformer.Run(ctx.Done())
+			for nodeIndexInformer.HasSynced() {
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			// As the parameters in the client changes, we expect the outcomes of the reconcile loops to change.
+			r = ReconcileInstallation{
+				config:               nil, // there is no fake for config
+				client:               c,
+				scheme:               scheme,
+				autoDetectedProvider: operator.ProviderNone,
+				status:               mockStatus,
+				typhaAutoscaler:      newTyphaAutoscaler(cs, nodeIndexInformer, test.NewTyphaListWatch(cs), mockStatus),
+				namespaceMigration:   &fakeNamespaceMigration{},
+				amazonCRDExists:      true,
+				enterpriseCRDsExist:  true,
+				migrationChecked:     true,
+				clusterDomain:        dns.DefaultClusterDomain,
+				tierWatchReady:       ready,
+			}
+			r.typhaAutoscaler.start(ctx)
+
+			cr = &operator.Installation{
+				ObjectMeta: metav1.ObjectMeta{Name: "default"},
+				Spec: operator.InstallationSpec{
+					Variant:            operator.TigeraSecureEnterprise,
+					Registry:           "some.registry.org/",
+					KubernetesProvider: operator.ProviderEKS,
+					CNI: &operator.CNISpec{
+						Type: operator.PluginAmazonVPC,
+						IPAM: &operator.IPAMSpec{
+							Type: operator.IPAMPluginAmazonVPC,
+						},
+					},
+				},
+				Status: operator.InstallationStatus{
+					Variant: operator.TigeraSecureEnterprise,
+					Computed: &operator.InstallationSpec{
+						Registry: "my-reg",
+						// The test is provider agnostic.
+						KubernetesProvider: operator.ProviderNone,
+					},
+				},
+			}
+			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
+
+			// NOTE: We do NOT create an IP pool for this test suite, as it is not needed for the Amazon VPC plugin.
+
+			var err error
+			certificateManager, err = certificatemanager.Create(c, nil, "", common.OperatorNamespace(), certificatemanager.AllowCACreation())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, certificateManager.KeyPair().Secret(common.OperatorNamespace()))) // Persist the root-ca in the operator namespace.
+			prometheusTLS, err := certificateManager.GetOrCreateKeyPair(c, monitor.PrometheusClientTLSSecretName, common.OperatorNamespace(), []string{monitor.PrometheusClientTLSSecretName})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, prometheusTLS.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+		})
+
+		AfterEach(func() {
+			cancel()
+		})
+
+		It("should reconcile successfully and create resources", func() {
+			_, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			secret := &corev1.Secret{}
+			cfgMap := &corev1.ConfigMap{}
+
+			Expect(c.Get(ctx, client.ObjectKey{Name: "tigera-ca-bundle", Namespace: common.CalicoNamespace}, cfgMap)).ShouldNot(HaveOccurred())
+			Expect(cfgMap.GetOwnerReferences()).To(HaveLen(1))
+
+			Expect(c.Get(ctx, client.ObjectKey{Name: render.NodeTLSSecretName, Namespace: common.OperatorNamespace()}, secret)).ShouldNot(HaveOccurred())
+			Expect(secret.GetOwnerReferences()).To(HaveLen(1))
+
+			Expect(c.Get(ctx, client.ObjectKey{Name: render.TyphaTLSSecretName, Namespace: common.OperatorNamespace()}, secret)).ShouldNot(HaveOccurred())
+			Expect(secret.GetOwnerReferences()).To(HaveLen(1))
 		})
 	})
 })

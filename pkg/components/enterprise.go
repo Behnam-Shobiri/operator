@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -56,6 +56,12 @@ var (
 		Registry: "",
 	}
 
+	ComponentTigeraCSRInitContainer = component{
+		Version:  "master",
+		Image:    "tigera/key-cert-provisioner",
+		Registry: "",
+	}
+
 	ComponentDeepPacketInspection = component{
 		Version:  "master",
 		Image:    "tigera/deep-packet-inspection",
@@ -63,12 +69,12 @@ var (
 	}
 
 	ComponentEckElasticsearch = component{
-		Version:  "7.17.14",
+		Version:  "7.17.18",
 		Registry: "",
 	}
 
 	ComponentEckKibana = component{
-		Version:  "7.17.14",
+		Version:  "7.17.18",
 		Registry: "",
 	}
 
@@ -210,7 +216,7 @@ var (
 	}
 
 	ComponentCoreOSPrometheus = component{
-		Version:  "v2.43.1",
+		Version:  "v2.48.1",
 		Registry: "",
 	}
 
@@ -285,31 +291,25 @@ var (
 		Registry: "",
 	}
 
-	ComponentCloudControllers = component{
-		Version:  "master",
-		Image:    "tigera/cloud-controllers",
-		Registry: "",
-	}
-
 	ComponentElasticsearchMetrics = component{
 		Version:  "master",
 		Image:    "tigera/elasticsearch-metrics",
 		Registry: "",
 	}
 
-	ComponentFlexVolumePrivate = component{
+	ComponentTigeraFlexVolume = component{
 		Version:  "master",
 		Image:    "tigera/pod2daemon-flexvol",
 		Registry: "",
 	}
 
-	ComponentCSIPrivate = component{
+	ComponentTigeraCSI = component{
 		Version:  "master",
 		Image:    "tigera/csi",
 		Registry: "",
 	}
 
-	ComponentCSINodeDriverRegistrarPrivate = component{
+	ComponentTigeraCSINodeDriverRegistrar = component{
 		Version:  "master",
 		Image:    "tigera/node-driver-registrar",
 		Registry: "",
@@ -323,6 +323,7 @@ var (
 		ComponentComplianceReporter,
 		ComponentComplianceServer,
 		ComponentComplianceSnapshotter,
+		ComponentTigeraCSRInitContainer,
 		ComponentDeepPacketInspection,
 		ComponentElasticTseeInstaller,
 		ComponentElasticsearch,
@@ -349,16 +350,17 @@ var (
 		ComponentQueryServer,
 		ComponentTigeraKubeControllers,
 		ComponentTigeraNode,
+		ComponentTigeraNodeWindows,
 		ComponentTigeraTypha,
 		ComponentTigeraCNI,
 		ComponentTigeraCNIFIPS,
-		ComponentCloudControllers,
+		ComponentTigeraCNIWindows,
 		ComponentElasticsearchMetrics,
 		ComponentESGateway,
 		ComponentLinseed,
 		ComponentDikastes,
-		ComponentFlexVolumePrivate,
-		ComponentCSIPrivate,
-		ComponentCSINodeDriverRegistrarPrivate,
+		ComponentTigeraFlexVolume,
+		ComponentTigeraCSI,
+		ComponentTigeraCSINodeDriverRegistrar,
 	}
 )

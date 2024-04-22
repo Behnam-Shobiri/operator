@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,8 +20,9 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
+
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-	"github.com/tigera/operator/pkg/ptr"
+
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	k8sresource "k8s.io/apimachinery/pkg/api/resource"
@@ -29,15 +30,17 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/dns"
+	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	rtest "github.com/tigera/operator/pkg/render/common/test"
@@ -74,7 +77,7 @@ var _ = Describe("monitor rendering tests", func() {
 	BeforeEach(func() {
 		scheme := runtime.NewScheme()
 		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
-		cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+		cli := ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 
 		certificateManager, err := certificatemanager.Create(cli, nil, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
@@ -127,6 +130,70 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(service.Labels["k8s-app"]).To(Equal("tigera-prometheus"))
 	})
 
+	It("Should render Prometheus resources with resources requests and limits", func() {
+
+		prometheusResources := corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				"cpu":    k8sresource.MustParse("1"),
+				"memory": k8sresource.MustParse("500Mi"),
+			},
+			Requests: corev1.ResourceList{
+				"cpu":    k8sresource.MustParse("101m"),
+				"memory": k8sresource.MustParse("100Mi"),
+			},
+		}
+		alertManagerResources := corev1.ResourceRequirements{
+			Limits: corev1.ResourceList{
+				"cpu":    k8sresource.MustParse("601m"),
+				"memory": k8sresource.MustParse("600Mi"),
+			},
+			Requests: corev1.ResourceList{
+				"cpu":    k8sresource.MustParse("201m"),
+				"memory": k8sresource.MustParse("200Mi"),
+			},
+		}
+
+		cfg.Monitor.Prometheus = &operatorv1.Prometheus{
+			PrometheusSpec: &operatorv1.PrometheusSpec{
+				CommonPrometheusFields: &operatorv1.CommonPrometheusFields{
+					Containers: []operatorv1.PrometheusContainer{{
+						Name:      "authn-proxy",
+						Resources: &prometheusResources,
+					},
+					},
+					Resources: prometheusResources,
+				},
+			},
+		}
+
+		cfg.Monitor.AlertManager = &operatorv1.AlertManager{
+			AlertManagerSpec: &operatorv1.AlertManagerSpec{
+				Resources: alertManagerResources,
+			},
+		}
+
+		component := monitor.Monitor(cfg)
+		Expect(component.ResolveImages(nil)).NotTo(HaveOccurred())
+		toCreate, toDelete := component.Objects()
+		Expect(toDelete).To(HaveLen(3))
+
+		// Prometheus
+		prometheusObj, ok := rtest.GetResource(toCreate, monitor.CalicoNodePrometheus, common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.PrometheusesKind).(*monitoringv1.Prometheus)
+		Expect(ok).To(BeTrue())
+
+		Expect(prometheusObj.Spec.CommonPrometheusFields.Containers).To(HaveLen(1))
+		Expect(prometheusObj.Spec.CommonPrometheusFields.Containers[0].Name).To(Equal("authn-proxy"))
+		Expect(prometheusObj.Spec.CommonPrometheusFields.Containers[0].Resources).To(Equal(prometheusResources))
+
+		Expect(prometheusObj.Spec.CommonPrometheusFields.Resources).To(Equal(prometheusResources))
+
+		// AlertManager
+		alertmanagerObj, ok := rtest.GetResource(toCreate, monitor.CalicoNodeAlertmanager, common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.AlertmanagersKind).(*monitoringv1.Alertmanager)
+		Expect(ok).To(BeTrue())
+		Expect(alertmanagerObj.Spec.Resources).To(Equal(alertManagerResources))
+
+	})
+
 	It("Should render Prometheus resource Specs correctly", func() {
 		component := monitor.Monitor(cfg)
 		Expect(component.ResolveImages(nil)).NotTo(HaveOccurred())
@@ -137,18 +204,24 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(ok).To(BeTrue())
 		promOperClusterRoleObj, ok := rtest.GetResource(toCreate, "calico-prometheus-operator", "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
 		Expect(ok).To(BeTrue())
-		Expect(promOperClusterRoleObj.Rules).To(HaveLen(9))
+		Expect(promOperClusterRoleObj.Rules).To(HaveLen(10))
 		Expect(promOperClusterRoleObj.Rules[0]).To(Equal(rbacv1.PolicyRule{
 			APIGroups: []string{"monitoring.coreos.com"},
 			Resources: []string{
 				"alertmanagers",
 				"alertmanagers/finalizers",
+				"alertmanagers/status",
 				"alertmanagerconfigs",
 				"prometheuses",
 				"prometheuses/finalizers",
 				"prometheuses/status",
+				"prometheusagents",
+				"prometheusagents/finalizers",
+				"prometheusagents/status",
 				"thanosrulers",
 				"thanosrulers/finalizers",
+				"thanosrulers/status",
+				"scrapeconfigs",
 				"servicemonitors",
 				"podmonitors",
 				"probes",
@@ -185,10 +258,10 @@ var _ = Describe("monitor rendering tests", func() {
 				"endpoints",
 			},
 			Verbs: []string{
-				"create",
-				"delete",
 				"get",
+				"create",
 				"update",
+				"delete",
 			},
 		}))
 		Expect(promOperClusterRoleObj.Rules[5]).To(Equal(rbacv1.PolicyRule{
@@ -218,6 +291,13 @@ var _ = Describe("monitor rendering tests", func() {
 			},
 		}))
 		Expect(promOperClusterRoleObj.Rules[8]).To(Equal(rbacv1.PolicyRule{
+			APIGroups: []string{"storage.k8s.io"},
+			Resources: []string{"storageclasses"},
+			Verbs: []string{
+				"get",
+			},
+		}))
+		Expect(promOperClusterRoleObj.Rules[9]).To(Equal(rbacv1.PolicyRule{
 			APIGroups:     []string{"policy"},
 			Resources:     []string{"podsecuritypolicies"},
 			Verbs:         []string{"use"},
@@ -716,132 +796,148 @@ var _ = Describe("monitor rendering tests", func() {
 			Entry("for managed, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: true, Openshift: true}),
 		)
 
-		It("Should render external prometheus resources with service monitor", func() {
-			cfg.Monitor.ExternalPrometheus = &operatorv1.ExternalPrometheus{
-				ServiceMonitor: &operatorv1.ServiceMonitor{
-					Endpoints: []operatorv1.Endpoint{
-						{
-							BearerTokenSecret: corev1.SecretKeySelector{
-								LocalObjectReference: corev1.LocalObjectReference{Name: "tigera-external-prometheus"},
-							},
+		It("prometheus policy should omit kube-controller egress rule when kube-controller port is 0", func() {
+			// Baseline case
+			cfg.KubeControllerPort = 9094
+			component := monitor.MonitorPolicy(cfg)
+			resourcesToCreate, _ := component.Objects()
+			baselinePolicy := testutils.GetAllowTigeraPolicyFromResources(types.NamespacedName{Name: "allow-tigera.prometheus", Namespace: "tigera-prometheus"}, resourcesToCreate)
+
+			// kube-controllers port set to 0
+			cfg.KubeControllerPort = 0
+			component = monitor.MonitorPolicy(cfg)
+			resourcesToCreate, _ = component.Objects()
+			zeroedPolicy := testutils.GetAllowTigeraPolicyFromResources(types.NamespacedName{Name: "allow-tigera.prometheus", Namespace: "tigera-prometheus"}, resourcesToCreate)
+
+			Expect(len(zeroedPolicy.Spec.Egress)).To(Equal(len(baselinePolicy.Spec.Egress) - 1))
+		})
+	})
+
+	It("Should render external prometheus resources with service monitor", func() {
+		cfg.Monitor.ExternalPrometheus = &operatorv1.ExternalPrometheus{
+			ServiceMonitor: &operatorv1.ServiceMonitor{
+				Endpoints: []operatorv1.Endpoint{
+					{
+						BearerTokenSecret: corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "tigera-external-prometheus"},
 						},
 					},
 				},
-				Namespace: "external-prometheus",
-			}
-			component := monitor.Monitor(cfg)
-			Expect(component.ResolveImages(nil)).NotTo(HaveOccurred())
-			toCreate, toDelete := component.Objects()
-			expectedResources := expectedBaseResources()
-			expectedResources = append(expectedResources,
-				resource{"tigera-external-prometheus", "external-prometheus", "", "v1", "ConfigMap"},
-				resource{"tigera-external-prometheus", "external-prometheus", "monitoring.coreos.com", "v1", "ServiceMonitor"},
-				resource{"tigera-external-prometheus", "external-prometheus", "rbac.authorization.k8s.io", "v1", "ClusterRole"},
-				resource{"tigera-external-prometheus", "external-prometheus", "rbac.authorization.k8s.io", "v1", "ClusterRoleBinding"},
-				resource{"tigera-external-prometheus", "external-prometheus", "", "v1", "ServiceAccount"},
-				resource{"tigera-external-prometheus", "external-prometheus", "", "v1", "Secret"},
-			)
+			},
+			Namespace: "external-prometheus",
+		}
+		component := monitor.Monitor(cfg)
+		Expect(component.ResolveImages(nil)).NotTo(HaveOccurred())
+		toCreate, toDelete := component.Objects()
+		expectedResources := expectedBaseResources()
+		expectedResources = append(expectedResources,
+			resource{"tigera-external-prometheus", "external-prometheus", "", "v1", "ConfigMap"},
+			resource{"tigera-external-prometheus", "external-prometheus", "monitoring.coreos.com", "v1", "ServiceMonitor"},
+			resource{"tigera-external-prometheus", "external-prometheus", "rbac.authorization.k8s.io", "v1", "ClusterRole"},
+			resource{"tigera-external-prometheus", "external-prometheus", "rbac.authorization.k8s.io", "v1", "ClusterRoleBinding"},
+			resource{"tigera-external-prometheus", "external-prometheus", "", "v1", "ServiceAccount"},
+			resource{"tigera-external-prometheus", "external-prometheus", "", "v1", "Secret"},
+		)
 
-			for i, expectedRes := range expectedResources {
-				obj := toCreate[i]
-				rtest.ExpectResourceTypeAndObjectMetadata(obj, expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
-			}
-			Expect(toCreate).To(HaveLen(len(expectedResources)))
-			Expect(toDelete).To(HaveLen(3))
-		})
-		It("Should render external prometheus resources with service monitor and custom token", func() {
-			cfg.Monitor.ExternalPrometheus = &operatorv1.ExternalPrometheus{
-				ServiceMonitor: &operatorv1.ServiceMonitor{
-					Endpoints: []operatorv1.Endpoint{
-						{
-							BearerTokenSecret: corev1.SecretKeySelector{
-								LocalObjectReference: corev1.LocalObjectReference{Name: "some-other-token"},
-							},
+		for i, expectedRes := range expectedResources {
+			obj := toCreate[i]
+			rtest.ExpectResourceTypeAndObjectMetadata(obj, expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+		}
+		Expect(toCreate).To(HaveLen(len(expectedResources)))
+		Expect(toDelete).To(HaveLen(3))
+	})
+	It("Should render external prometheus resources with service monitor and custom token", func() {
+		cfg.Monitor.ExternalPrometheus = &operatorv1.ExternalPrometheus{
+			ServiceMonitor: &operatorv1.ServiceMonitor{
+				Endpoints: []operatorv1.Endpoint{
+					{
+						BearerTokenSecret: corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "some-other-token"},
 						},
 					},
 				},
-				Namespace: "external-prometheus",
-			}
-			component := monitor.Monitor(cfg)
-			Expect(component.ResolveImages(nil)).NotTo(HaveOccurred())
-			toCreate, toDelete := component.Objects()
-			expectedResources := expectedBaseResources()
-			expectedResources = append(expectedResources,
-				resource{"tigera-external-prometheus", "external-prometheus", "", "v1", "ConfigMap"},
-				resource{"tigera-external-prometheus", "external-prometheus", "monitoring.coreos.com", "v1", "ServiceMonitor"},
-			)
+			},
+			Namespace: "external-prometheus",
+		}
+		component := monitor.Monitor(cfg)
+		Expect(component.ResolveImages(nil)).NotTo(HaveOccurred())
+		toCreate, toDelete := component.Objects()
+		expectedResources := expectedBaseResources()
+		expectedResources = append(expectedResources,
+			resource{"tigera-external-prometheus", "external-prometheus", "", "v1", "ConfigMap"},
+			resource{"tigera-external-prometheus", "external-prometheus", "monitoring.coreos.com", "v1", "ServiceMonitor"},
+		)
 
-			for i, expectedRes := range expectedResources {
-				obj := toCreate[i]
-				rtest.ExpectResourceTypeAndObjectMetadata(obj, expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
-			}
-			Expect(toCreate).To(HaveLen(len(expectedResources)))
-			Expect(toDelete).To(HaveLen(3))
-		})
-		It("Should render external prometheus resources without service monitor", func() {
-			cfg.Monitor.ExternalPrometheus = &operatorv1.ExternalPrometheus{
-				Namespace: "external-prometheus",
-			}
-			component := monitor.Monitor(cfg)
-			Expect(component.ResolveImages(nil)).NotTo(HaveOccurred())
-			toCreate, toDelete := component.Objects()
-			expectedResources := expectedBaseResources()
-			expectedResources = append(expectedResources,
-				resource{"tigera-external-prometheus", "external-prometheus", "", "v1", "ConfigMap"},
-			)
+		for i, expectedRes := range expectedResources {
+			obj := toCreate[i]
+			rtest.ExpectResourceTypeAndObjectMetadata(obj, expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+		}
+		Expect(toCreate).To(HaveLen(len(expectedResources)))
+		Expect(toDelete).To(HaveLen(3))
+	})
+	It("Should render external prometheus resources without service monitor", func() {
+		cfg.Monitor.ExternalPrometheus = &operatorv1.ExternalPrometheus{
+			Namespace: "external-prometheus",
+		}
+		component := monitor.Monitor(cfg)
+		Expect(component.ResolveImages(nil)).NotTo(HaveOccurred())
+		toCreate, toDelete := component.Objects()
+		expectedResources := expectedBaseResources()
+		expectedResources = append(expectedResources,
+			resource{"tigera-external-prometheus", "external-prometheus", "", "v1", "ConfigMap"},
+		)
 
-			for i, expectedRes := range expectedResources {
-				obj := toCreate[i]
-				rtest.ExpectResourceTypeAndObjectMetadata(obj, expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
-			}
-			Expect(toCreate).To(HaveLen(len(expectedResources)))
-			Expect(toDelete).To(HaveLen(3))
-		})
-		It("Should render typha service monitor if typha metrics are enabled", func() {
-			cfg.Installation.TyphaMetricsPort = ptr.Int32ToPtr(9093)
-			component := monitor.Monitor(cfg)
-			Expect(component.ResolveImages(nil)).NotTo(HaveOccurred())
-			toCreate, toDelete := component.Objects()
-			expectedResources := expectedBaseResources()
-			expectedResources = append(expectedResources,
-				resource{"calico-typha-metrics", "tigera-prometheus", "monitoring.coreos.com", "v1", "ServiceMonitor"},
-			)
+		for i, expectedRes := range expectedResources {
+			obj := toCreate[i]
+			rtest.ExpectResourceTypeAndObjectMetadata(obj, expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+		}
+		Expect(toCreate).To(HaveLen(len(expectedResources)))
+		Expect(toDelete).To(HaveLen(3))
+	})
+	It("Should render typha service monitor if typha metrics are enabled", func() {
+		cfg.Installation.TyphaMetricsPort = ptr.Int32ToPtr(9093)
+		component := monitor.Monitor(cfg)
+		Expect(component.ResolveImages(nil)).NotTo(HaveOccurred())
+		toCreate, toDelete := component.Objects()
+		expectedResources := expectedBaseResources()
+		expectedResources = append(expectedResources,
+			resource{"calico-typha-metrics", "tigera-prometheus", "monitoring.coreos.com", "v1", "ServiceMonitor"},
+		)
 
-			for i, expectedRes := range expectedResources {
-				obj := toCreate[i]
-				rtest.ExpectResourceTypeAndObjectMetadata(obj, expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
-			}
-			Expect(toCreate).To(HaveLen(len(expectedResources)))
-			Expect(toDelete).To(HaveLen(2))
-			sm := rtest.GetResource(toCreate, "calico-typha-metrics", "tigera-prometheus", "monitoring.coreos.com", "v1", "ServiceMonitor").(*monitoringv1.ServiceMonitor)
-			Expect(sm).To(Equal(&monitoringv1.ServiceMonitor{
-				TypeMeta: metav1.TypeMeta{Kind: monitoringv1.ServiceMonitorsKind, APIVersion: "monitoring.coreos.com/v1"},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "calico-typha-metrics",
-					Namespace: "tigera-prometheus",
-					Labels:    map[string]string{"team": "network-operators"},
-				},
-				Spec: monitoringv1.ServiceMonitorSpec{
-					Endpoints: []monitoringv1.Endpoint{
-						{
-							HonorLabels:   true,
-							Interval:      "5s",
-							Port:          "calico-typha-metrics",
-							Scheme:        "http",
-							ScrapeTimeout: "5s",
-						},
-					},
-					NamespaceSelector: monitoringv1.NamespaceSelector{
-						MatchNames: []string{common.CalicoNamespace},
-					},
-					Selector: metav1.LabelSelector{
-						MatchLabels: map[string]string{
-							render.AppLabelName: render.TyphaMetricsName,
-						},
+		for i, expectedRes := range expectedResources {
+			obj := toCreate[i]
+			rtest.ExpectResourceTypeAndObjectMetadata(obj, expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
+		}
+		Expect(toCreate).To(HaveLen(len(expectedResources)))
+		Expect(toDelete).To(HaveLen(2))
+		sm := rtest.GetResource(toCreate, "calico-typha-metrics", "tigera-prometheus", "monitoring.coreos.com", "v1", "ServiceMonitor").(*monitoringv1.ServiceMonitor)
+		Expect(sm).To(Equal(&monitoringv1.ServiceMonitor{
+			TypeMeta: metav1.TypeMeta{Kind: monitoringv1.ServiceMonitorsKind, APIVersion: "monitoring.coreos.com/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "calico-typha-metrics",
+				Namespace: "tigera-prometheus",
+				Labels:    map[string]string{"team": "network-operators"},
+			},
+			Spec: monitoringv1.ServiceMonitorSpec{
+				Endpoints: []monitoringv1.Endpoint{
+					{
+						HonorLabels:   true,
+						Interval:      "5s",
+						Port:          "calico-typha-metrics",
+						Scheme:        "http",
+						ScrapeTimeout: "5s",
 					},
 				},
-			}))
-		})
+				NamespaceSelector: monitoringv1.NamespaceSelector{
+					MatchNames: []string{common.CalicoNamespace},
+				},
+				Selector: metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						render.AppLabelName: render.TyphaMetricsName,
+					},
+				},
+			},
+		}))
 	})
 })
 

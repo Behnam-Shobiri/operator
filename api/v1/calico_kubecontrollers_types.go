@@ -1,4 +1,4 @@
-// Copyright (c) 2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2024 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@ import (
 // CalicoKubeControllersDeploymentContainer is a calico-kube-controllers Deployment container.
 type CalicoKubeControllersDeploymentContainer struct {
 	// Name is an enum which identifies the calico-kube-controllers Deployment container by name.
+	// Supported values are: calico-kube-controllers
 	// +kubebuilder:validation:Enum=calico-kube-controllers
 	Name string `json:"name"`
 
@@ -200,4 +201,8 @@ func (c *CalicoKubeControllersDeployment) GetTerminationGracePeriodSeconds() *in
 
 func (c *CalicoKubeControllersDeployment) GetDeploymentStrategy() *appsv1.DeploymentStrategy {
 	return nil
+}
+
+func (c *CalicoKubeControllersDeployment) GetPriorityClassName() string {
+	return ""
 }

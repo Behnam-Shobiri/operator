@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -148,7 +148,7 @@ var _ = Describe("CRD management tests", func() {
 
 		It("Should create CRD if it doesn't exist", func() {
 			c, shutdownContext, cancel, mgr = setupManager(ManageCRDsEnable, false)
-			operatorDone = installResourceCRD(c, mgr, shutdownContext, nil)
+			operatorDone = createInstallation(c, mgr, shutdownContext, nil)
 
 			np := npCRD.DeepCopy()
 			By("Checking that the networkpolicies CRD is created")
@@ -161,6 +161,7 @@ var _ = Describe("CRD management tests", func() {
 			}, 60*time.Second, 1*time.Second).Should(BeNil())
 		})
 	})
+
 	Describe("Updating CRD", func() {
 		BeforeEach(func() {
 			edited := npCRD.DeepCopy()
@@ -181,7 +182,7 @@ var _ = Describe("CRD management tests", func() {
 		})
 		It("Should add tier to networkpolicy CRD", func() {
 			c, shutdownContext, cancel, mgr = setupManager(ManageCRDsEnable, false)
-			operatorDone = installResourceCRD(c, mgr, shutdownContext, &operator.InstallationSpec{Variant: operator.TigeraSecureEnterprise})
+			operatorDone = createInstallation(c, mgr, shutdownContext, &operator.InstallationSpec{Variant: operator.TigeraSecureEnterprise})
 
 			By("Checking that the networkpolicies CRD is updated with tier")
 			Eventually(func() error {

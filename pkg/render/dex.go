@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,9 +30,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
+	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/common/podaffinity"
@@ -74,6 +76,8 @@ type DexComponentConfiguration struct {
 
 	// Whether the cluster supports pod security policies.
 	UsePSP bool
+
+	Authentication *operatorv1.Authentication
 }
 
 type dexComponent struct {
@@ -269,7 +273,7 @@ func (c *dexComponent) deployment() client.Object {
 							LivenessProbe:   c.probe(),
 							SecurityContext: securitycontext.NewNonRootContext(),
 
-							Command: []string{"/usr/local/bin/dex", "serve", "/etc/dex/baseCfg/config.yaml"},
+							Command: []string{"/dex", "serve", "/etc/dex/baseCfg/config.yaml"},
 
 							Ports: []corev1.ContainerPort{
 								{
@@ -288,6 +292,12 @@ func (c *dexComponent) deployment() client.Object {
 
 	if c.cfg.Installation.ControlPlaneReplicas != nil && *c.cfg.Installation.ControlPlaneReplicas > 1 {
 		d.Spec.Template.Spec.Affinity = podaffinity.NewPodAntiAffinity(DexObjectName, DexNamespace)
+	}
+
+	if c.cfg.Authentication != nil {
+		if overrides := c.cfg.Authentication.Spec.DexDeployment; overrides != nil {
+			rcomponents.ApplyDeploymentOverrides(d, overrides)
+		}
 	}
 
 	return d
@@ -348,6 +358,12 @@ func (c *dexComponent) configMap() *corev1.ConfigMap {
 			"tlsKey":                  c.cfg.TLSKeyPair.VolumeMountKeyFilePath(),
 			"allowedOrigins":          []string{"*"},
 			"discoveryAllowedOrigins": []string{"*"},
+			"headers": map[string]string{
+				"X-Content-Type-Options":    "nosniff",
+				"X-XSS-Protection":          "1; mode=block",
+				"X-Frame-Options":           "DENY",
+				"Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+			},
 		},
 		"connectors": []map[string]interface{}{c.connector},
 		"oauth2": map[string]interface{}{
@@ -362,9 +378,13 @@ func (c *dexComponent) configMap() *corev1.ConfigMap {
 				"secretEnv":    dexSecretEnv,
 			},
 		},
+		"expiry": map[string]string{
+			// Default duration is 24h. This is too high for most organizations. Setting it to 15m.
+			"idTokens": "15m",
+		},
 	})
 	if err != nil {
-		// Panic since this this would be a developer error, as the marshaled struct is one created by our code.
+		// Panic since this would be a developer error, as the marshaled struct is one created by our code.
 		panic(err)
 	}
 	return &corev1.ConfigMap{
@@ -411,6 +431,9 @@ func (c *dexComponent) allowTigeraNetworkPolicy() *v3.NetworkPolicy {
 	dexIngressPortDestination := v3.EntityRule{
 		Ports: networkpolicy.Ports(DexPort),
 	}
+
+	networkpolicyHelper := networkpolicy.DefaultHelper()
+
 	return &v3.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -438,7 +461,7 @@ func (c *dexComponent) allowTigeraNetworkPolicy() *v3.NetworkPolicy {
 				{
 					Action:      v3.Allow,
 					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      ComplianceServerSourceEntityRule,
+					Source:      networkpolicyHelper.ComplianceServerSourceEntityRule(),
 					Destination: dexIngressPortDestination,
 				},
 				{

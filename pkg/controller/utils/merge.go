@@ -1,4 +1,4 @@
-// Copyright (c) 2020, 2022-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020, 2022-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -266,6 +266,11 @@ func mergeCalicoNetwork(cfg, override *operatorv1.CalicoNetworkSpec) *operatorv1
 	switch compareFields(out.MTU, override.MTU) {
 	case BOnlySet, Different:
 		out.MTU = override.MTU
+	}
+
+	switch compareFields(out.LinuxPolicySetupTimeoutSeconds, override.LinuxPolicySetupTimeoutSeconds) {
+	case BOnlySet, Different:
+		out.LinuxPolicySetupTimeoutSeconds = override.LinuxPolicySetupTimeoutSeconds
 	}
 
 	switch compareFields(out.LinuxDataplane, override.LinuxDataplane) {

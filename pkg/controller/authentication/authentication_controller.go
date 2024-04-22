@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ import (
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
 	"github.com/tigera/operator/pkg/controller/utils/imageset"
+	"github.com/tigera/operator/pkg/ctrlruntime"
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
@@ -47,7 +48,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 var log = logf.Log.WithName("controller_authentication")
@@ -73,7 +73,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	reconciler := newReconciler(mgr, opts, tierWatchReady)
 
 	// Create a new controller
-	c, err := controller.New(controllerName, mgr, controller.Options{Reconciler: reconcile.Reconciler(reconciler)})
+	c, err := ctrlruntime.NewController(controllerName, mgr, controller.Options{Reconciler: reconcile.Reconciler(reconciler)})
 	if err != nil {
 		return fmt.Errorf("failed to create %s: %w", controllerName, err)
 	}
@@ -90,7 +90,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	})
 
 	// Watch for changes to the dex namespace.
-	if err = c.Watch(&source.Kind{Type: &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName}}}, &handler.EnqueueRequestForObject{}); err != nil {
+	if err = c.WatchObject(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName}}, &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("%s failed to watch dex namespace: %w", controllerName, err)
 	}
 
@@ -114,8 +114,8 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions, tierWatchReady 
 }
 
 // add adds watches for resources that are available at startup
-func add(mgr manager.Manager, c controller.Controller) error {
-	err := c.Watch(&source.Kind{Type: &oprv1.Authentication{}}, &handler.EnqueueRequestForObject{})
+func add(mgr manager.Manager, c ctrlruntime.Controller) error {
+	err := c.WatchObject(&oprv1.Authentication{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return fmt.Errorf("%s failed to watch resource: %w", controllerName, err)
 	}
@@ -124,7 +124,7 @@ func add(mgr manager.Manager, c controller.Controller) error {
 		return fmt.Errorf("%s failed to watch installation resource: %w", controllerName, err)
 	}
 
-	err = c.Watch(&source.Kind{Type: &oprv1.ManagementClusterConnection{}}, &handler.EnqueueRequestForObject{})
+	err = c.WatchObject(&oprv1.ManagementClusterConnection{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return fmt.Errorf("%s failed to watch resource: %w", controllerName, err)
 	}
@@ -256,7 +256,7 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 	// Ensure the allow-tigera tier exists, before rendering any network policies within it.
 	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.TigeraComponentTierName}, &v3.Tier{}); err != nil {
 		if errors.IsNotFound(err) {
-			r.status.SetDegraded(oprv1.ResourceNotReady, "Waiting for allow-tigera tier to be created", err, reqLogger)
+			r.status.SetDegraded(oprv1.ResourceNotReady, "Waiting for allow-tigera tier to be created, see the 'tiers' TigeraStatus for more information", err, reqLogger)
 			return reconcile.Result{}, nil
 		} else {
 			r.status.SetDegraded(oprv1.ResourceReadError, "Error querying allow-tigera tier", err, reqLogger)
@@ -328,15 +328,16 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 	hlr := utils.NewComponentHandler(log, r.client, r.scheme, authentication)
 
 	dexComponentCfg := &render.DexComponentConfiguration{
-		PullSecrets:   pullSecrets,
-		Openshift:     r.provider == oprv1.ProviderOpenShift,
-		Installation:  install,
-		DexConfig:     dexCfg,
-		ClusterDomain: r.clusterDomain,
-		DeleteDex:     disableDex,
-		TLSKeyPair:    tlsKeyPair,
-		TrustedBundle: trustedBundle,
-		UsePSP:        r.usePSP,
+		PullSecrets:    pullSecrets,
+		Openshift:      r.provider == oprv1.ProviderOpenShift,
+		Installation:   install,
+		DexConfig:      dexCfg,
+		ClusterDomain:  r.clusterDomain,
+		DeleteDex:      disableDex,
+		TLSKeyPair:     tlsKeyPair,
+		TrustedBundle:  trustedBundle,
+		UsePSP:         r.usePSP,
+		Authentication: authentication,
 	}
 
 	// Render the desired objects from the CRD and create or update them.

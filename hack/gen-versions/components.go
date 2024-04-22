@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ var defaultImages = map[string]string{
 	"calico/csi":                 "calico/csi",
 	"csi-node-driver-registrar":  "calico/node-driver-registrar",
 	"typha":                      "calico/typha",
+	"key-cert-provisioner":       "calico/key-cert-provisioner",
 	"eck-elasticsearch":          "unused/image",
 	"eck-elasticsearch-operator": "unused/image",
 	"eck-kibana":                 "unused/image",
@@ -45,7 +46,6 @@ var defaultImages = map[string]string{
 	"cnx-node-windows":           "tigera/cnx-node-windows",
 	"tigera-cni":                 "tigera/cni",
 	"tigera-cni-windows":         "tigera/cni-windows",
-	"key-cert-provisioner":       "tigera/key-cert-provisioner",
 	"calico/apiserver":           "calico/apiserver",
 	"tigera/linseed":             "tigera/linseed",
 }

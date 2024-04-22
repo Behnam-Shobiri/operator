@@ -1,4 +1,4 @@
-# Copyright (c) 2019 Tigera, Inc. All rights reserved.
+# Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 # This Makefile requires the following dependencies on the host system:
 # - go
@@ -91,7 +91,7 @@ endif
 
 PACKAGE_NAME?=github.com/tigera/operator
 LOCAL_USER_ID?=$(shell id -u $$USER)
-GO_BUILD_VER?=v0.90
+GO_BUILD_VER?=v0.91
 CALICO_BUILD?=calico/go-build:$(GO_BUILD_VER)-$(BUILDARCH)
 SRC_FILES=$(shell find ./pkg -name '*.go')
 SRC_FILES+=$(shell find ./api -name '*.go')
@@ -410,7 +410,7 @@ cluster-destroy: $(BINDIR)/kubectl $(BINDIR)/kind
 .PHONY: static-checks
 ## Perform static checks on the code.
 static-checks:
-	$(CONTAINERIZED) $(CALICO_BUILD) golangci-lint run --deadline 5m
+	$(CONTAINERIZED) $(CALICO_BUILD) golangci-lint run --timeout 5m
 
 .PHONY: fix
 ## Fix static checks
@@ -547,7 +547,6 @@ endif
 release-prep: var-require-all-GIT_PR_BRANCH_BASE-GIT_REPO_SLUG-VERSION-CALICO_VERSION-COMMON_VERSION-CALICO_ENTERPRISE_VERSION
 	$(YQ_V4) ".title = \"$(CALICO_ENTERPRISE_VERSION)\" | .components |= with_entries(select(.key | test(\"^(eck-|coreos-).*\") | not)) |= with(.[]; .version = \"$(CALICO_ENTERPRISE_VERSION)\")" -i config/enterprise_versions.yml
 	$(YQ_V4) ".title = \"$(CALICO_VERSION)\" | .components.[].version = \"$(CALICO_VERSION)\"" -i config/calico_versions.yml
-	$(YQ_V4) ".title = \"$(COMMON_VERSION)\" | .components.key-cert-provisioner.version = \"$(COMMON_VERSION)\"" -i config/common_versions.yml
 	sed -i "s/\"gcr.io.*\"/\"quay.io\/\"/g" pkg/components/images.go
 	sed -i "s/\"gcr.io.*\"/\"quay.io\"/g" hack/gen-versions/main.go
 	$(MAKE) gen-versions release-prep/create-and-push-branch release-prep/create-pr release-prep/set-pr-labels
@@ -600,20 +599,16 @@ gen-files: manifests generate
 
 OS_VERSIONS?=config/calico_versions.yml
 EE_VERSIONS?=config/enterprise_versions.yml
-COMMON_VERSIONS?=config/common_versions.yml
 
-.PHONY: gen-versions gen-versions-calico gen-versions-enterprise gen-versions-common
+.PHONY: gen-versions gen-versions-calico gen-versions-enterprise
 
-gen-versions: gen-versions-calico gen-versions-enterprise gen-versions-common
+gen-versions: gen-versions-calico gen-versions-enterprise
 
 gen-versions-calico: $(BINDIR)/gen-versions update-calico-crds
 	$(BINDIR)/gen-versions -os-versions=$(OS_VERSIONS) > pkg/components/calico.go
 
 gen-versions-enterprise: $(BINDIR)/gen-versions update-enterprise-crds
 	$(BINDIR)/gen-versions -ee-versions=$(EE_VERSIONS) > pkg/components/enterprise.go
-
-gen-versions-common: $(BINDIR)/gen-versions
-	$(BINDIR)/gen-versions -common-versions=$(COMMON_VERSIONS) > pkg/components/common.go
 
 $(BINDIR)/gen-versions: $(shell find ./hack/gen-versions -type f)
 	mkdir -p $(BINDIR)
@@ -727,7 +722,7 @@ help: # Some kind of magic from https://gist.github.com/rcmachado/af3db315e31383
 #####################################
 # Image URL to use all building/pushing image targets
 IMG ?= controller:latest
-CONTROLLER_GEN_VERSION ?= v0.11.3
+CONTROLLER_GEN_VERSION ?= v0.14.0
 
 # Run against the configured Kubernetes cluster in ~/.kube/config
 run: generate fmt vet manifests
@@ -886,7 +881,7 @@ install-git-hooks:
 
 .PHONY: pre-commit
 pre-commit:
-	$(CONTAINERIZED) $(CALICO_BUILD) git-hooks/pre-commit-in-container
+	$(CONTAINERIZED) $(foreach ALTERNATE,$(shell cat $(shell git rev-parse --git-dir)/objects/info/alternates 2>/dev/null),-v $(ALTERNATE):$(ALTERNATE):ro) $(CALICO_BUILD) git-hooks/pre-commit-in-container
 
 # var-set-% checks if there is a non empty variable for the value describe by %. If FAIL_NOT_SET is set, then var-set-%
 # fails with an error message. If FAIL_NOT_SET is not set, then var-set-% appends a 1 to VARSET if the variable isn't

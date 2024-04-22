@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -459,7 +459,7 @@ func (m *CoreNamespaceMigration) deleteKubeSystemCalicoNode(ctx context.Context)
 // the calico-system namespace is ready before continuing, it will wait up to
 // 10 minutes before returning with an error.
 func (m *CoreNamespaceMigration) waitForOperatorTyphaDeploymentReady(ctx context.Context, log logr.Logger) error {
-	return wait.PollImmediate(5*time.Second, 10*time.Minute, func() (bool, error) {
+	return wait.PollUntilContextTimeout(ctx, 5*time.Second, 10*time.Minute, true, func(ctx context.Context) (bool, error) {
 		d, err := m.client.AppsV1().Deployments(common.CalicoNamespace).Get(ctx, common.TyphaDeploymentName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
@@ -512,7 +512,7 @@ func (m *CoreNamespaceMigration) removeNodeMigrationLabelFromNodes(ctx context.C
 // kube-system namespace with a node selector that will prevent it from being
 // deployed to nodes that have been migrated and waits for the daemonset to update.
 func (m *CoreNamespaceMigration) ensureKubeSysNodeDaemonSetHasNodeSelectorAndIsReady(ctx context.Context, log logr.Logger) error {
-	return wait.PollImmediate(5*time.Second, 10*time.Minute, func() (bool, error) {
+	return wait.PollUntilContextTimeout(ctx, 5*time.Second, 10*time.Minute, true, func(ctx context.Context) (bool, error) {
 		ds, err := m.client.AppsV1().DaemonSets(kubeSystem).Get(ctx, nodeDaemonSetName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
@@ -642,7 +642,7 @@ func (m *CoreNamespaceMigration) getNodesToMigrate() []*v1.Node {
 // waitUntilNodeCanBeMigrated checks the number of desired and ready pods in the kube-system and calico-system
 // daemonsets to make sure we don't simultaneously migrate more pods than allowed.
 func (m *CoreNamespaceMigration) waitUntilNodeCanBeMigrated(ctx context.Context, log logr.Logger) error {
-	return wait.PollImmediate(1*time.Second, 1*time.Minute, func() (bool, error) {
+	return wait.PollUntilContextTimeout(ctx, 1*time.Second, 1*time.Minute, true, func(ctx context.Context) (bool, error) {
 		// num node desired schedule, num node ready, node max unavailable in kube-system
 		ksD, ksR, _, err := m.getNumPodsDesiredAndReady(ctx, kubeSystem, nodeDaemonSetName)
 		if err != nil {
@@ -672,6 +672,15 @@ func (m *CoreNamespaceMigration) waitUntilNodeCanBeMigrated(ctx context.Context,
 			}
 		}
 
+		// In case of a single node cluster, the ensureTyphaRoom() function scales down the kube-system/calico-typha pod to zero,
+		// and it can cause that kube-system/calico-node goes down to CrashLoopBackOff. It can block namespace migration and the below
+		// calculation fails as there will be no ready calico-node pods. Handle this special case.
+		// Assumptions:
+		// - all the nodes are labeled with projectcalico.org/operator-node-migration (pre-operator value)
+		// - kube-system/calico-node and calico-system/calico-node daemonsets are using the above nodeSelector
+		if ksD == 1 && csD == 0 {
+			return true, nil
+		}
 		// Check that ready pods plus maxUnavailable is MORE than the desired pods so when we migrate
 		// one more node we won't go over the maxUnavailable with unready pods.
 		if (ksR + csR + maxUnavailable) > (ksD + csD) {
@@ -700,7 +709,7 @@ func (m *CoreNamespaceMigration) getNumPodsDesiredAndReady(ctx context.Context, 
 // Get/Check/Update so that it always working on latest version.
 // If node labels has been set already, do nothing.
 func (m *CoreNamespaceMigration) addNodeLabel(ctx context.Context, nodeName, key, value string) error {
-	return wait.PollImmediate(1*time.Second, 1*time.Minute, func() (bool, error) {
+	return wait.PollUntilContextTimeout(ctx, 1*time.Second, 1*time.Minute, true, func(ctx context.Context) (bool, error) {
 		node, err := m.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
 			return false, err
@@ -752,7 +761,7 @@ type StringPatch struct {
 // most recent version of the resource.
 // If node labels do not exist, do nothing.
 func (m *CoreNamespaceMigration) removeNodeLabel(ctx context.Context, nodeName, key string) error {
-	return wait.PollImmediate(1*time.Second, 1*time.Minute, func() (bool, error) {
+	return wait.PollUntilContextTimeout(ctx, 1*time.Second, 1*time.Minute, true, func(ctx context.Context) (bool, error) {
 		node, err := m.client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 		if err != nil {
 			return false, err

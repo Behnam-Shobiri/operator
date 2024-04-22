@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,13 +29,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	"github.com/tigera/operator/pkg/controller/k8sapi"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
@@ -64,7 +64,7 @@ var _ = Describe("Typha rendering tests", func() {
 		}
 		scheme := runtime.NewScheme()
 		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
-		cli = fake.NewClientBuilder().WithScheme(scheme).Build()
+		cli = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 		certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
 		typhaNodeTLS = getTyphaNodeTLS(cli, certificateManager)
@@ -225,49 +225,6 @@ var _ = Describe("Typha rendering tests", func() {
 				MaxUnavailable: ptr.IntOrStrPtr("1"),
 			},
 		}))
-	})
-	It("should set TIGERA_*_SECURITY_GROUP variables when AmazonCloudIntegration is defined", func() {
-		expectedResources := []struct {
-			name    string
-			ns      string
-			group   string
-			version string
-			kind    string
-		}{
-			// Typha resources
-			{name: "calico-typha", ns: "calico-system", group: "", version: "v1", kind: "ServiceAccount"},
-			{name: "calico-typha", ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole"},
-			{name: "calico-typha", ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
-			{name: "calico-typha", ns: "calico-system", group: "", version: "v1", kind: "Service"},
-			{name: "calico-typha", ns: "calico-system", group: "policy", version: "v1", kind: "PodDisruptionBudget"},
-			{name: "calico-typha", ns: "", group: "policy", version: "v1beta1", kind: "PodSecurityPolicy"},
-			{name: "calico-typha", ns: "calico-system", group: "apps", version: "v1", kind: "Deployment"},
-		}
-
-		cfg.AmazonCloudIntegration = &operatorv1.AmazonCloudIntegration{
-			Spec: operatorv1.AmazonCloudIntegrationSpec{
-				NodeSecurityGroupIDs: []string{"sg-nodeid", "sg-masterid"},
-				PodSecurityGroupID:   "sg-podsgid",
-			},
-		}
-		component := render.Typha(&cfg)
-		resources, _ := component.Objects()
-		Expect(len(resources)).To(Equal(len(expectedResources)))
-
-		deploymentResource := rtest.GetResource(resources, "calico-typha", "calico-system", "apps", "v1", "Deployment")
-		Expect(deploymentResource).ToNot(BeNil())
-		d := deploymentResource.(*appsv1.Deployment)
-		tc := d.Spec.Template.Spec.Containers[0]
-		Expect(tc.Name).To(Equal("calico-typha"))
-
-		// Assert on expected env vars.
-		expectedEnvVars := []corev1.EnvVar{
-			{Name: "TIGERA_DEFAULT_SECURITY_GROUPS", Value: "sg-nodeid,sg-masterid"},
-			{Name: "TIGERA_POD_SECURITY_GROUP", Value: "sg-podsgid"},
-		}
-		for _, v := range expectedEnvVars {
-			Expect(tc.Env).To(ContainElement(v))
-		}
 	})
 
 	It("should properly configure a non-default typha health port", func() {

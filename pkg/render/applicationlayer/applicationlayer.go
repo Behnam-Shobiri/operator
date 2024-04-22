@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,6 +38,7 @@ import (
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
+	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
@@ -109,6 +110,8 @@ type Config struct {
 
 	// Whether the cluster supports pod security policies.
 	UsePSP bool
+
+	ApplicationLayer *operatorv1.ApplicationLayer
 }
 
 func (c *component) ResolveImages(is *operatorv1.ImageSet) error {
@@ -227,7 +230,7 @@ func (c *component) daemonset() *appsv1.DaemonSet {
 		},
 	}
 
-	return &appsv1.DaemonSet{
+	ds := &appsv1.DaemonSet{
 		TypeMeta: metav1.TypeMeta{Kind: "DaemonSet", APIVersion: "apps/v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ApplicationLayerDaemonsetName,
@@ -242,6 +245,13 @@ func (c *component) daemonset() *appsv1.DaemonSet {
 			},
 		},
 	}
+
+	if c.config.ApplicationLayer != nil {
+		if overrides := c.config.ApplicationLayer.Spec.L7LogCollectorDaemonSet; overrides != nil {
+			rcomponents.ApplyDaemonSetOverrides(ds, overrides)
+		}
+	}
+	return ds
 }
 
 func (c *component) containers() []corev1.Container {
@@ -300,11 +310,7 @@ func (c *component) containers() []corev1.Container {
 				commandArgs,
 				"--waf-enabled",
 				"--waf-log-file", filepath.Join(CalicologsVolumePath, "waf", "waf.log"),
-				"--waf-ruleset-base-dir", ModSecurityRulesetVolumePath,
-				"--waf-directive", "Include modsecdefault.conf",
-				"--waf-directive", "Include crs-setup.conf",
-				"--waf-directive", "Include tigera.conf",
-				"--waf-directive", "Include rules/*.conf",
+				"--waf-ruleset-file", filepath.Join(ModSecurityRulesetVolumePath, "tigera.conf"),
 			)
 			volMounts = append(
 				volMounts,

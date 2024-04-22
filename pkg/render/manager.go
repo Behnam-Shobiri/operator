@@ -20,8 +20,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/tigera/operator/pkg/url"
-
 	ocsv1 "github.com/openshift/api/security/v1"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -33,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
@@ -48,8 +47,10 @@ import (
 	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/manager"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 	"github.com/tigera/operator/pkg/tls/certkeyusage"
+	"github.com/tigera/operator/pkg/url"
 )
 
 const (
@@ -126,6 +127,8 @@ func Manager(cfg *ManagerConfiguration) (Component, error) {
 
 // ManagerConfiguration contains all the config information needed to render the component.
 type ManagerConfiguration struct {
+	VoltronRouteConfig *manager.VoltronRouteConfig
+
 	KeyValidatorConfig authentication.KeyValidatorConfig
 	ESSecrets          []*corev1.Secret
 	ClusterConfig      *relasticsearch.ClusterConfig
@@ -158,6 +161,7 @@ type ManagerConfiguration struct {
 	Replicas                *int32
 	Compliance              *operatorv1.Compliance
 	ComplianceLicenseActive bool
+	ComplianceNamespace     string
 
 	// Whether the cluster supports pod security policies.
 	UsePSP            bool
@@ -165,8 +169,9 @@ type ManagerConfiguration struct {
 	TruthNamespace    string
 	BindingNamespaces []string
 
-	// Whether or not to run the rendered components in multi-tenant mode.
-	Tenant *operatorv1.Tenant
+	// Whether to run the rendered components in multi-tenant, single-tenant, or zero-tenant mode
+	Tenant          *operatorv1.Tenant
+	ExternalElastic bool
 
 	Manager *operatorv1.Manager
 }
@@ -246,6 +251,10 @@ func (c *managerComponent) Objects() ([]client.Object, []client.Object) {
 	objs = append(objs, c.getTLSObjects()...)
 	objs = append(objs, c.managerService())
 
+	if c.cfg.VoltronRouteConfig != nil {
+		objs = append(objs, c.cfg.VoltronRouteConfig.RoutesConfigMap(c.cfg.Namespace))
+	}
+
 	// If we're running on openshift, we need to add in an SCC.
 	if c.cfg.Openshift {
 		objs = append(objs, c.securityContextConstraints())
@@ -289,11 +298,22 @@ func (c *managerComponent) managerDeployment() *appsv1.Deployment {
 		initContainers = append(initContainers, c.cfg.VoltronLinseedKeyPair.InitContainer(ManagerNamespace))
 	}
 
+	managerPodContainers := []corev1.Container{c.managerEsProxyContainer(), c.voltronContainer()}
+	if c.cfg.Tenant == nil {
+		managerPodContainers = append(managerPodContainers, c.managerContainer())
+	}
+	annotations := c.tlsAnnotations
+	if c.cfg.VoltronRouteConfig != nil {
+		for key, value := range c.cfg.VoltronRouteConfig.Annotations() {
+			annotations[key] = value
+		}
+	}
+
 	podTemplate := relasticsearch.DecorateAnnotations(&corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        ManagerDeploymentName,
 			Namespace:   c.cfg.Namespace,
-			Annotations: c.tlsAnnotations,
+			Annotations: annotations,
 		},
 		Spec: corev1.PodSpec{
 			NodeSelector:       c.cfg.Installation.ControlPlaneNodeSelector,
@@ -301,7 +321,7 @@ func (c *managerComponent) managerDeployment() *appsv1.Deployment {
 			Tolerations:        c.managerTolerations(),
 			ImagePullSecrets:   secret.GetReferenceList(c.cfg.PullSecrets),
 			InitContainers:     initContainers,
-			Containers:         []corev1.Container{c.managerContainer(), c.managerEsProxyContainer(), c.voltronContainer()},
+			Containers:         managerPodContainers,
 			Volumes:            c.managerVolumes(),
 		},
 	}, c.cfg.ESSecrets).(*corev1.PodTemplateSpec)
@@ -356,6 +376,10 @@ func (c *managerComponent) managerVolumes() []corev1.Volume {
 	}
 	if c.cfg.KeyValidatorConfig != nil {
 		v = append(v, c.cfg.KeyValidatorConfig.RequiredVolumes()...)
+	}
+
+	if c.cfg.VoltronRouteConfig != nil {
+		v = append(v, c.cfg.VoltronRouteConfig.Volumes()...)
 	}
 
 	return v
@@ -496,7 +520,7 @@ func (c *managerComponent) voltronContainer() corev1.Container {
 
 	env := []corev1.EnvVar{
 		{Name: "VOLTRON_PORT", Value: defaultVoltronPort},
-		{Name: "VOLTRON_COMPLIANCE_ENDPOINT", Value: fmt.Sprintf("https://compliance.%s.svc.%s", ComplianceNamespace, c.cfg.ClusterDomain)},
+		{Name: "VOLTRON_COMPLIANCE_ENDPOINT", Value: fmt.Sprintf("https://compliance.%s.svc.%s", c.cfg.ComplianceNamespace, c.cfg.ClusterDomain)},
 		{Name: "VOLTRON_LOGLEVEL", Value: "Info"},
 		{Name: "VOLTRON_KIBANA_ENDPOINT", Value: rkibana.HTTPSEndpoint(c.SupportedOSType(), c.cfg.ClusterDomain)},
 		{Name: "VOLTRON_KIBANA_BASE_PATH", Value: fmt.Sprintf("/%s/", KibanaBasePath)},
@@ -521,6 +545,10 @@ func (c *managerComponent) voltronContainer() corev1.Container {
 		{Name: "VOLTRON_FIPS_MODE_ENABLED", Value: operatorv1.IsFIPSModeEnabledString(c.cfg.Installation.FIPSMode)},
 	}
 
+	if c.cfg.VoltronRouteConfig != nil {
+		env = append(env, c.cfg.VoltronRouteConfig.EnvVars()...)
+	}
+
 	if c.cfg.ManagementCluster != nil {
 		env = append(env, corev1.EnvVar{Name: "VOLTRON_USE_HTTPS_CERT_ON_TUNNEL", Value: strconv.FormatBool(c.cfg.ManagementCluster.Spec.TLS != nil && c.cfg.ManagementCluster.Spec.TLS.SecretName == ManagerTLSSecretName)})
 		env = append(env, corev1.EnvVar{Name: "VOLTRON_LINSEED_SERVER_KEY", Value: linseedKeyPath})
@@ -540,16 +568,29 @@ func (c *managerComponent) voltronContainer() corev1.Container {
 		mounts = append(mounts, c.cfg.VoltronLinseedKeyPair.VolumeMount(c.SupportedOSType()))
 	}
 
+	linseedEndpointEnv := corev1.EnvVar{Name: "VOLTRON_LINSEED_ENDPOINT", Value: fmt.Sprintf("https://tigera-linseed.%s.svc.%s", ElasticsearchNamespace, c.cfg.ClusterDomain)}
 	if c.cfg.Tenant != nil {
-		env = append(env, corev1.EnvVar{Name: "VOLTRON_TENANT_ID", Value: c.cfg.Tenant.Spec.ID})
+		// Configure the tenant id in order to read /write linseed data using the correct tenant ID
+		// Multi-tenant and single tenant with external elastic needs this variable set
+		if c.cfg.ExternalElastic {
+			env = append(env, corev1.EnvVar{Name: "VOLTRON_TENANT_ID", Value: c.cfg.Tenant.Spec.ID})
+		}
+
 		// Always configure the Tenant Claim for all multi-tenancy setups (single tenant and multi tenant)
 		// This will check the tenant claim when a Bearer token is presented to Voltron
+		// The actual value of the token is extracted from the tenant claim
 		env = append(env, corev1.EnvVar{Name: "VOLTRON_REQUIRE_TENANT_CLAIM", Value: "true"})
+		env = append(env, corev1.EnvVar{Name: "VOLTRON_TENANT_CLAIM", Value: c.cfg.Tenant.Spec.ID})
 
 		if c.cfg.Tenant.MultiTenant() {
 			env = append(env, corev1.EnvVar{Name: "VOLTRON_TENANT_NAMESPACE", Value: c.cfg.Tenant.Namespace})
-			env = append(env, corev1.EnvVar{Name: "VOLTRON_LINSEED_ENDPOINT", Value: fmt.Sprintf("https://tigera-linseed.%s.svc", c.cfg.Tenant.Namespace)})
+			linseedEndpointEnv = corev1.EnvVar{Name: "VOLTRON_LINSEED_ENDPOINT", Value: fmt.Sprintf("https://tigera-linseed.%s.svc", c.cfg.Tenant.Namespace)}
 		}
+	}
+	env = append(env, linseedEndpointEnv)
+
+	if c.cfg.VoltronRouteConfig != nil {
+		mounts = append(mounts, c.cfg.VoltronRouteConfig.VolumeMounts()...)
 	}
 
 	return corev1.Container{
@@ -596,8 +637,11 @@ func (c *managerComponent) managerEsProxyContainer() corev1.Container {
 	// Determine the Linseed location. Use code default unless in multi-tenant mode,
 	// in which case use the Linseed in the current namespace.
 	if c.cfg.Tenant != nil {
-		// A tenant was specified, ensur we set the tenant ID.
-		env = append(env, corev1.EnvVar{Name: "TENANT_ID", Value: c.cfg.Tenant.Spec.ID})
+
+		if c.cfg.ExternalElastic {
+			// A tenant was specified, ensure we set the tenant ID.
+			env = append(env, corev1.EnvVar{Name: "TENANT_ID", Value: c.cfg.Tenant.Spec.ID})
+		}
 
 		if c.cfg.Tenant.MultiTenant() {
 			// This cluster supports multiple tenants. Point the manager at the correct Linseed instance for this tenant.
@@ -877,11 +921,12 @@ func (c *managerComponent) getTLSObjects() []client.Object {
 
 // Allow users to access Calico Enterprise Manager.
 func (c *managerComponent) managerAllowTigeraNetworkPolicy() *v3.NetworkPolicy {
+	networkpolicyHelper := networkpolicy.Helper(c.cfg.Tenant.MultiTenant(), c.cfg.Namespace)
 	egressRules := []v3.Rule{
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.Helper(c.cfg.Tenant.MultiTenant(), c.cfg.Namespace).ManagerEntityRule(),
+			Destination: networkpolicyHelper.ManagerEntityRule(),
 		},
 		{
 			Action:      v3.Allow,
@@ -892,18 +937,18 @@ func (c *managerComponent) managerAllowTigeraNetworkPolicy() *v3.NetworkPolicy {
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
 			Source:      v3.EntityRule{},
-			Destination: networkpolicy.Helper(c.cfg.Tenant.MultiTenant(), c.cfg.Namespace).ESGatewayEntityRule(),
+			Destination: networkpolicyHelper.ESGatewayEntityRule(),
 		},
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
 			Source:      v3.EntityRule{},
-			Destination: networkpolicy.Helper(c.cfg.Tenant.MultiTenant(), c.cfg.Namespace).LinseedEntityRule(),
+			Destination: networkpolicyHelper.LinseedEntityRule(),
 		},
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: ComplianceServerEntityRule,
+			Destination: networkpolicyHelper.ComplianceServerEntityRule(),
 		},
 		{
 			Action:      v3.Allow,
@@ -1038,7 +1083,6 @@ func managerClusterWideTigeraLayer() *v3.UISettings {
 		"tigera-prometheus",
 		"tigera-system",
 		"calico-system",
-		"tigera-amazon-cloud-integration",
 		"tigera-firewall-controller",
 		"calico-cloud",
 		"tigera-image-assurance",

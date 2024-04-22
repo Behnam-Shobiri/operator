@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,7 +33,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
@@ -43,6 +42,7 @@ import (
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
 	"github.com/tigera/operator/pkg/controller/utils/imageset"
+	"github.com/tigera/operator/pkg/ctrlruntime"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/monitor"
@@ -70,7 +70,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	reconciler := newReconciler(mgr.GetClient(), mgr.GetScheme(), statusManager, opts.DetectedProvider, tierWatchReady, opts)
 
 	// Create a new controller
-	controller, err := controller.New(controllerName, mgr, controller.Options{Reconciler: reconciler})
+	c, err := ctrlruntime.NewController(controllerName, mgr, controller.Options{Reconciler: reconciler})
 	if err != nil {
 		return fmt.Errorf("failed to create %s: %w", controllerName, err)
 	}
@@ -82,10 +82,10 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	}
 
 	// Watch for changes to License and Tier, as their status is used as input to determine whether network policy should be reconciled by this controller.
-	go utils.WaitToAddLicenseKeyWatch(controller, k8sClient, log, nil)
-	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, controller, k8sClient, log, tierWatchReady)
+	go utils.WaitToAddLicenseKeyWatch(c, k8sClient, log, nil)
+	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, k8sClient, log, tierWatchReady)
 
-	go utils.WaitToAddNetworkPolicyWatches(controller, k8sClient, log, []types.NamespacedName{
+	go utils.WaitToAddNetworkPolicyWatches(c, k8sClient, log, []types.NamespacedName{
 		{Name: render.GuardianPolicyName, Namespace: render.GuardianNamespace},
 		{Name: networkpolicy.TigeraComponentDefaultDenyPolicyName, Namespace: render.GuardianNamespace},
 	})
@@ -96,12 +96,12 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		render.ProjectCalicoAPIServerTLSSecretName(operatorv1.TigeraSecureEnterprise),
 		render.ProjectCalicoAPIServerTLSSecretName(operatorv1.Calico),
 	} {
-		if err = utils.AddSecretsWatch(controller, secretName, common.OperatorNamespace()); err != nil {
+		if err = utils.AddSecretsWatch(c, secretName, common.OperatorNamespace()); err != nil {
 			return fmt.Errorf("failed to add watch for secret %s/%s: %w", common.OperatorNamespace(), secretName, err)
 		}
 	}
 
-	return add(mgr, controller)
+	return add(mgr, c)
 }
 
 // newReconciler returns a new reconcile.Reconciler
@@ -127,15 +127,15 @@ func newReconciler(
 }
 
 // add adds a new controller to mgr with r as the reconcile.Reconciler
-func add(mgr manager.Manager, c controller.Controller) error {
+func add(mgr manager.Manager, c ctrlruntime.Controller) error {
 	// Watch for changes to primary resource ManagementCluster
-	err := c.Watch(&source.Kind{Type: &operatorv1.ManagementCluster{}}, &handler.EnqueueRequestForObject{})
+	err := c.WatchObject(&operatorv1.ManagementCluster{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return fmt.Errorf("%s failed to watch primary resource: %w", controllerName, err)
 	}
 
 	// Watch for changes to primary resource ManagementClusterConnection
-	err = c.Watch(&source.Kind{Type: &operatorv1.ManagementClusterConnection{}}, &handler.EnqueueRequestForObject{})
+	err = c.WatchObject(&operatorv1.ManagementClusterConnection{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return fmt.Errorf("%s failed to watch primary resource: %w", controllerName, err)
 	}
@@ -355,14 +355,15 @@ func (r *ReconcileConnection) Reconcile(ctx context.Context, request reconcile.R
 
 	ch := utils.NewComponentHandler(log, r.Client, r.Scheme, managementClusterConnection)
 	guardianCfg := &render.GuardianConfiguration{
-		URL:               managementClusterConnection.Spec.ManagementClusterAddr,
-		TunnelCAType:      managementClusterConnection.Spec.TLS.CA,
-		PullSecrets:       pullSecrets,
-		Openshift:         r.Provider == operatorv1.ProviderOpenShift,
-		Installation:      instl,
-		TunnelSecret:      tunnelSecret,
-		TrustedCertBundle: trustedCertBundle,
-		UsePSP:            r.usePSP,
+		URL:                         managementClusterConnection.Spec.ManagementClusterAddr,
+		TunnelCAType:                managementClusterConnection.Spec.TLS.CA,
+		PullSecrets:                 pullSecrets,
+		Openshift:                   r.Provider == operatorv1.ProviderOpenShift,
+		Installation:                instl,
+		TunnelSecret:                tunnelSecret,
+		TrustedCertBundle:           trustedCertBundle,
+		UsePSP:                      r.usePSP,
+		ManagementClusterConnection: managementClusterConnection,
 	}
 
 	components := []render.Component{render.Guardian(guardianCfg)}

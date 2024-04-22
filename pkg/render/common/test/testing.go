@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"regexp"
 	"strings"
 
 	. "github.com/onsi/gomega"
@@ -32,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -119,8 +121,18 @@ func ExpectResource(expected client.Object, resources []client.Object) error {
 			}
 		}
 	}
+	return notFoundError(name, ns, resources)
+}
 
-	// Build a list of items so we can print a nice error message.
+func notFoundError(name, ns string, resources []client.Object) error {
+	if ns == "" {
+		return fmt.Errorf("resource %s not found in:\n\n%s", name, itemList(resources))
+	}
+	return fmt.Errorf("resource %s/%s not found in:\n\n%s", ns, name, itemList(resources))
+}
+
+// itemList is a helper for printing out a nice error message when a resource is not found.
+func itemList(resources []client.Object) string {
 	items := []string{}
 	for i, r := range resources {
 		items = append(items,
@@ -131,10 +143,7 @@ func ExpectResource(expected client.Object, resources []client.Object) error {
 				r.(metav1.ObjectMetaAccessor).GetObjectMeta().GetName(),
 			))
 	}
-	if ns == "" {
-		return fmt.Errorf("%T %s not found in:\n\n%s", expected, name, strings.Join(items, "\n"))
-	}
-	return fmt.Errorf("%T %s/%s not found in:\n\n%s", expected, ns, name, strings.Join(items, "\n"))
+	return strings.Join(items, "\n")
 }
 
 // ExpectResourceTypeAndObjectMetadata checks that the given resource matches the expected name, namespace, group, version, and kind.
@@ -162,6 +171,26 @@ func GetResource(resources []client.Object, name, ns, group, version, kind strin
 		}
 	}
 	return nil
+}
+
+func GetResourceOfType[T client.Object](resources []client.Object, name, ns string) (T, error) {
+	for _, r := range resources {
+		if reflect.TypeOf(r) != reflect.TypeOf(*new(T)) {
+			continue
+		}
+		if r.(metav1.ObjectMetaAccessor).GetObjectMeta().GetName() != name {
+			continue
+		}
+		if r.(metav1.ObjectMetaAccessor).GetObjectMeta().GetNamespace() != ns {
+			continue
+		}
+		// Type, name, and namespace match.
+		return r.(T), nil
+	}
+
+	// Return a nil instance of T and an error.
+	var n T
+	return n, notFoundError(name, ns, resources)
 }
 
 func GetGlobalResource(resources []client.Object, name, group, version, kind string) client.Object {
@@ -251,5 +280,55 @@ func CreateCertSecret(name, namespace string, dnsNames ...string) *corev1.Secret
 			corev1.TLSPrivateKeyKey: keyContent.Bytes(),
 			corev1.TLSCertKey:       crtContent.Bytes(),
 		},
+	}
+}
+
+func ExpectBundleContents(bundle *corev1.ConfigMap, secrets ...types.NamespacedName) {
+	ExpectWithOffset(1, bundle.Data).To(HaveKey("tigera-ca-bundle.crt"), fmt.Sprintf("Bundle: %+v", bundle))
+
+	// Go through and build up all of the secret names from within the bundle.
+	// Keep a list of all the certificates in the bundle in case we need to error it out.
+	certsInBundle := map[types.NamespacedName]bool{}
+
+	// Use a regex to extract secret namespaces and names from the bundle by matching
+	// the following pattern:
+	// # certificate name: <namespace>/<name>
+	re := regexp.MustCompile(`# certificate name: ([^\s]*)\/([^\s\n]*)`)
+	matches := re.FindAllStringSubmatch(bundle.Data["tigera-ca-bundle.crt"], -1)
+
+	// Go through each match and add it to the list of certs in the bundle.
+	for _, match := range matches {
+		key := types.NamespacedName{Name: match[2], Namespace: match[1]}
+		ExpectWithOffset(1, certsInBundle).ToNot(HaveKey(key), "Duplicate certificate found in bundle")
+		certsInBundle[key] = true
+	}
+
+	// Local helper for erroring if a secret is not found in the bundle.
+	errNotInBundle := func(s types.NamespacedName) string {
+		errStr := fmt.Sprintf("Certificate %s/%s not found among those in bundle:\n\n", s.Namespace, s.Name)
+		for cert := range certsInBundle {
+			errStr += fmt.Sprintf("%s/%s\n", cert.Namespace, cert.Name)
+		}
+		return errStr
+	}
+
+	// Now, we can assert that each secret given as an argument to this function is in the bundle.
+	for _, secret := range secrets {
+		ExpectWithOffset(1, certsInBundle).To(HaveKey(secret), errNotInBundle(secret))
+	}
+
+	// We can also assert that each secret within the bundle was given as an argument to this function!
+	for cert := range certsInBundle {
+		found := false
+		for _, secret := range secrets {
+			if cert.Name == secret.Name && cert.Namespace == secret.Namespace {
+				found = true
+				break
+			}
+		}
+
+		// If not found, error out.
+		errStr := fmt.Sprintf("Unexpected certificate %s/%s found among those in bundle", cert.Namespace, cert.Name)
+		ExpectWithOffset(1, found).To(BeTrue(), errStr)
 	}
 }

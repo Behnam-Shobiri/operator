@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,6 +25,8 @@ import (
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 
+	esv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/elasticsearch/v1"
+	kbv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/kibana/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1beta1 "k8s.io/api/policy/v1beta1"
@@ -34,16 +36,14 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-
-	esv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/elasticsearch/v1"
-	kbv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/kibana/v1"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
@@ -52,6 +52,7 @@ import (
 	rtest "github.com/tigera/operator/pkg/render/common/test"
 	"github.com/tigera/operator/pkg/render/testutils"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
+	"github.com/tigera/operator/test"
 )
 
 type resourceTestObj struct {
@@ -182,7 +183,7 @@ var _ = Describe("Elasticsearch rendering tests", func() {
 				}
 			})
 
-			It("should render an elasticsearchComponent", func() {
+			It("should render an elasticsearchComponent and a kibanaComponent", func() {
 				expectedCreateResources := []client.Object{
 					// ECK Resources
 					&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: render.ECKOperatorNamespace}},
@@ -461,6 +462,11 @@ var _ = Describe("Elasticsearch rendering tests", func() {
 						ResourceNames: []string{"elastic-operator"},
 					},
 				}))
+
+				resultKB := rtest.GetResource(createResources, render.KibanaName, render.KibanaNamespace,
+					"kibana.k8s.elastic.co", "v1", "Kibana").(*kbv1.Kibana)
+				Expect(resultKB.Spec.Config.Data["xpack.security.session.lifespan"]).To(Equal("8h"))
+				Expect(resultKB.Spec.Config.Data["xpack.security.session.idleTimeout"]).To(Equal("30m"))
 			})
 
 			It("should render an elasticsearchComponent and delete the Elasticsearch and Kibana ExternalService as well as Curator components", func() {
@@ -1626,13 +1632,73 @@ var _ = Describe("Elasticsearch rendering tests", func() {
 			Expect(kibana.Spec.PodTemplate.Spec.Affinity).NotTo(BeNil())
 			Expect(kibana.Spec.PodTemplate.Spec.Affinity).To(Equal(podaffinity.NewPodAntiAffinity("tigera-secure", "tigera-kibana")))
 		})
+
+		It("should render the kibana pod template with resource requests and limits when set", func() {
+
+			cfg.Installation.CertificateManagement = &operatorv1.CertificateManagement{
+				CACert:             cfg.ElasticsearchKeyPair.GetCertificatePEM(),
+				SignerName:         "my signer name",
+				SignatureAlgorithm: "ECDSAWithSHA256",
+				KeyAlgorithm:       "ECDSAWithCurve521",
+			}
+
+			cfg.ElasticsearchKeyPair, cfg.KibanaKeyPair, cfg.TrustedBundle = getTLS(cfg.Installation)
+			cfg.UnusedTLSSecret = &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: relasticsearch.UnusedCertSecret, Namespace: common.OperatorNamespace()},
+			}
+			expectedResourcesRequirements := corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					"cpu":    resource.MustParse("1"),
+					"memory": resource.MustParse("500Mi"),
+				},
+				Requests: corev1.ResourceList{
+					"cpu":    resource.MustParse("101m"),
+					"memory": resource.MustParse("100Mi"),
+				},
+			}
+
+			cfg.LogStorage.Spec.Kibana = &operatorv1.Kibana{
+				Spec: &operatorv1.KibanaSpec{
+					Template: &operatorv1.KibanaPodTemplateSpec{
+						Spec: &operatorv1.KibanaPodSpec{
+							Containers: []operatorv1.KibanaContainer{
+								{
+									Name:      "kibana",
+									Resources: &expectedResourcesRequirements},
+							},
+							InitContainers: []operatorv1.KibanaInitContainer{
+								{
+									Name:      "key-cert-provisioner",
+									Resources: &expectedResourcesRequirements,
+								},
+							},
+						},
+					},
+				},
+			}
+
+			component := render.LogStorage(cfg)
+			resources, _ := component.Objects()
+
+			kibana, ok := rtest.GetResource(resources, "tigera-secure", "tigera-kibana", "kibana.k8s.elastic.co", "v1", "Kibana").(*kbv1.Kibana)
+			Expect(ok).To(BeTrue())
+			Expect(kibana.Spec.Count).To(Equal(int32(1)))
+			container := test.GetContainer(kibana.Spec.PodTemplate.Spec.Containers, "kibana")
+			Expect(container).NotTo(BeNil())
+			Expect(container.Resources).To(Equal(expectedResourcesRequirements))
+
+			initcontainer := test.GetContainer(kibana.Spec.PodTemplate.Spec.InitContainers, "key-cert-provisioner")
+			Expect(initcontainer).NotTo(BeNil())
+			Expect(initcontainer.Resources).To(Equal(expectedResourcesRequirements))
+
+		})
 	})
 })
 
 func getTLS(installation *operatorv1.InstallationSpec) (certificatemanagement.KeyPairInterface, certificatemanagement.KeyPairInterface, certificatemanagement.TrustedBundle) {
 	scheme := runtime.NewScheme()
 	Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
-	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	cli := ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 
 	certificateManager, err := certificatemanager.Create(cli, installation, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 	Expect(err).NotTo(HaveOccurred())

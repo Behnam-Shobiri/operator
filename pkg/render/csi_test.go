@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@ import (
 	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
@@ -196,6 +197,49 @@ var _ = Describe("CSI rendering tests", func() {
 		Expect(ds.Spec.Template.Spec.ServiceAccountName).To(BeEmpty())
 	})
 
+	Describe("AKS", func() {
+		It("should avoid virtual nodes", func() {
+			defaultInstance.KubernetesProvider = operatorv1.ProviderAKS
+
+			component := render.CSI(&cfg)
+			resources, _ := component.Objects()
+			dsResource := rtest.GetResource(resources, render.CSIDaemonSetName, common.CalicoNamespace, "apps", "v1", "DaemonSet")
+			Expect(dsResource).ToNot(BeNil())
+			// The DaemonSet should have the correct configuration.
+			ds := dsResource.(*appsv1.DaemonSet)
+			Expect(ds.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms).To(ContainElement(
+				corev1.NodeSelectorTerm{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      "type",
+						Operator: corev1.NodeSelectorOpNotIn,
+						Values:   []string{"virtual-kubelet"},
+					}},
+				},
+			))
+		})
+	})
+	Describe("EKS", func() {
+		It("should avoid virtual fargate nodes", func() {
+			defaultInstance.KubernetesProvider = operatorv1.ProviderEKS
+
+			component := render.CSI(&cfg)
+			resources, _ := component.Objects()
+			dsResource := rtest.GetResource(resources, render.CSIDaemonSetName, common.CalicoNamespace, "apps", "v1", "DaemonSet")
+			Expect(dsResource).ToNot(BeNil())
+			// The DaemonSet should have the correct configuration.
+			ds := dsResource.(*appsv1.DaemonSet)
+			Expect(ds.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms).To(ContainElement(
+				corev1.NodeSelectorTerm{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      "eks.amazonaws.com/compute-type",
+						Operator: corev1.NodeSelectorOpNotIn,
+						Values:   []string{"fargate"},
+					}},
+				},
+			))
+		})
+	})
+
 	Context("With csi-node-driver DaemonSet overrides", func() {
 		It("should handle csiNodeDriverDaemonSet overrides", func() {
 			affinity := &corev1.Affinity{
@@ -216,6 +260,10 @@ var _ = Describe("CSI rendering tests", func() {
 				Value:    "bar",
 			}
 
+			resourceRequirements := corev1.ResourceRequirements{
+				Requests: corev1.ResourceList{"cpu": resource.MustParse("1")},
+			}
+
 			defaultInstance.CSINodeDriverDaemonSet = &operatorv1.CSINodeDriverDaemonSet{
 				Metadata: &operatorv1.Metadata{
 					Labels:      map[string]string{"top-level": "label1"},
@@ -233,6 +281,10 @@ var _ = Describe("CSI rendering tests", func() {
 							},
 							Affinity:    affinity,
 							Tolerations: []corev1.Toleration{toleration},
+							Containers: []operatorv1.CSINodeDriverDaemonSetContainer{
+								{Name: render.CSIContainerName, Resources: &resourceRequirements},
+								{Name: render.CSIRegistrarContainerName, Resources: &resourceRequirements},
+							},
 						},
 					},
 				},
@@ -263,6 +315,10 @@ var _ = Describe("CSI rendering tests", func() {
 
 			Expect(ds.Spec.Template.Spec.Tolerations).To(HaveLen(1))
 			Expect(ds.Spec.Template.Spec.Tolerations[0]).To(Equal(toleration))
+
+			Expect(ds.Spec.Template.Spec.Containers).To(HaveLen(2))
+			Expect(ds.Spec.Template.Spec.Containers[0].Resources).To(Equal(resourceRequirements))
+			Expect(ds.Spec.Template.Spec.Containers[1].Resources).To(Equal(resourceRequirements))
 		})
 	})
 
@@ -272,8 +328,8 @@ var _ = Describe("CSI rendering tests", func() {
 		Expect(comp.ResolveImages(nil)).To(BeNil())
 		createObjs, _ := comp.Objects()
 		dsResource := rtest.GetResource(createObjs, "csi-node-driver", common.CalicoNamespace, "apps", "v1", "DaemonSet")
-		Expect(dsResource.(*appsv1.DaemonSet).Spec.Template.Spec.Containers[0].Image).To(Equal(fmt.Sprintf("%s%s:%s", components.TigeraRegistry, components.ComponentCSIPrivate.Image, components.ComponentCSIPrivate.Version)))
-		Expect(dsResource.(*appsv1.DaemonSet).Spec.Template.Spec.Containers[1].Image).To(Equal(fmt.Sprintf("%s%s:%s", components.TigeraRegistry, components.ComponentCSINodeDriverRegistrarPrivate.Image, components.ComponentCSINodeDriverRegistrarPrivate.Version)))
+		Expect(dsResource.(*appsv1.DaemonSet).Spec.Template.Spec.Containers[0].Image).To(Equal(fmt.Sprintf("%s%s:%s", components.TigeraRegistry, components.ComponentTigeraCSI.Image, components.ComponentTigeraCSI.Version)))
+		Expect(dsResource.(*appsv1.DaemonSet).Spec.Template.Spec.Containers[1].Image).To(Equal(fmt.Sprintf("%s%s:%s", components.TigeraRegistry, components.ComponentTigeraCSINodeDriverRegistrar.Image, components.ComponentTigeraCSINodeDriverRegistrar.Version)))
 	})
 
 	It("should use private images when Variant = Calico", func() {

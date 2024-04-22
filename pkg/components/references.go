@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -48,9 +48,10 @@ func GetReference(c component, registry, imagePath, imagePrefix string, is *oper
 			ComponentCalicoTyphaFIPS,
 			ComponentCalicoKubeControllers,
 			ComponentCalicoKubeControllersFIPS,
-			ComponentFlexVolume,
+			ComponentCalicoFlexVolume,
 			ComponentCalicoAPIServer,
 			ComponentCalicoAPIServerFIPS,
+			ComponentCalicoCSRInitContainer,
 			ComponentCalicoCSI,
 			ComponentCalicoCSIFIPS,
 			ComponentCalicoCSIRegistrar,
@@ -59,8 +60,6 @@ func GetReference(c component, registry, imagePath, imagePrefix string, is *oper
 			registry = CalicoRegistry
 		case ComponentOperatorInit:
 			registry = InitRegistry
-		case ComponentCSRInitContainer:
-			registry = CSRInitRegistry
 		default:
 			registry = TigeraRegistry
 		}

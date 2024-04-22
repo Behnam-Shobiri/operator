@@ -1,4 +1,4 @@
-// Copyright (c) 2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,14 +23,15 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	operatorv1 "github.com/tigera/operator/api/v1"
-	tigeraelastic "github.com/tigera/operator/pkg/controller/logstorage/elastic"
-	"github.com/tigera/operator/pkg/controller/utils"
 	apiv1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+
+	operatorv1 "github.com/tigera/operator/api/v1"
+	tigeraelastic "github.com/tigera/operator/pkg/controller/logstorage/elastic"
+	"github.com/tigera/operator/pkg/controller/utils"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 )
 
 var _ = Describe("LogStorage cleanup controller", func() {
@@ -42,7 +43,7 @@ var _ = Describe("LogStorage cleanup controller", func() {
 		scheme := runtime.NewScheme()
 		Expect(operatorv1.AddToScheme(scheme)).NotTo(HaveOccurred())
 		Expect(corev1.AddToScheme(scheme)).NotTo(HaveOccurred())
-		cli = fake.NewClientBuilder().WithScheme(scheme).Build()
+		cli = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 	})
 
 	It("should clean up Elastic users for tenants that no longer exist", func() {
@@ -60,18 +61,23 @@ var _ = Describe("LogStorage cleanup controller", func() {
 		tenantID1 := "tenant1"
 		tenantID2 := "tenant2"
 
-		staleUser := utils.LinseedUser(clusterID1, tenantID1)
+		staleLinseedUser := utils.LinseedUser(clusterID1, tenantID1)
+		staleDashboardsUser := utils.DashboardUser(clusterID1, tenantID1)
 
 		esTestUsers := []utils.User{
-			*staleUser,
+			*staleLinseedUser,
+			*staleDashboardsUser,
 			*utils.LinseedUser(clusterID1, tenantID2),
+			*utils.DashboardUser(clusterID1, tenantID2),
 			*utils.LinseedUser(clusterID2, tenantID1),
+			*utils.DashboardUser(clusterID2, tenantID1),
 			*utils.LinseedUser(clusterID2, tenantID2),
+			*utils.DashboardUser(clusterID2, tenantID2),
 		}
 
 		testESClient.On("GetUsers", ctx).Return(esTestUsers, nil)
-		testESClient.On("DeleteUser", ctx, staleUser).Return(nil)
-		testESClient.On("DeleteRoles", ctx, staleUser.Roles).Return(nil)
+		testESClient.On("DeleteUser", ctx, staleLinseedUser).Return(nil)
+		testESClient.On("DeleteRoles", ctx, staleLinseedUser.Roles).Return(nil)
 
 		cluster1IDConfigMap := corev1.ConfigMap{
 			ObjectMeta: apiv1.ObjectMeta{

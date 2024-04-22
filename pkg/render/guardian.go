@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ import (
 	"github.com/tigera/api/pkg/lib/numorstring"
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/components"
+	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
@@ -90,7 +91,8 @@ type GuardianConfiguration struct {
 	TunnelCAType      operatorv1.CAType
 
 	// Whether the cluster supports pod security policies.
-	UsePSP bool
+	UsePSP                      bool
+	ManagementClusterConnection *operatorv1.ManagementClusterConnection
 }
 
 type GuardianComponent struct {
@@ -256,7 +258,7 @@ func (c *GuardianComponent) clusterRoleBinding() *rbacv1.ClusterRoleBinding {
 func (c *GuardianComponent) deployment() *appsv1.Deployment {
 	var replicas int32 = 1
 
-	return &appsv1.Deployment{
+	d := &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      GuardianDeploymentName,
@@ -284,6 +286,13 @@ func (c *GuardianComponent) deployment() *appsv1.Deployment {
 			},
 		},
 	}
+
+	if c.cfg.ManagementClusterConnection != nil {
+		if overrides := c.cfg.ManagementClusterConnection.Spec.GuardianDeployment; overrides != nil {
+			rcomponents.ApplyDeploymentOverrides(d, overrides)
+		}
+	}
+	return d
 }
 
 func (c *GuardianComponent) volumes() []corev1.Volume {
@@ -421,6 +430,7 @@ func guardianAllowTigeraPolicy(cfg *GuardianConfiguration) (*v3.NetworkPolicy, e
 	egressRules = append(egressRules, v3.Rule{Action: v3.Pass})
 
 	guardianIngressDestinationEntityRule := v3.EntityRule{Ports: networkpolicy.Ports(8080)}
+	networkpolicyHelper := networkpolicy.DefaultHelper()
 	ingressRules := []v3.Rule{
 		{
 			Action:      v3.Allow,
@@ -431,25 +441,25 @@ func guardianAllowTigeraPolicy(cfg *GuardianConfiguration) (*v3.NetworkPolicy, e
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Source:      ComplianceBenchmarkerSourceEntityRule,
+			Source:      networkpolicyHelper.ComplianceBenchmarkerSourceEntityRule(),
 			Destination: guardianIngressDestinationEntityRule,
 		},
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Source:      ComplianceReporterSourceEntityRule,
+			Source:      networkpolicyHelper.ComplianceReporterSourceEntityRule(),
 			Destination: guardianIngressDestinationEntityRule,
 		},
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Source:      ComplianceSnapshotterSourceEntityRule,
+			Source:      networkpolicyHelper.ComplianceSnapshotterSourceEntityRule(),
 			Destination: guardianIngressDestinationEntityRule,
 		},
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Source:      ComplianceControllerSourceEntityRule,
+			Source:      networkpolicyHelper.ComplianceControllerSourceEntityRule(),
 			Destination: guardianIngressDestinationEntityRule,
 		},
 		{

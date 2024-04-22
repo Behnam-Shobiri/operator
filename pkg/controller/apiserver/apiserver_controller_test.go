@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -33,10 +33,10 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
 	"github.com/tigera/operator/pkg/common"
@@ -44,6 +44,7 @@ import (
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
@@ -76,7 +77,7 @@ var _ = Describe("apiserver controller tests", func() {
 		Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 
 		ctx = context.Background()
-		cli = fake.NewClientBuilder().WithScheme(scheme).Build()
+		cli = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 
 		// Create a CertificateManagement instance for tests that need it.
 		ca, err := tls.MakeCA(rmeta.DefaultOperatorCASignerName())
@@ -132,7 +133,7 @@ var _ = Describe("apiserver controller tests", func() {
 			Data: map[string][]byte{
 				render.ClientIDSecretField:     []byte("a"),
 				render.ClientSecretSecretField: []byte("a"),
-				render.RootCASecretField:       []byte("a"),
+				render.RootCASecretField:       []byte(dexSecret.Data[corev1.TLSCertKey]),
 			},
 		})).ToNot(HaveOccurred())
 
@@ -161,7 +162,6 @@ var _ = Describe("apiserver controller tests", func() {
 				scheme:              scheme,
 				provider:            operatorv1.ProviderNone,
 				enterpriseCRDsExist: true,
-				amazonCRDExists:     false,
 				status:              mockStatus,
 				tierWatchReady:      ready,
 			}
@@ -194,8 +194,8 @@ var _ = Describe("apiserver controller tests", func() {
 			Expect(csrinit).ToNot(BeNil())
 			Expect(csrinit.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s:%s",
-					components.ComponentCSRInitContainer.Image,
-					components.ComponentCSRInitContainer.Version)))
+					components.ComponentTigeraCSRInitContainer.Image,
+					components.ComponentTigeraCSRInitContainer.Version)))
 
 			pcDeployment := appsv1.Deployment{
 				TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "v1"},
@@ -228,8 +228,8 @@ var _ = Describe("apiserver controller tests", func() {
 			Expect(csrinitContainer).ToNot(BeNil())
 			Expect(csrinitContainer.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s:%s",
-					components.ComponentCSRInitContainer.Image,
-					components.ComponentCSRInitContainer.Version)))
+					components.ComponentTigeraCSRInitContainer.Image,
+					components.ComponentTigeraCSRInitContainer.Version)))
 			pcSecret := corev1.Secret{
 				TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
 				ObjectMeta: metav1.ObjectMeta{
@@ -292,7 +292,7 @@ var _ = Describe("apiserver controller tests", func() {
 			Expect(csrinit).ToNot(BeNil())
 			Expect(csrinit.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s@%s",
-					components.ComponentCSRInitContainer.Image,
+					components.ComponentTigeraCSRInitContainer.Image,
 					"sha256:calicocsrinithash")))
 
 			pcDeployment := appsv1.Deployment{
@@ -314,7 +314,7 @@ var _ = Describe("apiserver controller tests", func() {
 			Expect(csrinitContainer).ToNot(BeNil())
 			Expect(csrinitContainer.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s@%s",
-					components.ComponentCSRInitContainer.Image,
+					components.ComponentTigeraCSRInitContainer.Image,
 					"sha256:calicocsrinithash")))
 			pcSecret := corev1.Secret{
 				TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
@@ -736,7 +736,6 @@ var _ = Describe("apiserver controller tests", func() {
 					scheme:              scheme,
 					provider:            operatorv1.ProviderNone,
 					enterpriseCRDsExist: true,
-					amazonCRDExists:     false,
 					status:              mockStatus,
 					tierWatchReady:      ready,
 					multiTenant:         false,
@@ -778,7 +777,6 @@ var _ = Describe("apiserver controller tests", func() {
 					scheme:              scheme,
 					provider:            operatorv1.ProviderNone,
 					enterpriseCRDsExist: true,
-					amazonCRDExists:     false,
 					status:              mockStatus,
 					tierWatchReady:      ready,
 					multiTenant:         false,
@@ -818,7 +816,6 @@ var _ = Describe("apiserver controller tests", func() {
 					scheme:              scheme,
 					provider:            operatorv1.ProviderNone,
 					enterpriseCRDsExist: true,
-					amazonCRDExists:     false,
 					status:              mockStatus,
 					tierWatchReady:      ready,
 					multiTenant:         true,
@@ -850,6 +847,64 @@ var _ = Describe("apiserver controller tests", func() {
 				// Do not expect any secrets to be copied over
 				err = test.GetResource(cli, &clusterConnectionInAppNs)
 				Expect(kerror.IsNotFound(err)).Should(BeTrue())
+			})
+
+			It("Should reconcile and not create packet capture resources for a management cluster in multi tenant mode", func() {
+
+				r := ReconcileAPIServer{
+					client:              cli,
+					scheme:              scheme,
+					provider:            operatorv1.ProviderNone,
+					enterpriseCRDsExist: true,
+					status:              mockStatus,
+					tierWatchReady:      ready,
+					multiTenant:         true,
+				}
+
+				// Reconcile the API server
+				_, err := r.Reconcile(ctx, reconcile.Request{})
+				Expect(err).ShouldNot(HaveOccurred())
+
+				deployment := appsv1.Deployment{
+					TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "v1"},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tigera-packetcapture",
+						Namespace: "tigera-packetcapture",
+					},
+				}
+
+				// Ensure a deployment is not created for the packetcapture API
+				err = test.GetResource(cli, &deployment)
+				Expect(kerror.IsNotFound(err)).Should(BeTrue())
+
+			})
+			It("Should reconcile and create packet capture resources for a management cluster in single tenant mode", func() {
+				r := ReconcileAPIServer{
+					client:              cli,
+					scheme:              scheme,
+					provider:            operatorv1.ProviderNone,
+					enterpriseCRDsExist: true,
+					status:              mockStatus,
+					tierWatchReady:      ready,
+					multiTenant:         false,
+				}
+
+				// Reconcile the API server
+				_, err := r.Reconcile(ctx, reconcile.Request{})
+				Expect(err).ShouldNot(HaveOccurred())
+
+				deployment := appsv1.Deployment{
+					TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "v1"},
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tigera-packetcapture",
+						Namespace: "tigera-packetcapture",
+					},
+				}
+
+				// Ensure a deployment was created for the packetcapture API
+				err = test.GetResource(cli, &deployment)
+				Expect(kerror.IsNotFound(err)).Should(BeFalse())
+
 			})
 		})
 	})

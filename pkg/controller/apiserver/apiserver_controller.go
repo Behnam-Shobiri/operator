@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,10 @@ import (
 	"context"
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -30,7 +32,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
@@ -43,6 +44,7 @@ import (
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
 	"github.com/tigera/operator/pkg/controller/utils/imageset"
+	"github.com/tigera/operator/pkg/ctrlruntime"
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
@@ -61,7 +63,7 @@ var log = logf.Log.WithName("controller_apiserver")
 func Add(mgr manager.Manager, opts options.AddOptions) error {
 	r := newReconciler(mgr, opts)
 
-	c, err := controller.New("apiserver-controller", mgr, controller.Options{Reconciler: r})
+	c, err := ctrlruntime.NewController("apiserver-controller", mgr, controller.Options{Reconciler: r})
 	if err != nil {
 		return fmt.Errorf("failed to create apiserver-controller: %w", err)
 	}
@@ -92,7 +94,6 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions) *ReconcileAPISe
 		client:              mgr.GetClient(),
 		scheme:              mgr.GetScheme(),
 		provider:            opts.DetectedProvider,
-		amazonCRDExists:     opts.AmazonCRDExists,
 		enterpriseCRDsExist: opts.EnterpriseCRDExists,
 		status:              status.New(mgr.GetClient(), "apiserver", opts.KubernetesVersion),
 		clusterDomain:       opts.ClusterDomain,
@@ -105,12 +106,18 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions) *ReconcileAPISe
 }
 
 // add adds watches for resources that are available at startup
-func add(c controller.Controller, r *ReconcileAPIServer) error {
+func add(c ctrlruntime.Controller, r *ReconcileAPIServer) error {
 	// Watch for changes to primary resource APIServer
-	err := c.Watch(&source.Kind{Type: &operatorv1.APIServer{}}, &handler.EnqueueRequestForObject{})
+	err := c.WatchObject(&operatorv1.APIServer{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		log.V(5).Info("Failed to create APIServer watch", "err", err)
 		return fmt.Errorf("apiserver-controller failed to watch primary resource: %v", err)
+	}
+
+	// Watch for changes to packet capture.
+	err = c.WatchObject(&operatorv1.PacketCapture{}, &handler.EnqueueRequestForObject{})
+	if err != nil {
+		return fmt.Errorf("apiserver-controller failed to watch resource: %w", err)
 	}
 
 	if err = utils.AddInstallationWatch(c); err != nil {
@@ -122,23 +129,15 @@ func add(c controller.Controller, r *ReconcileAPIServer) error {
 		return fmt.Errorf("apiserver-controller failed to watch ConfigMap %s: %w", render.K8sSvcEndpointConfigMapName, err)
 	}
 
-	if r.amazonCRDExists {
-		err = c.Watch(&source.Kind{Type: &operatorv1.AmazonCloudIntegration{}}, &handler.EnqueueRequestForObject{})
-		if err != nil {
-			log.V(5).Info("Failed to create AmazonCloudIntegration watch", "err", err)
-			return fmt.Errorf("apiserver-controller failed to watch primary resource: %v", err)
-		}
-	}
-
 	if r.enterpriseCRDsExist {
 		// Watch for changes to primary resource ManagementCluster
-		err = c.Watch(&source.Kind{Type: &operatorv1.ManagementCluster{}}, &handler.EnqueueRequestForObject{})
+		err = c.WatchObject(&operatorv1.ManagementCluster{}, &handler.EnqueueRequestForObject{})
 		if err != nil {
 			return fmt.Errorf("apiserver-controller failed to watch primary resource: %v", err)
 		}
 
 		// Watch for changes to primary resource ManagementClusterConnection
-		err = c.Watch(&source.Kind{Type: &operatorv1.ManagementClusterConnection{}}, &handler.EnqueueRequestForObject{})
+		err = c.WatchObject(&operatorv1.ManagementClusterConnection{}, &handler.EnqueueRequestForObject{})
 		if err != nil {
 			return fmt.Errorf("apiserver-controller failed to watch primary resource: %v", err)
 		}
@@ -152,10 +151,18 @@ func add(c controller.Controller, r *ReconcileAPIServer) error {
 		}
 
 		// Watch for changes to authentication
-		err = c.Watch(&source.Kind{Type: &operatorv1.Authentication{}}, &handler.EnqueueRequestForObject{})
+		err = c.WatchObject(&operatorv1.Authentication{}, &handler.EnqueueRequestForObject{})
 		if err != nil {
 			return fmt.Errorf("apiserver-controller failed to watch resource: %w", err)
 		}
+	}
+
+	// Watch for the namespace(s) managed by this controller.
+	if err = c.WatchObject(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: rmeta.APIServerNamespace(operatorv1.Calico)}}, &handler.EnqueueRequestForObject{}); err != nil {
+		return fmt.Errorf("apiserver-controller failed to watch resource: %w", err)
+	}
+	if err = c.WatchObject(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: rmeta.APIServerNamespace(operatorv1.TigeraSecureEnterprise)}}, &handler.EnqueueRequestForObject{}); err != nil {
+		return fmt.Errorf("apiserver-controller failed to watch resource: %w", err)
 	}
 
 	for _, secretName := range []string{
@@ -174,6 +181,7 @@ func add(c controller.Controller, r *ReconcileAPIServer) error {
 	if err = utils.AddTigeraStatusWatch(c, ResourceName); err != nil {
 		return fmt.Errorf("apiserver-controller failed to watch apiserver Tigerastatus: %w", err)
 	}
+
 	log.V(5).Info("Controller created and Watches setup")
 	return nil
 }
@@ -188,7 +196,6 @@ type ReconcileAPIServer struct {
 	client              client.Client
 	scheme              *runtime.Scheme
 	provider            operatorv1.Provider
-	amazonCRDExists     bool
 	enterpriseCRDsExist bool
 	status              status.StatusManager
 	clusterDomain       string
@@ -211,7 +218,7 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 		if errors.IsNotFound(err) {
 			reqLogger.Info("APIServer config not found")
 			r.status.OnCRNotFound()
-			return reconcile.Result{}, nil
+			return reconcile.Result{}, maintainInstallationFinalizer(ctx, r.client, nil)
 		}
 		r.status.SetDegraded(operatorv1.ResourceReadError, fmt.Sprintf("An error occurred when querying the APIServer resource: %s", msg), err, reqLogger)
 		return reconcile.Result{}, err
@@ -243,7 +250,7 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 	}
 
 	// Query for the installation object.
-	variant, network, err := utils.GetInstallation(context.Background(), r.client)
+	variant, installationSpec, err := utils.GetInstallation(context.Background(), r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotFound, "Installation not found", err, reqLogger)
@@ -258,15 +265,15 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 	}
 	ns := rmeta.APIServerNamespace(variant)
 
-	certificateManager, err := certificatemanager.Create(r.client, network, r.clusterDomain, common.OperatorNamespace())
+	certificateManager, err := certificatemanager.Create(r.client, installationSpec, r.clusterDomain, common.OperatorNamespace())
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the Tigera CA", err, reqLogger)
 		return reconcile.Result{}, err
 	}
 
 	// We need separate certificates for OSS vs Enterprise.
-	secretName := render.ProjectCalicoAPIServerTLSSecretName(network.Variant)
-	tlsSecret, err := certificateManager.GetOrCreateKeyPair(r.client, secretName, common.OperatorNamespace(), dns.GetServiceDNSNames(render.ProjectCalicoAPIServerServiceName(network.Variant), rmeta.APIServerNamespace(network.Variant), r.clusterDomain))
+	secretName := render.ProjectCalicoAPIServerTLSSecretName(installationSpec.Variant)
+	tlsSecret, err := certificateManager.GetOrCreateKeyPair(r.client, secretName, common.OperatorNamespace(), dns.GetServiceDNSNames(render.ProjectCalicoAPIServerServiceName(installationSpec.Variant), rmeta.APIServerNamespace(installationSpec.Variant), r.clusterDomain))
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to get or create tls key pair", err, reqLogger)
 		return reconcile.Result{}, err
@@ -274,7 +281,7 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 
 	certificateManager.AddToStatusManager(r.status, ns)
 
-	pullSecrets, err := utils.GetNetworkingPullSecrets(network, r.client)
+	pullSecrets, err := utils.GetNetworkingPullSecrets(installationSpec, r.client)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error retrieving pull secrets", err, reqLogger)
 		return reconcile.Result{}, err
@@ -283,7 +290,6 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 	// Query enterprise-only data.
 	var tunnelCAKeyPair certificatemanagement.KeyPairInterface
 	var trustedBundle certificatemanagement.TrustedBundle
-	var amazon *operatorv1.AmazonCloudIntegration
 	var managementCluster *operatorv1.ManagementCluster
 	var managementClusterConnection *operatorv1.ManagementClusterConnection
 	includeV3NetworkPolicy := false
@@ -326,16 +332,6 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 			}
 		}
 
-		if r.amazonCRDExists {
-			amazon, err = utils.GetAmazonCloudIntegration(ctx, r.client)
-			if errors.IsNotFound(err) {
-				amazon = nil
-			} else if err != nil {
-				r.status.SetDegraded(operatorv1.ResourceReadError, "Error reading AmazonCloudIntegration", err, reqLogger)
-				return reconcile.Result{}, err
-			}
-		}
-
 		// Ensure the allow-tigera tier exists, before rendering any network policies within it.
 		//
 		// The creation of the Tier depends on this controller to reconcile it's non-NetworkPolicy resources so that
@@ -367,6 +363,13 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error reading services endpoint configmap", err, reqLogger)
 		return reconcile.Result{}, err
 	}
+
+	// API server exists and configuration is valid - maintain a Finalizer on the installation.
+	if err := maintainInstallationFinalizer(ctx, r.client, instance); err != nil {
+		r.status.SetDegraded(operatorv1.ResourceReadError, "Error setting finalizer on Installation", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+
 	// Create a component handler to manage the rendered component.
 	handler := utils.NewComponentHandler(log, r.client, r.scheme, instance)
 
@@ -375,12 +378,11 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 
 	apiServerCfg := render.APIServerConfiguration{
 		K8SServiceEndpoint:          k8sapi.Endpoint,
-		Installation:                network,
+		Installation:                installationSpec,
 		APIServer:                   &instance.Spec,
 		ForceHostNetwork:            false,
 		ManagementCluster:           managementCluster,
 		ManagementClusterConnection: managementClusterConnection,
-		AmazonCloudIntegration:      amazon,
 		TLSKeyPair:                  tlsSecret,
 		PullSecrets:                 pullSecrets,
 		Openshift:                   r.provider == operatorv1.ProviderOpenShift,
@@ -408,7 +410,7 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 	}
 
 	var pcPolicy render.Component
-	if variant == operatorv1.TigeraSecureEnterprise {
+	if variant == operatorv1.TigeraSecureEnterprise && (!r.multiTenant || managementCluster == nil) {
 		packetCaptureCertSecret, err := certificateManager.GetOrCreateKeyPair(
 			r.client,
 			render.PacketCaptureServerCert,
@@ -444,16 +446,24 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 		}
 		trustedBundle := certificateManager.CreateTrustedBundle(certificates...)
 
+		//Fetch the packet capture spec. If it exists, we utilize it to configure packet capture resource requirements.
+		packetcapture, err := utils.GetPacketCapture(ctx, r.client)
+		if err != nil && !errors.IsNotFound(err) {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying PacketCapture", err, reqLogger)
+			return reconcile.Result{}, err
+		}
+
 		packetCaptureApiCfg := &render.PacketCaptureApiConfiguration{
 			PullSecrets:                 pullSecrets,
 			Openshift:                   r.provider == operatorv1.ProviderOpenShift,
-			Installation:                network,
+			Installation:                installationSpec,
 			KeyValidatorConfig:          keyValidatorConfig,
 			ServerCertSecret:            packetCaptureCertSecret,
 			ClusterDomain:               r.clusterDomain,
 			ManagementClusterConnection: managementClusterConnection,
 			TrustedBundle:               trustedBundle,
 			UsePSP:                      r.usePSP,
+			PacketCapture:               packetcapture,
 		}
 		pc := render.PacketCaptureAPI(packetCaptureApiCfg)
 		pcPolicy = render.PacketCaptureAPIPolicy(packetCaptureApiCfg)
@@ -491,6 +501,7 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 			return reconcile.Result{}, err
 		}
 	}
+
 	// Clear the degraded bit if we've reached this far.
 	r.status.ClearDegraded()
 
@@ -516,4 +527,46 @@ func validateAPIServerResource(instance *operatorv1.APIServer) error {
 		}
 	}
 	return nil
+}
+
+// maintainInstallationFinalizer manages this controller's finalizer on the Installation resource.
+// We add a finalizer to the Installation when the API server has been installed, and only remove that finalizer when
+// the API server has been deleted and its pods have stopped running. This allows for a graceful cleanup of API server resources
+// prior to the CNI plugin being removed.
+func maintainInstallationFinalizer(ctx context.Context, c client.Client, apiserver *operatorv1.APIServer) error {
+	// Get the Installation.
+	installation := &operatorv1.Installation{}
+	if err := c.Get(ctx, utils.DefaultInstanceKey, installation); err != nil {
+		if errors.IsNotFound(err) {
+			log.V(1).Info("Installation config not found")
+			return nil
+		}
+		log.Error(err, "An error occurred when querying the Installation resource")
+		return err
+	}
+	patchFrom := client.MergeFrom(installation.DeepCopy())
+
+	// Determine the correct finalizers to apply to the Installation. If the APIServer exists, we should apply
+	// a finalizer. Otherwise, if the API server namespace doesn't exist we should remove it. This ensures the finalizer
+	// is always present so long as the resources managed by this controller exist in the cluster.
+	if apiserver != nil {
+		// Add a finalizer indicating that the API server is still running.
+		utils.SetInstallationFinalizer(installation, render.APIServerFinalizer)
+	} else {
+		// Check if the API server namespace exists, and remove the finalizer if not. Gating this on Namespace removal
+		// in the best way to approximate that all API server related resources have been removed.
+		l := &corev1.Namespace{}
+		err := c.Get(ctx, types.NamespacedName{Name: rmeta.APIServerNamespace(installation.Spec.Variant)}, l)
+		if err != nil && !errors.IsNotFound(err) {
+			return err
+		} else if errors.IsNotFound(err) {
+			log.Info("API server Namespace does not exist, removing finalizer", "finalizer", render.APIServerFinalizer)
+			utils.RemoveInstallationFinalizer(installation, render.APIServerFinalizer)
+		} else {
+			log.Info("API server Namespace is still present, waiting for termination")
+		}
+	}
+
+	// Update the installation with any finalizer changes.
+	return c.Patch(ctx, installation, patchFrom)
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -73,6 +73,16 @@ var _ = Describe("provider discovery", func() {
 		Expect(p).To(Equal(operatorv1.ProviderGKE))
 	})
 
+	It("should detect TKG based on API resource core.tanzu.vmware.com existence", func() {
+		c := fake.NewSimpleClientset()
+		c.Resources = []*metav1.APIResourceList{{
+			GroupVersion: "core.tanzu.vmware.com/v1alpha2",
+		}}
+		p, e := AutoDiscoverProvider(context.Background(), c)
+		Expect(e).To(BeNil())
+		Expect(p).To(Equal(operatorv1.ProviderTKG))
+	})
+
 	It("should detect EKS based on eks-certificates-controller ConfigMap", func() {
 		c := fake.NewSimpleClientset(&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
@@ -114,6 +124,18 @@ var _ = Describe("provider discovery", func() {
 		c := fake.NewSimpleClientset(&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "rke2",
+				Namespace: "kube-system",
+			},
+		})
+		p, e := AutoDiscoverProvider(context.Background(), c)
+		Expect(e).To(BeNil())
+		Expect(p).To(Equal(operatorv1.ProviderRKE2))
+	})
+
+	It("should detect RKE2 based on presence of kube-system/rke2-coredns-rke2-coredns Service", func() {
+		c := fake.NewSimpleClientset(&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "rke2-coredns-rke2-coredns",
 				Namespace: "kube-system",
 			},
 		})

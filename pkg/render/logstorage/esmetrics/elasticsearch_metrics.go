@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,8 @@ package esmetrics
 
 import (
 	"fmt"
+
+	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 
 	"github.com/tigera/operator/pkg/url"
 
@@ -70,6 +72,8 @@ type Config struct {
 
 	// Whether the cluster supports pod security policies.
 	UsePSP bool
+
+	LogStorage *operatorv1.LogStorage
 }
 
 type elasticsearchMetrics struct {
@@ -213,7 +217,7 @@ func (e elasticsearchMetrics) metricsDeployment() *appsv1.Deployment {
 
 	_, esHost, esPort, _ := url.ParseEndpoint(relasticsearch.GatewayEndpoint(e.SupportedOSType(), e.cfg.ClusterDomain, render.ElasticsearchNamespace))
 
-	return &appsv1.Deployment{
+	d := &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ElasticsearchMetricsName,
@@ -266,6 +270,14 @@ func (e elasticsearchMetrics) metricsDeployment() *appsv1.Deployment {
 			}, []*corev1.Secret{e.cfg.ESMetricsCredsSecret}).(*corev1.PodTemplateSpec),
 		},
 	}
+
+	if e.cfg.LogStorage != nil {
+		if overrides := e.cfg.LogStorage.Spec.ElasticsearchMetricsDeployment; overrides != nil {
+			rcomponents.ApplyDeploymentOverrides(d, overrides)
+		}
+	}
+
+	return d
 }
 
 func (e *elasticsearchMetrics) allowTigeraPolicy() *v3.NetworkPolicy {

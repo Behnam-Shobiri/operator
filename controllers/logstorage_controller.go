@@ -1,4 +1,4 @@
-// Copyright (c) 2020,2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020,2024 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,6 +18,7 @@ package controllers
 
 import (
 	"github.com/go-logr/logr"
+	"github.com/tigera/operator/pkg/controller/logstorage/dashboards"
 	"github.com/tigera/operator/pkg/controller/logstorage/esmetrics"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -84,6 +85,11 @@ func (r *LogStorageReconciler) SetupWithManager(mgr ctrl.Manager, opts options.A
 		return err
 	}
 
+	// The dashboards controller installs Kibana dashboards and Kibana index-patterns
+	if err := dashboards.Add(mgr, opts); err != nil {
+		return err
+	}
+
 	// The managed cluster controller runs on managed clusters only, and installs the necessary services for managed cluster components
 	// to talk to the management cluster, as well as the necessary RBAC for management cluster components to talk
 	// to the managed cluster.
@@ -91,7 +97,7 @@ func (r *LogStorageReconciler) SetupWithManager(mgr ctrl.Manager, opts options.A
 		return err
 	}
 
-	// The users controller runs in multi-tenant mode only, and is responsible for genmerating unique credentials for each Linseed instance
+	// The users controller runs in multi-tenant mode only, and is responsible for generating unique credentials for each Linseed instance
 	// and provisioning users into Elasticsearch for them to use.
 	if err := users.Add(mgr, opts); err != nil {
 		return err

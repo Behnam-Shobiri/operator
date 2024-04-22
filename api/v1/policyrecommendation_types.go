@@ -71,6 +71,7 @@ type PolicyRecommendationDeploymentPodSpec struct {
 // PolicyRecommendationDeploymentContainer is a PolicyRecommendation Deployment container.
 type PolicyRecommendationDeploymentContainer struct {
 	// Name is an enum which identifies the PolicyRecommendation Deployment container by name.
+	// Supported values are: policy-recommendation-controller
 	// +kubebuilder:validation:Enum=policy-recommendation-controller
 	Name string `json:"name"`
 
@@ -205,6 +206,10 @@ func (c *PolicyRecommendationDeployment) GetTerminationGracePeriodSeconds() *int
 
 func (c *PolicyRecommendationDeployment) GetDeploymentStrategy() *appsv1.DeploymentStrategy {
 	return nil
+}
+
+func (c *PolicyRecommendationDeployment) GetPriorityClassName() string {
+	return ""
 }
 
 func init() {

@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/tls"
@@ -48,7 +49,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
@@ -71,7 +71,7 @@ var _ = Describe("Compliance controller tests", func() {
 		Expect(operatorv1.SchemeBuilder.AddToScheme(scheme)).NotTo(HaveOccurred())
 
 		// Create a client that will have a crud interface of k8s objects.
-		c = fake.NewClientBuilder().WithScheme(scheme).Build()
+		c = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 		ctx = context.Background()
 
 		mockStatus = &status.MockStatus{}
@@ -126,13 +126,6 @@ var _ = Describe("Compliance controller tests", func() {
 		Expect(c.Create(ctx, &operatorv1.APIServer{ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure"}, Status: operatorv1.APIServerStatus{State: operatorv1.TigeraStatusReady}})).NotTo(HaveOccurred())
 		Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
 		Expect(c.Create(ctx, &v3.LicenseKey{ObjectMeta: metav1.ObjectMeta{Name: "default"}, Status: v3.LicenseKeyStatus{Features: []string{common.ComplianceFeature}}})).NotTo(HaveOccurred())
-
-		// Create a bunch of empty secrets, such that the reconcile loop will make it to the render functionality.
-		Expect(c.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.ElasticsearchComplianceBenchmarkerUserSecret, Namespace: "tigera-operator"}})).NotTo(HaveOccurred())
-		Expect(c.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.ElasticsearchComplianceControllerUserSecret, Namespace: "tigera-operator"}})).NotTo(HaveOccurred())
-		Expect(c.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.ElasticsearchComplianceReporterUserSecret, Namespace: "tigera-operator"}})).NotTo(HaveOccurred())
-		Expect(c.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.ElasticsearchComplianceSnapshotterUserSecret, Namespace: "tigera-operator"}})).NotTo(HaveOccurred())
-		Expect(c.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.ElasticsearchComplianceServerUserSecret, Namespace: "tigera-operator"}})).NotTo(HaveOccurred())
 
 		certificateManager, err := certificatemanager.Create(c, nil, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
@@ -598,12 +591,12 @@ var _ = Describe("Compliance controller tests", func() {
 		})
 
 		It("should wait if allow-tigera tier is unavailable", func() {
-			utils.DeleteAllowTigeraTierAndExpectWait(ctx, c, &r, mockStatus)
+			test.DeleteAllowTigeraTierAndExpectWait(ctx, c, &r, mockStatus)
 		})
 
 		It("should wait if tier watch is not ready", func() {
 			r.tierWatchReady = &utils.ReadyFlag{}
-			utils.ExpectWaitForTierWatch(ctx, &r, mockStatus)
+			test.ExpectWaitForTierWatch(ctx, &r, mockStatus)
 		})
 	})
 
@@ -714,7 +707,7 @@ var _ = Describe("Compliance controller tests", func() {
 				Namespace: "",
 			}})
 			Expect(err).ShouldNot(HaveOccurred())
-			instance, err := GetCompliance(ctx, r.client)
+			instance, err := GetCompliance(ctx, r.client, false, "notused")
 			Expect(err).ShouldNot(HaveOccurred())
 
 			Expect(instance.Status.Conditions).To(HaveLen(1))
@@ -738,7 +731,7 @@ var _ = Describe("Compliance controller tests", func() {
 				Namespace: "",
 			}})
 			Expect(err).ShouldNot(HaveOccurred())
-			instance, err := GetCompliance(ctx, r.client)
+			instance, err := GetCompliance(ctx, r.client, false, "notused")
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(instance.Status.Conditions).To(HaveLen(0))
 		})
@@ -780,7 +773,7 @@ var _ = Describe("Compliance controller tests", func() {
 				Namespace: "",
 			}})
 			Expect(err).ShouldNot(HaveOccurred())
-			instance, err := GetCompliance(ctx, r.client)
+			instance, err := GetCompliance(ctx, r.client, false, "notused")
 			Expect(err).ShouldNot(HaveOccurred())
 
 			Expect(instance.Status.Conditions).To(HaveLen(3))
@@ -840,7 +833,7 @@ var _ = Describe("Compliance controller tests", func() {
 				Namespace: "",
 			}})
 			Expect(err).ShouldNot(HaveOccurred())
-			instance, err := GetCompliance(ctx, r.client)
+			instance, err := GetCompliance(ctx, r.client, false, "notused")
 			Expect(err).ShouldNot(HaveOccurred())
 
 			Expect(instance.Status.Conditions).To(HaveLen(3))
@@ -861,6 +854,116 @@ var _ = Describe("Compliance controller tests", func() {
 			Expect(instance.Status.Conditions[2].Reason).To(Equal(string(operatorv1.NotApplicable)))
 			Expect(instance.Status.Conditions[2].Message).To(Equal("Not Applicable"))
 			Expect(instance.Status.Conditions[2].ObservedGeneration).To(Equal(generation))
+		})
+	})
+
+	Context("Multi-tenant/namespaced reconciliation", func() {
+		tenantANamespace := "tenant-a"
+		tenantBNamespace := "tenant-b"
+
+		BeforeEach(func() {
+			r.multiTenant = true
+		})
+
+		It("should reconcile both with and without namespace provided while namespaced compliance instances exist", func() {
+			// Create the Tenant resources for tenant-a and tenant-b.
+			tenantA := &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "default",
+					Namespace: tenantANamespace,
+				},
+				Spec: operatorv1.TenantSpec{ID: "tenant-a"},
+			}
+			Expect(c.Create(ctx, tenantA)).NotTo(HaveOccurred())
+			tenantB := &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "default",
+					Namespace: tenantBNamespace,
+				},
+				Spec: operatorv1.TenantSpec{ID: "tenant-b"},
+			}
+			Expect(c.Create(ctx, tenantB)).NotTo(HaveOccurred())
+
+			certificateManagerTenantA, err := certificatemanager.Create(c, nil, dns.DefaultClusterDomain, tenantANamespace, certificatemanager.AllowCACreation(), certificatemanager.WithTenant(tenantA))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, certificateManagerTenantA.KeyPair().Secret(tenantANamespace)))
+			trustedBundleWithSystemCAsTenantA, err := certificateManagerTenantA.CreateMultiTenantTrustedBundleWithSystemRootCertificates()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, trustedBundleWithSystemCAsTenantA.ConfigMap(tenantANamespace))).NotTo(HaveOccurred())
+
+			linseedTLSTenantA, err := certificateManagerTenantA.GetOrCreateKeyPair(c, render.TigeraLinseedSecret, tenantANamespace, []string{render.TigeraLinseedSecret})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, linseedTLSTenantA.Secret(tenantANamespace))).NotTo(HaveOccurred())
+
+			certificateManagerTenantB, err := certificatemanager.Create(c, nil, "", tenantBNamespace, certificatemanager.AllowCACreation(), certificatemanager.WithTenant(tenantB))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, certificateManagerTenantB.KeyPair().Secret(tenantBNamespace)))
+			trustedBundleWithSystemCAsTenantB, err := certificateManagerTenantB.CreateMultiTenantTrustedBundleWithSystemRootCertificates()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, trustedBundleWithSystemCAsTenantB.ConfigMap(tenantBNamespace))).NotTo(HaveOccurred())
+
+			linseedTLSTenantB, err := certificateManagerTenantB.GetOrCreateKeyPair(c, render.TigeraLinseedSecret, tenantBNamespace, []string{render.TigeraLinseedSecret})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, linseedTLSTenantB.Secret(tenantBNamespace))).NotTo(HaveOccurred())
+
+			Expect(c.Create(ctx, &operatorv1.Compliance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tigera-secure",
+					Namespace: tenantANamespace,
+				},
+			})).NotTo(HaveOccurred())
+
+			Expect(c.Create(ctx, &operatorv1.Compliance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tigera-secure",
+					Namespace: tenantBNamespace,
+				},
+			})).NotTo(HaveOccurred())
+
+			result, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(0 * time.Second))
+
+			// We check for correct rendering of all resources in compliance_test.go, so use the SA
+			// merely as a proxy here that the creation of our Compliance went smoothly
+			tenantAServiceAccount := corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+				Name:      render.ComplianceServerServiceAccount,
+				Namespace: tenantANamespace,
+			}}
+
+			tenantBServiceAccount := corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+				Name:      render.ComplianceServerServiceAccount,
+				Namespace: tenantBNamespace,
+			}}
+
+			// We called Reconcile without specifying a namespace, so neither of these namespaced objects should
+			// exist yet
+			err = test.GetResource(c, &tenantAServiceAccount)
+			Expect(err).Should(HaveOccurred())
+
+			err = test.GetResource(c, &tenantBServiceAccount)
+			Expect(err).Should(HaveOccurred())
+
+			// Now reconcile only tenant A's namespace and check that its Compliance object exists, but tenant B's
+			// Compliance object still hasn't been reconciled so it should still not exist
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: tenantANamespace}})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			err = test.GetResource(c, &tenantAServiceAccount)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			err = test.GetResource(c, &tenantBServiceAccount)
+			Expect(err).Should(HaveOccurred())
+
+			// Now reconcile tenant B's namespace and check that its Compliance object exists now alongside tenant A's
+			_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: tenantBNamespace}})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			err = test.GetResource(c, &tenantAServiceAccount)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			err = test.GetResource(c, &tenantBServiceAccount)
+			Expect(err).ShouldNot(HaveOccurred())
 		})
 	})
 })

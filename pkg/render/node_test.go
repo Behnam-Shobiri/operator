@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,6 @@ package render_test
 
 import (
 	"fmt"
-	"net"
 	"strings"
 
 	. "github.com/onsi/ginkgo"
@@ -31,7 +30,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
@@ -39,6 +37,7 @@ import (
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	"github.com/tigera/operator/pkg/controller/k8sapi"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
@@ -123,7 +122,7 @@ var _ = Describe("Node rendering tests", func() {
 				}
 				scheme := runtime.NewScheme()
 				Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
-				cli = fake.NewClientBuilder().WithScheme(scheme).Build()
+				cli = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 
 				certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 				Expect(err).NotTo(HaveOccurred())
@@ -142,6 +141,7 @@ var _ = Describe("Node rendering tests", func() {
 					ClusterDomain:   defaultClusterDomain,
 					FelixHealthPort: 9099,
 					UsePSP:          true,
+					IPPools:         defaultInstance.CalicoNetwork.IPPools,
 				}
 			})
 
@@ -199,6 +199,8 @@ var _ = Describe("Node rendering tests", func() {
   "plugins": [
     {
       "type": "calico",
+      "policy_setup_timeout_seconds": 0,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
       "datastore_type": "kubernetes",
       "mtu": 0,
       "nodename_file_optional": false,
@@ -235,12 +237,7 @@ var _ = Describe("Node rendering tests", func() {
 
 				// The DaemonSet should have the correct configuration.
 				ds := dsResource.(*appsv1.DaemonSet)
-				if enableIPv4 {
-					rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "CALICO_IPV4POOL_CIDR", "192.168.1.0/16")
-				}
-				if enableIPv6 {
-					rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "CALICO_IPV6POOL_CIDR", "2001:db8:1::/122")
-				}
+				rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "NO_DEFAULT_POOLS", "true")
 
 				// Node image override results in correct image.
 				Expect(ds.Spec.Template.Spec.Containers).To(HaveLen(1))
@@ -286,7 +283,7 @@ var _ = Describe("Node rendering tests", func() {
 
 				// Verify the Flex volume container image.
 				flexvolContainer := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver")
-				Expect(flexvolContainer.Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentFlexVolume.Image, components.ComponentFlexVolume.Version)))
+				Expect(flexvolContainer.Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				Expect(*flexvolContainer.SecurityContext.AllowPrivilegeEscalation).To(BeTrue())
 				Expect(*flexvolContainer.SecurityContext.Privileged).To(BeTrue())
@@ -332,6 +329,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "FIPS_MODE_ENABLED", Value: "false"},
+					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
 				expectedNodeEnv = configureExpectedNodeEnvIPVersions(expectedNodeEnv, defaultInstance, enableIPv4, enableIPv6)
 				Expect(ds.Spec.Template.Spec.Containers[0].Env).To(ConsistOf(expectedNodeEnv))
@@ -480,6 +478,8 @@ var _ = Describe("Node rendering tests", func() {
       "policy": {
         "type": "k8s"
       },
+      "policy_setup_timeout_seconds": 0,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
       "kubernetes": {
         "kubeconfig": "__KUBECONFIG_FILEPATH__"
       }
@@ -505,12 +505,8 @@ var _ = Describe("Node rendering tests", func() {
 
 				// The DaemonSet should have the correct configuration.
 				ds := dsResource.(*appsv1.DaemonSet)
-				if enableIPv4 {
-					rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "CALICO_IPV4POOL_CIDR", "192.168.1.0/16")
-				}
-				if enableIPv6 {
-					rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "CALICO_IPV6POOL_CIDR", "2001:db8:1::/122")
-				}
+
+				rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "NO_DEFAULT_POOLS", "true")
 
 				cniContainer := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni")
 				rtest.ExpectEnv(cniContainer.Env, "CNI_NET_DIR", "/etc/cni/net.d")
@@ -526,7 +522,7 @@ var _ = Describe("Node rendering tests", func() {
 				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentFlexVolume.Image, components.ComponentFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify the mount-bpffs image and command.
 				mountBpffs := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "mount-bpffs")
@@ -556,7 +552,6 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "CALICO_MANAGE_CNI", Value: "true"},
 					{Name: "CALICO_DISABLE_FILE_LOGGING", Value: "false"},
 					{Name: "CLUSTER_TYPE", Value: "k8s,operator,bgp"},
-					{Name: "FELIX_BPFENABLED", Value: "true"},
 					{Name: "FELIX_DEFAULTENDPOINTTOHOSTACTION", Value: "ACCEPT"},
 					{Name: "FELIX_HEALTHENABLED", Value: "true"},
 					{Name: "FELIX_HEALTHPORT", Value: "9099"},
@@ -578,6 +573,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "FIPS_MODE_ENABLED", Value: "false"},
+					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
 				expectedNodeEnv = configureExpectedNodeEnvIPVersions(expectedNodeEnv, defaultInstance, enableIPv4, enableIPv6)
 				Expect(ds.Spec.Template.Spec.Containers[0].Env).To(ConsistOf(expectedNodeEnv))
@@ -707,6 +703,8 @@ var _ = Describe("Node rendering tests", func() {
       "policy": {
           "type": "k8s"
       },
+      "policy_setup_timeout_seconds": 0,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
       "kubernetes": {
           "kubeconfig": "__KUBECONFIG_FILEPATH__"
       }
@@ -725,7 +723,9 @@ var _ = Describe("Node rendering tests", func() {
 				ds := dsResource.(*appsv1.DaemonSet)
 
 				// Verify env
-				expectedNodeEnv := []corev1.EnvVar{}
+				expectedNodeEnv := []corev1.EnvVar{
+					{Name: "NO_DEFAULT_POOLS", Value: "true"},
+				}
 				if enableIPv4 {
 					expectedNodeEnv = append(expectedNodeEnv, []corev1.EnvVar{
 						{Name: "FELIX_IPINIPMTU", Value: "1450"},
@@ -784,7 +784,7 @@ var _ = Describe("Node rendering tests", func() {
 				rtest.ExpectEnv(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Env, "CNI_NET_DIR", "/etc/cni/net.d")
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("%s%s:%s", components.TigeraRegistry, components.ComponentFlexVolumePrivate.Image, components.ComponentFlexVolumePrivate.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("%s%s:%s", components.TigeraRegistry, components.ComponentTigeraFlexVolume.Image, components.ComponentTigeraFlexVolume.Version)))
 
 				expectedNodeEnv := []corev1.EnvVar{
 					// Default envvars.
@@ -827,6 +827,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_DNSLOGSFILEPERNODELIMIT", Value: "1000"},
 					{Name: "MULTI_INTERFACE_MODE", Value: operatorv1.MultiInterfaceModeNone.Value()},
 					{Name: "FIPS_MODE_ENABLED", Value: "false"},
+					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
 				expectedNodeEnv = configureExpectedNodeEnvIPVersions(expectedNodeEnv, defaultInstance, enableIPv4, enableIPv6)
 				Expect(ds.Spec.Template.Spec.Containers[0].Env).To(ConsistOf(expectedNodeEnv))
@@ -920,7 +921,7 @@ var _ = Describe("Node rendering tests", func() {
 				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentFlexVolume.Image, components.ComponentFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify the mount-bpffs image and command.
 				mountBpffs := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "mount-bpffs")
@@ -1007,6 +1008,7 @@ var _ = Describe("Node rendering tests", func() {
 				defaultInstance.KubernetesProvider = operatorv1.ProviderEKS
 				defaultInstance.CalicoNetwork.BGP = &bgpDisabled
 				defaultInstance.CalicoNetwork.IPPools[0].Encapsulation = operatorv1.EncapsulationVXLAN
+				cfg.IPPools = defaultInstance.CalicoNetwork.IPPools
 				component := render.Node(&cfg)
 				Expect(component.ResolveImages(nil)).To(BeNil())
 				resources, _ := component.Objects()
@@ -1047,6 +1049,8 @@ var _ = Describe("Node rendering tests", func() {
       "policy": {
           "type": "k8s"
       },
+      "policy_setup_timeout_seconds": 0,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
       "kubernetes": {
           "kubeconfig": "__KUBECONFIG_FILEPATH__"
       }
@@ -1064,12 +1068,8 @@ var _ = Describe("Node rendering tests", func() {
 
 				// The DaemonSet should have the correct configuration.
 				ds := dsResource.(*appsv1.DaemonSet)
-				if enableIPv4 {
-					rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "CALICO_IPV4POOL_CIDR", "192.168.1.0/16")
-				}
-				if enableIPv6 {
-					rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "CALICO_IPV6POOL_CIDR", "2001:db8:1::/122")
-				}
+
+				rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "NO_DEFAULT_POOLS", "true")
 
 				cniContainer := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni")
 				rtest.ExpectEnv(cniContainer.Env, "CNI_NET_DIR", "/etc/cni/net.d")
@@ -1084,7 +1084,7 @@ var _ = Describe("Node rendering tests", func() {
 				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentFlexVolume.Image, components.ComponentFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify env
 				expectedNodeEnv := []corev1.EnvVar{
@@ -1115,6 +1115,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "FIPS_MODE_ENABLED", Value: "false"},
+					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
 				expectedNodeEnv = configureExpectedNodeEnvIPVersions(expectedNodeEnv, defaultInstance, enableIPv4, enableIPv6)
 				Expect(ds.Spec.Template.Spec.Containers[0].Env).To(ConsistOf(expectedNodeEnv))
@@ -1240,7 +1241,7 @@ var _ = Describe("Node rendering tests", func() {
 				Expect(len(ds.Spec.Template.Spec.InitContainers)).To(Equal(1))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentFlexVolume.Image, components.ComponentFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify env
 				expectedNodeEnv := []corev1.EnvVar{
@@ -1421,6 +1422,7 @@ var _ = Describe("Node rendering tests", func() {
 				defaultInstance.KubernetesProvider = operatorv1.ProviderEKS
 				defaultInstance.CalicoNetwork.BGP = &disabled
 				defaultInstance.CalicoNetwork.IPPools[0].Encapsulation = operatorv1.EncapsulationVXLAN
+				cfg.IPPools = defaultInstance.CalicoNetwork.IPPools
 				component := render.Node(&cfg)
 				Expect(component.ResolveImages(nil)).To(BeNil())
 				resources, _ := component.Objects()
@@ -1461,6 +1463,8 @@ var _ = Describe("Node rendering tests", func() {
       "policy": {
           "type": "k8s"
       },
+      "policy_setup_timeout_seconds": 0,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
       "kubernetes": {
           "kubeconfig": "__KUBECONFIG_FILEPATH__"
       }
@@ -1478,12 +1482,8 @@ var _ = Describe("Node rendering tests", func() {
 
 				// The DaemonSet should have the correct configuration.
 				ds := dsResource.(*appsv1.DaemonSet)
-				if enableIPv4 {
-					rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "CALICO_IPV4POOL_CIDR", "192.168.1.0/16")
-				}
-				if enableIPv6 {
-					rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "CALICO_IPV6POOL_CIDR", "2001:db8:1::/122")
-				}
+
+				rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "NO_DEFAULT_POOLS", "true")
 
 				cniContainer := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni")
 				rtest.ExpectEnv(cniContainer.Env, "CNI_NET_DIR", "/etc/cni/net.d")
@@ -1498,7 +1498,7 @@ var _ = Describe("Node rendering tests", func() {
 				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentFlexVolume.Image, components.ComponentFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify env
 				expectedNodeEnv := []corev1.EnvVar{
@@ -1529,6 +1529,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "FIPS_MODE_ENABLED", Value: "false"},
+					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
 				expectedNodeEnv = configureExpectedNodeEnvIPVersions(expectedNodeEnv, defaultInstance, enableIPv4, enableIPv6)
 				Expect(ds.Spec.Template.Spec.Containers[0].Env).To(ConsistOf(expectedNodeEnv))
@@ -1651,7 +1652,7 @@ var _ = Describe("Node rendering tests", func() {
 				Expect(len(ds.Spec.Template.Spec.InitContainers)).To(Equal(1))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentFlexVolume.Image, components.ComponentFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify env
 				expectedNodeEnv := []corev1.EnvVar{
@@ -1863,6 +1864,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "FIPS_MODE_ENABLED", Value: "false"},
+					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
 				expectedNodeEnv = configureExpectedNodeEnvIPVersions(expectedNodeEnv, defaultInstance, enableIPv4, enableIPv6)
 				Expect(ds.Spec.Template.Spec.Containers[0].Env).To(ConsistOf(expectedNodeEnv))
@@ -1924,7 +1926,7 @@ var _ = Describe("Node rendering tests", func() {
 				rtest.ExpectEnv(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Env, "CNI_NET_DIR", "/var/run/multus/cni/net.d")
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("%s%s:%s", components.TigeraRegistry, components.ComponentFlexVolumePrivate.Image, components.ComponentFlexVolumePrivate.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("%s%s:%s", components.TigeraRegistry, components.ComponentTigeraFlexVolume.Image, components.ComponentTigeraFlexVolume.Version)))
 
 				expectedNodeEnv := []corev1.EnvVar{
 					// Default envvars.
@@ -1967,6 +1969,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_DNSLOGSFILEPERNODELIMIT", Value: "1000"},
 					{Name: "MULTI_INTERFACE_MODE", Value: operatorv1.MultiInterfaceModeNone.Value()},
 					{Name: "FIPS_MODE_ENABLED", Value: "false"},
+					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
 				expectedNodeEnv = configureExpectedNodeEnvIPVersions(expectedNodeEnv, defaultInstance, enableIPv4, enableIPv6)
 				Expect(ds.Spec.Template.Spec.Containers[0].Env).To(ConsistOf(expectedNodeEnv))
@@ -2046,6 +2049,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHACAFILE", Value: certificatemanagement.TrustedCertBundleMountPath},
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
+					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 					// Tigera-specific envvars
 					{Name: "FELIX_PROMETHEUSREPORTERENABLED", Value: "true"},
 					{Name: "FELIX_PROMETHEUSREPORTERPORT", Value: "9081"},
@@ -2280,218 +2284,6 @@ var _ = Describe("Node rendering tests", func() {
 				Expect(ns["projectcalico.org/operator-node-migration"]).To(Equal("migrated"))
 			})
 
-			trueValue := true
-			falseValue := false
-			DescribeTable("test IP Pool configuration",
-				func(pool operatorv1.IPPool, expect map[string]string) {
-					// Provider does not matter for IPPool configuration
-					defaultInstance.CalicoNetwork.IPPools = []operatorv1.IPPool{pool}
-					component := render.Node(&cfg)
-					Expect(component.ResolveImages(nil)).To(BeNil())
-					resources, _ := component.Objects()
-					Expect(len(resources)).To(Equal(defaultNumExpectedResources))
-
-					dsResource := rtest.GetResource(resources, "calico-node", "calico-system", "apps", "v1", "DaemonSet")
-					Expect(dsResource).ToNot(BeNil())
-
-					// The DaemonSet should have the correct configuration.
-					ds := dsResource.(*appsv1.DaemonSet)
-					nodeEnvs := ds.Spec.Template.Spec.Containers[0].Env
-
-					for _, envVar := range []string{
-						"CALICO_IPV4POOL_CIDR",
-						"CALICO_IPV4POOL_IPIP",
-						"CALICO_IPV4POOL_VXLAN",
-						"CALICO_IPV4POOL_NAT_OUTGOING",
-						"CALICO_IPV4POOL_NODE_SELECTOR",
-						"CALICO_IPV4POOL_DISABLE_BGP_EXPORT",
-						"CALICO_IPV6POOL_DISABLE_BGP_EXPORT",
-					} {
-						v, ok := expect[envVar]
-						if ok {
-							Expect(nodeEnvs).To(ContainElement(corev1.EnvVar{Name: envVar, Value: v}))
-						} else {
-							found := false
-							for _, ev := range nodeEnvs {
-								if ev.Name == envVar {
-									found = true
-									break
-								}
-							}
-							Expect(found).To(BeFalse(), "Expected EnvVars %v to not have %s", nodeEnvs, envVar)
-						}
-					}
-				},
-
-				Entry("Default pool",
-					operatorv1.IPPool{
-						CIDR: "192.168.0.0/16",
-					},
-					map[string]string{
-						"CALICO_IPV4POOL_CIDR": "192.168.0.0/16",
-						"CALICO_IPV4POOL_IPIP": "Always",
-					}),
-				Entry("Pool with nat outgoing disabled",
-					operatorv1.IPPool{
-						CIDR:        "172.16.0.0/24",
-						NATOutgoing: "Disabled",
-					},
-					map[string]string{
-						"CALICO_IPV4POOL_CIDR":         "172.16.0.0/24",
-						"CALICO_IPV4POOL_IPIP":         "Always",
-						"CALICO_IPV4POOL_NAT_OUTGOING": "false",
-					}),
-				Entry("Pool with nat outgoing enabled",
-					operatorv1.IPPool{
-						CIDR:        "172.16.0.0/24",
-						NATOutgoing: "Enabled",
-					},
-					map[string]string{
-						"CALICO_IPV4POOL_CIDR": "172.16.0.0/24",
-						"CALICO_IPV4POOL_IPIP": "Always",
-						// Enabled is the default so we don't set
-						// NAT_OUTGOING if it is enabled.
-					}),
-				Entry("Pool with VXLAN enabled (IPv6)",
-					operatorv1.IPPool{
-						CIDR:          "fc00::/48",
-						Encapsulation: operatorv1.EncapsulationVXLAN,
-					},
-					map[string]string{
-						"CALICO_IPV6POOL_CIDR":  "fc00::/48",
-						"CALICO_IPV6POOL_VXLAN": "Always",
-					}),
-				Entry("Pool with VXLAN cross subnet enabled (IPv6)",
-					operatorv1.IPPool{
-						CIDR:          "fc00::/48",
-						Encapsulation: operatorv1.EncapsulationVXLANCrossSubnet,
-					},
-					map[string]string{
-						"CALICO_IPV6POOL_CIDR":  "fc00::/48",
-						"CALICO_IPV6POOL_VXLAN": "CrossSubnet",
-					}),
-				Entry("Pool with nat outgoing disabled (IPv6)",
-					operatorv1.IPPool{
-						CIDR:        "fc00::/48",
-						NATOutgoing: "Disabled",
-					},
-					map[string]string{
-						"CALICO_IPV6POOL_CIDR": "fc00::/48",
-						// Disabled is the default so we don't set
-						// NAT_OUTGOING if it is disabled.
-					}),
-				Entry("Pool with nat outgoing enabled (IPv6)",
-					operatorv1.IPPool{
-						CIDR:        "fc00::/48",
-						NATOutgoing: "Enabled",
-					},
-					map[string]string{
-						"CALICO_IPV6POOL_CIDR":         "fc00::/48",
-						"CALICO_IPV6POOL_NAT_OUTGOING": "true",
-					}),
-				Entry("Pool with CrossSubnet",
-					operatorv1.IPPool{
-						CIDR:          "172.16.0.0/24",
-						Encapsulation: operatorv1.EncapsulationIPIPCrossSubnet,
-					},
-					map[string]string{
-						"CALICO_IPV4POOL_CIDR": "172.16.0.0/24",
-						"CALICO_IPV4POOL_IPIP": "CrossSubnet",
-					}),
-				Entry("Pool with VXLAN",
-					operatorv1.IPPool{
-						CIDR:          "172.16.0.0/24",
-						Encapsulation: operatorv1.EncapsulationVXLAN,
-					},
-					map[string]string{
-						"CALICO_IPV4POOL_CIDR":  "172.16.0.0/24",
-						"CALICO_IPV4POOL_VXLAN": "Always",
-					}),
-				Entry("Pool with VXLANCrossSubnet",
-					operatorv1.IPPool{
-						CIDR:          "172.16.0.0/24",
-						Encapsulation: operatorv1.EncapsulationVXLANCrossSubnet,
-					},
-					map[string]string{
-						"CALICO_IPV4POOL_CIDR":  "172.16.0.0/24",
-						"CALICO_IPV4POOL_VXLAN": "CrossSubnet",
-					}),
-				Entry("Pool with no encapsulation",
-					operatorv1.IPPool{
-						CIDR:          "172.16.0.0/24",
-						Encapsulation: operatorv1.EncapsulationNone,
-					},
-					map[string]string{
-						"CALICO_IPV4POOL_CIDR": "172.16.0.0/24",
-						"CALICO_IPV4POOL_IPIP": "Never",
-					}),
-				Entry("Pool with node selector",
-					operatorv1.IPPool{
-						CIDR:         "172.16.0.0/24",
-						NodeSelector: "has(thiskey)",
-					},
-					map[string]string{
-						"CALICO_IPV4POOL_CIDR":          "172.16.0.0/24",
-						"CALICO_IPV4POOL_IPIP":          "Always",
-						"CALICO_IPV4POOL_NODE_SELECTOR": "has(thiskey)",
-					}),
-				Entry("Pool with v4 disable BGP export set to true",
-					operatorv1.IPPool{
-						CIDR:             "172.16.0.0/24",
-						DisableBGPExport: &trueValue,
-					},
-					map[string]string{
-						"CALICO_IPV4POOL_CIDR":               "172.16.0.0/24",
-						"CALICO_IPV4POOL_IPIP":               "Always",
-						"CALICO_IPV4POOL_DISABLE_BGP_EXPORT": "true",
-					}),
-				Entry("Pool with v4 disable BGP export set to false",
-					operatorv1.IPPool{
-						CIDR:             "172.16.0.0/24",
-						DisableBGPExport: &falseValue,
-					},
-					map[string]string{
-						"CALICO_IPV4POOL_CIDR":               "172.16.0.0/24",
-						"CALICO_IPV4POOL_IPIP":               "Always",
-						"CALICO_IPV4POOL_DISABLE_BGP_EXPORT": "false",
-					}),
-				Entry("Pool with v6 disable BGP export set to true",
-					operatorv1.IPPool{
-						CIDR:             "fc00::/48",
-						DisableBGPExport: &trueValue,
-					},
-					map[string]string{
-						"CALICO_IPV6POOL_CIDR":               "fc00::/48",
-						"CALICO_IPV6POOL_IPIP":               "Always",
-						"CALICO_IPV6POOL_DISABLE_BGP_EXPORT": "true",
-					}),
-				Entry("Pool with v6 disable BGP export set to false",
-					operatorv1.IPPool{
-						CIDR:             "fc00::/48",
-						DisableBGPExport: &falseValue,
-					},
-					map[string]string{
-						"CALICO_IPV6POOL_CIDR":               "fc00::/48",
-						"CALICO_IPV6POOL_IPIP":               "Always",
-						"CALICO_IPV6POOL_DISABLE_BGP_EXPORT": "false",
-					}),
-				Entry("Pool with all fields set",
-					operatorv1.IPPool{
-						CIDR:             "172.16.0.0/24",
-						Encapsulation:    operatorv1.EncapsulationIPIP,
-						NATOutgoing:      "Disabled",
-						NodeSelector:     "has(thiskey)",
-						DisableBGPExport: &trueValue,
-					},
-					map[string]string{
-						"CALICO_IPV4POOL_CIDR":               "172.16.0.0/24",
-						"CALICO_IPV4POOL_IPIP":               "Always",
-						"CALICO_IPV4POOL_NAT_OUTGOING":       "false",
-						"CALICO_IPV4POOL_NODE_SELECTOR":      "has(thiskey)",
-						"CALICO_IPV4POOL_DISABLE_BGP_EXPORT": "true",
-					}),
-			)
-
 			It("should not enable prometheus metrics if NodeMetricsPort is nil", func() {
 				defaultInstance.Variant = operatorv1.TigeraSecureEnterprise
 				defaultInstance.NodeMetricsPort = nil
@@ -2571,6 +2363,27 @@ var _ = Describe("Node rendering tests", func() {
 				Expect(ds.Spec.UpdateStrategy.RollingUpdate.MaxUnavailable).To(Equal(&two))
 			})
 
+			It("should render LinuxPolicySetupTimeoutSeconds if a custom value was set", func() {
+				two := int32(2)
+				defaultInstance.CalicoNetwork.LinuxPolicySetupTimeoutSeconds = &two
+				component := render.Node(&cfg)
+				Expect(component.ResolveImages(nil)).To(BeNil())
+				resources, _ := component.Objects()
+				Expect(len(resources)).To(Equal(defaultNumExpectedResources))
+
+				dsResource := rtest.GetResource(resources, "calico-node", "calico-system", "apps", "v1", "DaemonSet")
+				Expect(dsResource).ToNot(BeNil())
+				ds := dsResource.(*appsv1.DaemonSet)
+				Expect(ds).ToNot(BeNil())
+
+				for _, c := range ds.Spec.Template.Spec.Containers {
+					Expect(c.Env).To(ContainElement(corev1.EnvVar{
+						Name:  "FELIX_ENDPOINTSTATUSPATHPREFIX",
+						Value: "/var/run/calico",
+					}))
+				}
+			})
+
 			It("should render cni config without portmap when HostPorts disabled", func() {
 				expectedResources := []struct {
 					name    string
@@ -2633,6 +2446,8 @@ var _ = Describe("Node rendering tests", func() {
       "policy": {
           "type": "k8s"
       },
+      "policy_setup_timeout_seconds": 0,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
       "kubernetes": {
           "kubeconfig": "__KUBECONFIG_FILEPATH__"
       }
@@ -2686,7 +2501,8 @@ var _ = Describe("Node rendering tests", func() {
 					{
 						Key:   "net.ipv4.tcp_keepalive_intvl",
 						Value: "15",
-					}, {
+					},
+					{
 						Key:   "net.ipv4.tcp_keepalive_probes",
 						Value: "6",
 					},
@@ -2732,6 +2548,8 @@ var _ = Describe("Node rendering tests", func() {
       "policy": {
         "type": "k8s"
       },
+      "policy_setup_timeout_seconds": 0,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
       "type": "calico"
     },
     {
@@ -2748,24 +2566,68 @@ var _ = Describe("Node rendering tests", func() {
       "type": "portmap"
     },
     {
-      "sysctl": [
+      "sysctl":
 		  {
-			"key": "net.ipv4.tcp_keepalive_intvl",
-			"value": "15"
+			"net.ipv4.tcp_keepalive_intvl": "15",
+			"net.ipv4.tcp_keepalive_probes": "6",
+			"net.ipv4.tcp_keepalive_time": "40"
 		  },
-		  {
-			"key": "net.ipv4.tcp_keepalive_probes",
-			"value": "6"
-		  },
-		  {
-			"key": "net.ipv4.tcp_keepalive_time",
-		    "value": "40"
-		  }
-		],
       "type": "tuning"
 	}
   ]
   }`, enableIPv4, enableIPv6)))
+			})
+
+			It("should render a proper 'policy_setup_timeout_seconds' setting in the cni config", func() {
+				one := int32(1)
+				defaultInstance.CalicoNetwork.LinuxPolicySetupTimeoutSeconds = &one
+				component := render.Node(&cfg)
+				Expect(component.ResolveImages(nil)).To(BeNil())
+				resources, _ := component.Objects()
+				Expect(len(resources)).To(Equal(defaultNumExpectedResources))
+
+				// Should render the correct resources.
+				cniCmResource := rtest.GetResource(resources, "cni-config", "calico-system", "", "v1", "ConfigMap")
+				Expect(cniCmResource).ToNot(BeNil())
+				cniCm := cniCmResource.(*corev1.ConfigMap)
+				Expect(cniCm.Data["config"]).To(MatchJSON(fmt.Sprintf(`{
+  "name": "k8s-pod-network",
+  "cniVersion": "0.3.1",
+  "plugins": [
+    {
+      "type": "calico",
+      "datastore_type": "kubernetes",
+      "mtu": 0,
+      "nodename_file_optional": false,
+      "log_level": "Debug",
+      "log_file_path": "/var/log/calico/cni/cni.log",
+      "log_file_max_size": 1,
+      "log_file_max_age": 5,
+      "log_file_max_count": 5,
+      "ipam": {
+          "type": "calico-ipam",
+          "assign_ipv4" : "%t",
+          "assign_ipv6" : "%t"
+      },
+      "container_settings": {
+          "allow_ip_forwarding": false
+      },
+      "policy_setup_timeout_seconds": 1,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
+      "policy": {
+          "type": "k8s"
+      },
+      "kubernetes": {
+          "kubeconfig": "__KUBECONFIG_FILEPATH__"
+      }
+    },
+    {
+      "type": "bandwidth",
+      "capabilities": {"bandwidth": true}
+    },
+    {"type": "portmap", "snat": true, "capabilities": {"portMappings": true}}
+  ]
+}`, enableIPv4, enableIPv6)))
 			})
 
 			It("should render a proper 'allow_ip_forwarding' container setting in the cni config", func() {
@@ -2802,6 +2664,8 @@ var _ = Describe("Node rendering tests", func() {
       "container_settings": {
           "allow_ip_forwarding": true
       },
+      "policy_setup_timeout_seconds": 0,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
       "policy": {
           "type": "k8s"
       },
@@ -2869,6 +2733,8 @@ var _ = Describe("Node rendering tests", func() {
           "type": "host-local",
           %s
       },
+      "policy_setup_timeout_seconds": 0,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
       "container_settings": { "allow_ip_forwarding": false },
       "policy": { "type": "k8s" },
       "kubernetes": { "kubeconfig": "__KUBECONFIG_FILEPATH__" }
@@ -2895,6 +2761,8 @@ var _ = Describe("Node rendering tests", func() {
 						NodeSelector:  "all()",
 					},
 				}
+				cfg.IPPools = defaultInstance.CalicoNetwork.IPPools
+
 				component := render.Node(&cfg)
 				Expect(component.ResolveImages(nil)).To(BeNil())
 				resources, _ := component.Objects()
@@ -2920,8 +2788,10 @@ var _ = Describe("Node rendering tests", func() {
       "log_file_max_count": 5,
       "ipam": {
           "type": "host-local",
-	  "ranges": [[{"subnet": "usePodCidr"}], [{"subnet": "usePodCidrIPv6"}]]
+          "ranges": [[{"subnet": "usePodCidr"}], [{"subnet": "usePodCidrIPv6"}]]
       },
+      "policy_setup_timeout_seconds": 0,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
       "container_settings": { "allow_ip_forwarding": false },
       "policy": { "type": "k8s" },
       "kubernetes": { "kubeconfig": "__KUBECONFIG_FILEPATH__" }
@@ -2942,6 +2812,8 @@ var _ = Describe("Node rendering tests", func() {
 						NodeSelector:  "all()",
 					},
 				}
+				cfg.IPPools = defaultInstance.CalicoNetwork.IPPools
+
 				component := render.Node(&cfg)
 				Expect(component.ResolveImages(nil)).To(BeNil())
 				resources, _ := component.Objects()
@@ -2969,6 +2841,8 @@ var _ = Describe("Node rendering tests", func() {
           "type": "host-local",
           "subnet" : "usePodCidrIPv6"
       },
+      "policy_setup_timeout_seconds": 0,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
       "container_settings": { "allow_ip_forwarding": false },
       "policy": { "type": "k8s" },
       "kubernetes": { "kubeconfig": "__KUBECONFIG_FILEPATH__" }
@@ -2998,6 +2872,8 @@ var _ = Describe("Node rendering tests", func() {
   "plugins": [
     {
       "type": "calico",
+      "policy_setup_timeout_seconds": 0,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
       "datastore_type": "kubernetes",
       "mtu": 0,
       "nodename_file_optional": false,
@@ -3052,31 +2928,6 @@ var _ = Describe("Node rendering tests", func() {
 				Expect(ds).ToNot(BeNil())
 
 				Expect(ds.Spec.Template.Annotations["container.apparmor.security.beta.kubernetes.io/calico-node"]).To(Equal(seccompProf))
-			})
-
-			It("should set TIGERA_*_SECURITY_GROUP variables when AmazonCloudIntegration is defined", func() {
-				cfg.AmazonCloudIntegration = &operatorv1.AmazonCloudIntegration{
-					Spec: operatorv1.AmazonCloudIntegrationSpec{
-						NodeSecurityGroupIDs: []string{"sg-nodeid", "sg-masterid"},
-						PodSecurityGroupID:   "sg-podsgid",
-					},
-				}
-				component := render.Node(&cfg)
-				Expect(component.ResolveImages(nil)).To(BeNil())
-				resources, _ := component.Objects()
-
-				dsResource := rtest.GetResource(resources, "calico-node", "calico-system", "apps", "v1", "DaemonSet")
-				Expect(dsResource).ToNot(BeNil())
-
-				// Assert on expected env vars.
-				expectedEnvVars := []corev1.EnvVar{
-					{Name: "TIGERA_DEFAULT_SECURITY_GROUPS", Value: "sg-nodeid,sg-masterid"},
-					{Name: "TIGERA_POD_SECURITY_GROUP", Value: "sg-podsgid"},
-				}
-				ds := dsResource.(*appsv1.DaemonSet)
-				for _, v := range expectedEnvVars {
-					Expect(ds.Spec.Template.Spec.Containers[0].Env).To(ContainElement(v))
-				}
 			})
 
 			It("should render resourcerequirements", func() {
@@ -3144,6 +2995,7 @@ var _ = Describe("Node rendering tests", func() {
 					Encapsulation: operatorv1.EncapsulationNone,
 					NATOutgoing:   operatorv1.NATOutgoingEnabled,
 				}}
+				cfg.IPPools = defaultInstance.CalicoNetwork.IPPools
 				component := render.Node(&cfg)
 				Expect(component.ResolveImages(nil)).To(BeNil())
 				resources, _ := component.Objects()
@@ -3165,6 +3017,8 @@ var _ = Describe("Node rendering tests", func() {
   "plugins": [
     {
       "type": "calico",
+      "policy_setup_timeout_seconds": 0,
+      "endpoint_status_dir": "/var/run/calico/endpoint-status",
       "datastore_type": "kubernetes",
       "mtu": 0,
       "nodename_file_optional": false,
@@ -3175,7 +3029,7 @@ var _ = Describe("Node rendering tests", func() {
       "log_file_max_count": 5,
       "ipam": {
           "type": "host-local",
-		  "subnet": "usePodCidr"
+          "subnet": "usePodCidr"
       },
       "container_settings": {
           "allow_ip_forwarding": false
@@ -3200,7 +3054,7 @@ var _ = Describe("Node rendering tests", func() {
 
 				// The DaemonSet should have the correct configuration.
 				ds := dsResource.(*appsv1.DaemonSet)
-				rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "CALICO_IPV4POOL_CIDR", "192.168.1.0/16")
+				rtest.ExpectEnv(ds.Spec.Template.Spec.Containers[0].Env, "NO_DEFAULT_POOLS", "true")
 
 				cniContainer := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni")
 				rtest.ExpectEnv(cniContainer.Env, "CNI_NET_DIR", "/etc/cni/net.d")
@@ -3215,7 +3069,7 @@ var _ = Describe("Node rendering tests", func() {
 				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentFlexVolume.Image, components.ComponentFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify env
 				expectedNodeEnv := []corev1.EnvVar{
@@ -3247,6 +3101,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHACAFILE", Value: certificatemanagement.TrustedCertBundleMountPath},
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
+					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
 				expectedNodeEnv = configureExpectedNodeEnvIPVersions(expectedNodeEnv, defaultInstance, enableIPv4, enableIPv6)
 				Expect(ds.Spec.Template.Spec.Containers[0].Env).To(ConsistOf(expectedNodeEnv))
@@ -3706,38 +3561,6 @@ func verifyProbesAndLifecycle(ds *appsv1.DaemonSet, isOpenshift, isEnterprise bo
 
 // configureExpectedNodeEnvIPVersions is a helper function to configure the right expected calico-node env var values based on if IPv4 and/or IPv6 are enabled
 func configureExpectedNodeEnvIPVersions(expectedNodeEnv []corev1.EnvVar, defaultInstance *operatorv1.InstallationSpec, enableIPv4, enableIPv6 bool) []corev1.EnvVar {
-	for _, pool := range defaultInstance.CalicoNetwork.IPPools {
-		ip, _, err := net.ParseCIDR(pool.CIDR)
-		Expect(err).NotTo(HaveOccurred())
-		if ip.To4() != nil {
-			expectedNodeEnv = append(expectedNodeEnv, corev1.EnvVar{Name: "CALICO_IPV4POOL_CIDR", Value: pool.CIDR})
-			switch pool.Encapsulation {
-			case operatorv1.EncapsulationIPIP:
-				expectedNodeEnv = append(expectedNodeEnv, corev1.EnvVar{Name: "CALICO_IPV4POOL_IPIP", Value: "Always"})
-			case operatorv1.EncapsulationIPIPCrossSubnet:
-				expectedNodeEnv = append(expectedNodeEnv, corev1.EnvVar{Name: "CALICO_IPV4POOL_IPIP", Value: "CrossSubnet"})
-			case operatorv1.EncapsulationVXLAN:
-				expectedNodeEnv = append(expectedNodeEnv, corev1.EnvVar{Name: "CALICO_IPV4POOL_VXLAN", Value: "Always"})
-			case operatorv1.EncapsulationVXLANCrossSubnet:
-				expectedNodeEnv = append(expectedNodeEnv, corev1.EnvVar{Name: "CALICO_IPV4POOL_VXLAN", Value: "CrossSubnet"})
-			case operatorv1.EncapsulationNone:
-				expectedNodeEnv = append(expectedNodeEnv, corev1.EnvVar{Name: "CALICO_IPV4POOL_IPIP", Value: "Never"})
-			default:
-				// IPIP is the default encapsulation
-				expectedNodeEnv = append(expectedNodeEnv, corev1.EnvVar{Name: "CALICO_IPV4POOL_IPIP", Value: "Always"})
-			}
-		} else {
-			expectedNodeEnv = append(expectedNodeEnv, []corev1.EnvVar{
-				{Name: "CALICO_IPV6POOL_CIDR", Value: pool.CIDR},
-			}...)
-			switch pool.Encapsulation {
-			case operatorv1.EncapsulationVXLAN:
-				expectedNodeEnv = append(expectedNodeEnv, corev1.EnvVar{Name: "CALICO_IPV6POOL_VXLAN", Value: "Always"})
-			case operatorv1.EncapsulationVXLANCrossSubnet:
-				expectedNodeEnv = append(expectedNodeEnv, corev1.EnvVar{Name: "CALICO_IPV6POOL_VXLAN", Value: "CrossSubnet"})
-			}
-		}
-	}
 	if enableIPv4 {
 		expectedNodeEnv = append(expectedNodeEnv, []corev1.EnvVar{
 			{Name: "IP", Value: "autodetect"},

@@ -1,4 +1,4 @@
-// Copyright (c) 2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,40 +19,38 @@ import (
 	"fmt"
 	"time"
 
-	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
-	"github.com/tigera/operator/pkg/render/common/networkpolicy"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
-
-	operatorv1 "github.com/tigera/operator/api/v1"
-	"github.com/tigera/operator/pkg/common"
-	"github.com/tigera/operator/pkg/controller/certificatemanager"
-	logstoragecommon "github.com/tigera/operator/pkg/controller/logstorage/common"
-	"github.com/tigera/operator/pkg/controller/options"
-	"github.com/tigera/operator/pkg/controller/status"
-	"github.com/tigera/operator/pkg/controller/utils"
-	"github.com/tigera/operator/pkg/controller/utils/imageset"
-	"github.com/tigera/operator/pkg/dns"
-	"github.com/tigera/operator/pkg/render"
-	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
-	"github.com/tigera/operator/pkg/render/logstorage/esmetrics"
-	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
+	operatorv1 "github.com/tigera/operator/api/v1"
+	"github.com/tigera/operator/pkg/common"
+	"github.com/tigera/operator/pkg/controller/certificatemanager"
+	logstoragecommon "github.com/tigera/operator/pkg/controller/logstorage/common"
+	"github.com/tigera/operator/pkg/controller/logstorage/initializer"
+	"github.com/tigera/operator/pkg/controller/options"
+	"github.com/tigera/operator/pkg/controller/status"
+	"github.com/tigera/operator/pkg/controller/utils"
+	"github.com/tigera/operator/pkg/controller/utils/imageset"
+	"github.com/tigera/operator/pkg/ctrlruntime"
+	"github.com/tigera/operator/pkg/dns"
+	"github.com/tigera/operator/pkg/render"
+	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
+	"github.com/tigera/operator/pkg/render/common/networkpolicy"
+	"github.com/tigera/operator/pkg/render/logstorage/esmetrics"
+	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
 
 var log = logf.Log.WithName("controller_logstorage_esmetrics")
-
-const (
-	tigeraStatusName = "log-storage-esmetrics"
-)
 
 type ESMetricsSubController struct {
 	client         client.Client
@@ -79,25 +77,25 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	r := &ESMetricsSubController{
 		client:         mgr.GetClient(),
 		scheme:         mgr.GetScheme(),
-		status:         status.New(mgr.GetClient(), tigeraStatusName, opts.KubernetesVersion),
+		status:         status.New(mgr.GetClient(), initializer.TigeraStatusLogStorageESMetrics, opts.KubernetesVersion),
 		clusterDomain:  opts.ClusterDomain,
 		provider:       opts.DetectedProvider,
 		tierWatchReady: &utils.ReadyFlag{},
 	}
 	r.status.Run(opts.ShutdownContext)
 
-	c, err := controller.New("log-storage-esmetrics-controller", mgr, controller.Options{Reconciler: r})
+	c, err := ctrlruntime.NewController("log-storage-esmetrics-controller", mgr, controller.Options{Reconciler: r})
 	if err != nil {
 		return fmt.Errorf("log-storage-esmetrics-controller failed to establish a connection to k8s: %w", err)
 	}
 
-	if err = c.Watch(&source.Kind{Type: &operatorv1.LogStorage{}}, &handler.EnqueueRequestForObject{}); err != nil {
+	if err = c.WatchObject(&operatorv1.LogStorage{}, &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("log-storage-esmetrics-controller failed to watch LogStorage resource: %w", err)
 	}
 	if err = utils.AddInstallationWatch(c); err != nil {
 		return fmt.Errorf("log-storage-esmetrics-controller failed to watch Installation resource: %w", err)
 	}
-	if err = c.Watch(&source.Kind{Type: &operatorv1.ManagementClusterConnection{}}, &handler.EnqueueRequestForObject{}); err != nil {
+	if err = c.WatchObject(&operatorv1.ManagementClusterConnection{}, &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("log-storage-esmetrics-controller failed to watch ManagementClusterConnection resource: %w", err)
 	}
 	if err = utils.AddConfigMapWatch(c, certificatemanagement.TrustedCertConfigMapName, render.ElasticsearchNamespace, &handler.EnqueueRequestForObject{}); err != nil {
@@ -171,7 +169,7 @@ func (r *ESMetricsSubController) Reconcile(ctx context.Context, request reconcil
 	// Ensure the allow-tigera tier exists, before rendering any network policies within it.
 	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.TigeraComponentTierName}, &v3.Tier{}); err != nil {
 		if errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for allow-tigera tier to be created", err, reqLogger)
+			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for allow-tigera tier to be created, see the 'tiers' TigeraStatus for more information", err, reqLogger)
 			return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 		} else {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying allow-tigera tier", err, reqLogger)
@@ -222,6 +220,10 @@ func (r *ESMetricsSubController) Reconcile(ctx context.Context, request reconcil
 			log,
 		)
 		return reconcile.Result{}, err
+	} else if serverKeyPair == nil {
+		// Possibly LogStorage was removed and caused the secret to have been deleted.
+		r.status.SetDegraded(operatorv1.ResourceNotReady, fmt.Sprintf("Waiting for secret %s/%s to be created", render.ElasticsearchNamespace, esmetrics.ElasticsearchMetricsServerTLSSecret), nil, reqLogger)
+		return reconcile.Result{}, nil
 	}
 
 	trustedBundle, err := cm.LoadTrustedBundle(ctx, r.client, render.ElasticsearchNamespace)
@@ -242,6 +244,7 @@ func (r *ESMetricsSubController) Reconcile(ctx context.Context, request reconcil
 		ServerTLS:            serverKeyPair,
 		TrustedBundle:        trustedBundle,
 		UsePSP:               r.usePSP,
+		LogStorage:           logStorage,
 	}
 	esMetricsComponent := esmetrics.ElasticsearchMetrics(esMetricsCfg)
 	if err = imageset.ApplyImageSet(ctx, r.client, variant, esMetricsComponent); err != nil {

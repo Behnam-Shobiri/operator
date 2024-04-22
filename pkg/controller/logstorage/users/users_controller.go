@@ -1,4 +1,4 @@
-// Copyright (c) 2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,10 +18,14 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/tigera/operator/pkg/controller/logstorage/initializer"
+
 	esv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/elasticsearch/v1"
 	"github.com/elastic/cloud-on-k8s/v2/pkg/utils/stringsutil"
 	"github.com/go-logr/logr"
 	operatorv1 "github.com/tigera/operator/api/v1"
+	"github.com/tigera/operator/pkg/ctrlruntime"
+	"github.com/tigera/operator/pkg/render/logstorage/dashboards"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/tigera/operator/pkg/controller/options"
@@ -40,7 +44,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 var log = logf.Log.WithName("controller_logstorage_users")
@@ -80,14 +83,14 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		client:          mgr.GetClient(),
 		scheme:          mgr.GetScheme(),
 		multiTenant:     opts.MultiTenant,
-		status:          status.New(mgr.GetClient(), "log-storage-users", opts.KubernetesVersion),
+		status:          status.New(mgr.GetClient(), initializer.TigeraStatusLogStorageUsers, opts.KubernetesVersion),
 		esClientFn:      utils.NewElasticClient,
 		elasticExternal: opts.ElasticExternal,
 	}
 	r.status.Run(opts.ShutdownContext)
 
 	// Create a controller using the reconciler and register it with the manager to receive reconcile calls.
-	c, err := controller.New("log-storage-user-controller", mgr, controller.Options{Reconciler: r})
+	c, err := ctrlruntime.NewController("log-storage-user-controller", mgr, controller.Options{Reconciler: r})
 	if err != nil {
 		return err
 	}
@@ -100,26 +103,26 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	}
 
 	// Configure watches for operator.tigera.io APIs this controller cares about.
-	if err = c.Watch(&source.Kind{Type: &operatorv1.LogStorage{}}, eventHandler); err != nil {
+	if err = c.WatchObject(&operatorv1.LogStorage{}, eventHandler); err != nil {
 		return fmt.Errorf("log-storage-user-controller failed to watch LogStorage resource: %w", err)
 	}
-	if err = c.Watch(&source.Kind{Type: &operatorv1.ManagementCluster{}}, eventHandler); err != nil {
+	if err = c.WatchObject(&operatorv1.ManagementCluster{}, eventHandler); err != nil {
 		return fmt.Errorf("log-storage-user-controller failed to watch ManagementCluster resource: %w", err)
 	}
-	if err = c.Watch(&source.Kind{Type: &operatorv1.ManagementClusterConnection{}}, eventHandler); err != nil {
+	if err = c.WatchObject(&operatorv1.ManagementClusterConnection{}, eventHandler); err != nil {
 		return fmt.Errorf("log-storage-user-controller failed to watch ManagementClusterConnection resource: %w", err)
 	}
-	if err = utils.AddTigeraStatusWatch(c, "log-storage-users"); err != nil {
+	if err = utils.AddTigeraStatusWatch(c, initializer.TigeraStatusLogStorageUsers); err != nil {
 		return fmt.Errorf("logstorage-controller failed to watch logstorage Tigerastatus: %w", err)
 	}
 	if opts.MultiTenant {
-		if err = c.Watch(&source.Kind{Type: &operatorv1.Tenant{}}, &handler.EnqueueRequestForObject{}); err != nil {
+		if err = c.WatchObject(&operatorv1.Tenant{}, &handler.EnqueueRequestForObject{}); err != nil {
 			return fmt.Errorf("log-storage-user-controller failed to watch Tenant resource: %w", err)
 		}
 	}
 
 	// Watch for Elasticsearch.
-	if err = c.Watch(&source.Kind{Type: &esv1.Elasticsearch{}}, eventHandler); err != nil {
+	if err = c.WatchObject(&esv1.Elasticsearch{}, eventHandler); err != nil {
 		return fmt.Errorf("log-storage-user-controller failed to watch Elasticsearch resource: %w", err)
 	}
 
@@ -139,12 +142,12 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	}
 
 	// Create a controller using the reconciler and register it with the manager to receive reconcile calls.
-	usersCleanupController, err := controller.New("log-storage-cleanup-controller", mgr, controller.Options{Reconciler: usersCleanupReconciler})
+	usersCleanupController, err := ctrlruntime.NewController("log-storage-cleanup-controller", mgr, controller.Options{Reconciler: usersCleanupReconciler})
 	if err != nil {
 		return err
 	}
 
-	if err = usersCleanupController.Watch(&source.Kind{Type: &operatorv1.Tenant{}}, &handler.EnqueueRequestForObject{}); err != nil {
+	if err = usersCleanupController.WatchObject(&operatorv1.Tenant{}, &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("log-storage-cleanup-controller failed to watch Tenant resource: %w", err)
 	}
 
@@ -239,24 +242,44 @@ func (r *UserController) Reconcile(ctx context.Context, request reconcile.Reques
 	// Query any existing username and password for this Linseed instance. If one already exists, we'll simply
 	// use that. Otherwise, generate a new one.
 	linseedUser := utils.LinseedUser(clusterID, tenantID)
-	basicCreds := corev1.Secret{}
+	linseedUserSecret := corev1.Secret{}
 	var credentialSecrets []client.Object
 	key := types.NamespacedName{Name: render.ElasticsearchLinseedUserSecret, Namespace: helper.TruthNamespace()}
-	if err = r.client.Get(ctx, key, &basicCreds); err != nil && !errors.IsNotFound(err) {
+	if err = r.client.Get(ctx, key, &linseedUserSecret); err != nil && !errors.IsNotFound(err) {
 		r.status.SetDegraded(operatorv1.ResourceReadError, fmt.Sprintf("Error getting Secret %s", key), err, reqLogger)
 		return reconcile.Result{}, err
 	} else if errors.IsNotFound(err) {
 		// Create the secret to provision into the cluster.
-		basicCreds.Name = render.ElasticsearchLinseedUserSecret
-		basicCreds.Namespace = helper.TruthNamespace()
-		basicCreds.StringData = map[string]string{"username": linseedUser.Username, "password": crypto.GeneratePassword(16)}
+		linseedUserSecret.Name = render.ElasticsearchLinseedUserSecret
+		linseedUserSecret.Namespace = helper.TruthNamespace()
+		linseedUserSecret.StringData = map[string]string{"username": linseedUser.Username, "password": crypto.GeneratePassword(16)}
 
 		// Make sure we install the generated credentials into the truth namespace.
-		credentialSecrets = append(credentialSecrets, &basicCreds)
+		credentialSecrets = append(credentialSecrets, &linseedUserSecret)
 	}
+
+	// Query any existing username and password for this Dashboards instance. If one already exists, we'll simply
+	// use that. Otherwise, generate a new one.
+	keyDashboardCred := types.NamespacedName{Name: dashboards.ElasticCredentialsSecret, Namespace: helper.TruthNamespace()}
+	dashboardUser := utils.DashboardUser(clusterID, tenantID)
+	dashboardUserSecret := corev1.Secret{}
+	if err = r.client.Get(ctx, key, &dashboardUserSecret); err != nil && !errors.IsNotFound(err) {
+		r.status.SetDegraded(operatorv1.ResourceReadError, fmt.Sprintf("Error getting Secret %s", keyDashboardCred), err, reqLogger)
+		return reconcile.Result{}, err
+	} else if errors.IsNotFound(err) {
+		// Create the secret to provision into the cluster.
+		dashboardUserSecret.Name = dashboards.ElasticCredentialsSecret
+		dashboardUserSecret.Namespace = helper.TruthNamespace()
+		dashboardUserSecret.StringData = map[string]string{"username": dashboardUser.Username, "password": crypto.GeneratePassword(16)}
+
+		// Make sure we install the generated credentials into the truth namespace.
+		credentialSecrets = append(credentialSecrets, &dashboardUserSecret)
+	}
+
 	if helper.TruthNamespace() != helper.InstallNamespace() {
 		// Copy the credentials into the install namespace.
-		credentialSecrets = append(credentialSecrets, secret.CopyToNamespace(helper.InstallNamespace(), &basicCreds)[0])
+		credentialSecrets = append(credentialSecrets, secret.CopyToNamespace(helper.InstallNamespace(), &linseedUserSecret)[0])
+		credentialSecrets = append(credentialSecrets, secret.CopyToNamespace(helper.InstallNamespace(), &dashboardUserSecret)[0])
 	}
 	credentialComponent := render.NewPassthrough(credentialSecrets...)
 
@@ -287,8 +310,13 @@ func (r *UserController) Reconcile(ctx context.Context, request reconcile.Reques
 	if tenant.Spec.Elastic != nil && tenant.Spec.Elastic.URL != "" {
 		elasticEndpoint = tenant.Spec.Elastic.URL
 	}
-	if err = r.createLinseedLogin(ctx, elasticEndpoint, clusterID, tenantID, &basicCreds, reqLogger); err != nil {
+	if err = r.createUserLogin(ctx, elasticEndpoint, &linseedUserSecret, linseedUser, reqLogger); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Failed to create Linseed user in ES", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+
+	if err = r.createUserLogin(ctx, elasticEndpoint, &dashboardUserSecret, dashboardUser, reqLogger); err != nil {
+		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Failed to create Dashboards user in ES", err, reqLogger)
 		return reconcile.Result{}, err
 	}
 
@@ -297,7 +325,7 @@ func (r *UserController) Reconcile(ctx context.Context, request reconcile.Reques
 	return reconcile.Result{}, nil
 }
 
-func (r *UserController) createLinseedLogin(ctx context.Context, elasticEndpoint string, clusterID, tenantID string, secret *corev1.Secret, reqLogger logr.Logger) error {
+func (r *UserController) createUserLogin(ctx context.Context, elasticEndpoint string, secret *corev1.Secret, user *utils.User, reqLogger logr.Logger) error {
 	esClient, err := r.esClientFn(r.client, ctx, elasticEndpoint)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Failed to connect to Elasticsearch - failed to create the Elasticsearch client", err, reqLogger)
@@ -314,7 +342,6 @@ func (r *UserController) createLinseedLogin(ctx context.Context, elasticEndpoint
 	}
 
 	// Create the user in ES.
-	user := utils.LinseedUser(clusterID, tenantID)
 	user.Password = password
 	if err = esClient.CreateUser(ctx, user); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Failed to create or update Elasticsearch user", err, reqLogger)
@@ -390,8 +417,9 @@ func (r *UsersCleanupController) cleanupStaleUsers(ctx context.Context, logger l
 		}
 
 		lu := utils.LinseedUser(clusterID, t.Spec.ID)
+		dashboardsUser := utils.DashboardUser(clusterID, t.Spec.ID)
 		for _, user := range allESUsers {
-			if user.Username == lu.Username {
+			if user.Username == lu.Username || user.Username == dashboardsUser.Username {
 				err = esClient.DeleteUser(ctx, &user)
 				if err != nil {
 					logger.Error(err, "Failed to delete elastic user")

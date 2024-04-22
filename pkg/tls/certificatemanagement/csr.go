@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -86,13 +86,23 @@ func CreateCSRInitContainer(
 			}},
 		},
 		SecurityContext: securitycontext.NewNonRootContext(),
+		Resources:       components.GetCSRContainerDefaultResources(),
 	}
 }
 
 // ResolveCsrInitImage resolves the image needed for the CSR init image taking into account the specified ImageSet
 func ResolveCSRInitImage(inst *operatorv1.InstallationSpec, is *operatorv1.ImageSet) (string, error) {
+	if inst.Variant == operatorv1.TigeraSecureEnterprise {
+		return components.GetReference(
+			components.ComponentTigeraCSRInitContainer,
+			inst.Registry,
+			inst.ImagePath,
+			inst.ImagePrefix,
+			is,
+		)
+	}
 	return components.GetReference(
-		components.ComponentCSRInitContainer,
+		components.ComponentCalicoCSRInitContainer,
 		inst.Registry,
 		inst.ImagePath,
 		inst.ImagePrefix,

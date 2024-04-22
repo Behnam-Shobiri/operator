@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -50,8 +50,6 @@ func RequiresTigeraSecure(cfg *rest.Config) (bool, error) {
 			fallthrough
 		case "LogStorage":
 			fallthrough
-		case "AmazonCloudIntegration":
-			fallthrough
 		case "Compliance":
 			fallthrough
 		case "IntrusionDetection":
@@ -65,27 +63,6 @@ func RequiresTigeraSecure(cfg *rest.Config) (bool, error) {
 		case "EgressGateway":
 			fallthrough
 		case "ManagementClusterConnection":
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// RequiresAmazonController determines if the configuration requires we start the aws
-// controllers.
-func RequiresAmazonController(cfg *rest.Config) (bool, error) {
-	clientset, err := kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return false, err
-	}
-
-	// Use the discovery client to determine if the amazoncloudintegration APIs exist.
-	resources, err := clientset.Discovery().ServerResourcesForGroupVersion("operator.tigera.io/v1")
-	if err != nil {
-		return false, err
-	}
-	for _, r := range resources.APIResources {
-		if r.Kind == "AmazonCloudIntegration" {
 			return true, nil
 		}
 	}
@@ -111,7 +88,7 @@ func MultiTenant(ctx context.Context, c kubernetes.Interface) (bool, error) {
 func AutoDiscoverProvider(ctx context.Context, clientset kubernetes.Interface) (operatorv1.Provider, error) {
 	// First, try to determine the platform based on the present API groups.
 	if platform, err := autodetectFromGroup(clientset); err != nil {
-		return operatorv1.ProviderNone, fmt.Errorf("Failed to check provider based on API groups: %s", err)
+		return operatorv1.ProviderNone, fmt.Errorf("failed to check provider based on API groups: %s", err)
 	} else if platform != operatorv1.ProviderNone {
 		// We detected a platform. Use it.
 		return platform, nil
@@ -119,21 +96,21 @@ func AutoDiscoverProvider(ctx context.Context, clientset kubernetes.Interface) (
 
 	// We failed to determine the platform based on API groups. Some platforms can be detected in other ways, though.
 	if dockeree, err := isDockerEE(ctx, clientset); err != nil {
-		return operatorv1.ProviderNone, fmt.Errorf("Failed to check if Docker EE is the provider: %s", err)
+		return operatorv1.ProviderNone, fmt.Errorf("failed to check if Docker EE is the provider: %s", err)
 	} else if dockeree {
 		return operatorv1.ProviderDockerEE, nil
 	}
 
 	// We failed to determine the platform based on API groups. Some platforms can be detected in other ways, though.
 	if eks, err := isEKS(ctx, clientset); err != nil {
-		return operatorv1.ProviderNone, fmt.Errorf("Failed to check if EKS is the provider: %s", err)
+		return operatorv1.ProviderNone, fmt.Errorf("failed to check if EKS is the provider: %s", err)
 	} else if eks {
 		return operatorv1.ProviderEKS, nil
 	}
 
 	// Attempt to detect RKE Version 2, which also cannot be done via API groups.
 	if rke2, err := isRKE2(ctx, clientset); err != nil {
-		return operatorv1.ProviderNone, fmt.Errorf("Failed to check if RKE2 is the provider: %s", err)
+		return operatorv1.ProviderNone, fmt.Errorf("failed to check if RKE2 is the provider: %s", err)
 	} else if rke2 {
 		return operatorv1.ProviderRKE2, nil
 	}
@@ -157,6 +134,10 @@ func autodetectFromGroup(c kubernetes.Interface) (operatorv1.Provider, error) {
 		if g.Name == "networking.gke.io" {
 			// Running on GKE.
 			return operatorv1.ProviderGKE, nil
+		}
+
+		if g.Name == "core.tanzu.vmware.com" {
+			return operatorv1.ProviderTKG, nil
 		}
 	}
 	return operatorv1.ProviderNone, nil
@@ -222,18 +203,30 @@ func isEKS(ctx context.Context, c kubernetes.Interface) (bool, error) {
 
 // isRKE2 returns true if running on an RKE2 cluster, and false otherwise.
 // While the presence of Rancher can be determined based on API Groups, it's important to
-// differentiate between versions, which requires another approach. In this case,
-// the presence of an "rke2" configmap in kube-system namespace is used.
+// differentiate between versions, which requires another approach. In this case we use
+// the presence of an "rke2" configmap or an "rke2-coredns-rke2-coredns" service in the
+// kube-system namespace
 func isRKE2(ctx context.Context, c kubernetes.Interface) (bool, error) {
-	cm, err := c.CoreV1().ConfigMaps("kube-system").Get(ctx, "rke2", metav1.GetOptions{})
-	if err != nil {
-		if kerrors.IsNotFound(err) {
-			return false, nil
-		}
+	foundRKE2Resource := false
+	_, err := c.CoreV1().ConfigMaps("kube-system").Get(ctx, "rke2", metav1.GetOptions{})
+	if err == nil {
+		foundRKE2Resource = true
+	} else if !kerrors.IsNotFound(err) {
 		return false, err
 	}
 
-	return (cm != nil), nil
+	// In current RKE2 the above ConfigMap no longer exists, but we leave that code in place in
+	// case there are variants where it is useful.  Check also for the RKE2 DNS service - which
+	// is especially relevant because one of the main uses of the RKE2 autodetection is to set
+	// DNS config.
+	_, err = c.CoreV1().Services("kube-system").Get(ctx, "rke2-coredns-rke2-coredns", metav1.GetOptions{})
+	if err == nil {
+		foundRKE2Resource = true
+	} else if !kerrors.IsNotFound(err) {
+		return false, err
+	}
+
+	return foundRKE2Resource, nil
 }
 
 // SupportsPodSecurityPolicies returns true if the cluster contains the policy/v1beta1 PodSecurityPolicy API,

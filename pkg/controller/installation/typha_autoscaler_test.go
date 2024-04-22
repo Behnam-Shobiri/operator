@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -164,7 +164,7 @@ var _ = Describe("Test typha autoscaler ", func() {
 		verifyTyphaReplicas(c, 2)
 	})
 
-	It("should ignore non-migrated nodes in its count", func() {
+	It("should not ignore non-migrated nodes in its count", func() {
 		typhaMeta := metav1.ObjectMeta{
 			Name:      "calico-typha",
 			Namespace: "calico-system",
@@ -193,9 +193,7 @@ var _ = Describe("Test typha autoscaler ", func() {
 		ta := newTyphaAutoscaler(c, nodeIndexInformer, tlw, statusManager, typhaAutoscalerPeriod(10*time.Millisecond))
 		ta.start(ctx)
 
-		// normally we'd expect to see three replicas for five nodes, but since one node is not migrated,
-		// we should still only expect two
-		verifyTyphaReplicas(c, 2)
+		verifyTyphaReplicas(c, 3)
 	})
 
 	It("should ignore aks virtual nodes in its count", func() {

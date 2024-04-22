@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,7 +29,6 @@ import (
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
 	v1 "github.com/tigera/operator/api/v1"
-	operatorv1beta1 "github.com/tigera/operator/api/v1beta1"
 	"github.com/tigera/operator/controllers"
 	"github.com/tigera/operator/pkg/active"
 	"github.com/tigera/operator/pkg/apis"
@@ -42,6 +41,7 @@ import (
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
+	"github.com/tigera/operator/pkg/render/intrusiondetection/dpi"
 	"github.com/tigera/operator/pkg/render/logstorage"
 	"github.com/tigera/operator/version"
 
@@ -80,7 +80,6 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(apiextensions.AddToScheme(scheme))
 	utilruntime.Must(operatorv1.AddToScheme(scheme))
-	utilruntime.Must(operatorv1beta1.AddToScheme(scheme))
 	utilruntime.Must(apis.AddToScheme(scheme))
 }
 
@@ -142,7 +141,6 @@ func main() {
 		if strings.ToLower(printImages) == "list" {
 			cmpnts := components.CalicoImages
 			cmpnts = append(cmpnts, components.EnterpriseImages...)
-			cmpnts = append(cmpnts, components.CommonImages...)
 
 			for _, x := range cmpnts {
 				ref, _ := components.GetReference(x, "", "", "", nil)
@@ -218,12 +216,6 @@ func main() {
 		os.Exit(0)
 	}
 
-	mapper, err := apiutil.NewDynamicRESTMapper(cfg)
-	if err != nil {
-		log.Error(err, "Failed to create dynamic rest mapper.")
-		os.Exit(1)
-	}
-
 	if preDelete {
 		// We've built a client - we can use it to clean up.
 		if err := executePreDeleteHook(ctx, c); err != nil {
@@ -254,9 +246,19 @@ func main() {
 		// for the LicenseKey. We should test again in the future to see if the cache issue is fixed
 		// and we can remove this. Here is a link to the upstream issue
 		// https://github.com/kubernetes-sigs/controller-runtime/issues/1316
-		ClientDisableCacheFor: []client.Object{
-			&v3.LicenseKey{},
+		Client: client.Options{
+			Cache: &client.CacheOptions{
+				DisableFor: []client.Object{
+					&v3.LicenseKey{},
+				},
+			},
 		},
+
+		// Explicitly set the MapperProvider to the NewDynamicRESTMapper, as we had previously had issues with the default
+		// not being this mapper (which has since been rectified). It was a tough issue to figure out when the default
+		// had changed out from under us, so better to continue to explicitly set it as we know this is the mapper we want.
+		MapperProvider: apiutil.NewDynamicRESTMapper,
+
 		// NetworkPolicy is served through the Tigera API Server, which currently restricts List and Watch
 		// operations on NetworkPolicy to a single tier only, specified via label or field selector. If no
 		// selector is specified, List and Watch return policies from the 'default' tier. The manager cache
@@ -264,17 +266,12 @@ func main() {
 		// within so that it can receive the expected resources for List and Watch. If the operator needs to
 		// reconcile policy within multiple tiers, the API Server should be updated to serve policy from all
 		// tiers that the user is authorized for.
-		NewCache: cache.BuilderWithOptions(cache.Options{
-			SelectorsByObject: cache.SelectorsByObject{
+		Cache: cache.Options{
+			ByObject: map[client.Object]cache.ByObject{
 				&v3.NetworkPolicy{}:       {Label: policySelector},
 				&v3.GlobalNetworkPolicy{}: {Label: policySelector},
 			},
-			// This commit https://github.com/kubernetes-sigs/controller-runtime/commit/b38c4a526b4cf9ffbcaebd0fe9363d9d64182dd2
-			// introduced a bug where if the cache builder is used and the Mapper is nil, it defaults it to the DiscoverRESTMapper
-			// even though the managers default mapper is the DynamicRESTMapper. To get around this issue, we explicitly
-			// set the mapper to the DynamicRESTMapper.
-			Mapper: mapper,
-		}),
+		},
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -388,12 +385,6 @@ func main() {
 	}
 	setupLog.WithValues("required", enterpriseCRDExists).Info("Checking if TSEE controllers are required")
 
-	amazonCRDExists, err := utils.RequiresAmazonController(mgr.GetConfig())
-	if err != nil {
-		setupLog.Error(err, "Failed to determine if AmazonCloudIntegration is required")
-		os.Exit(1)
-	}
-
 	clusterDomain, err := dns.GetClusterDomain(dns.DefaultResolveConfPath)
 	if err != nil {
 		clusterDomain = dns.DefaultClusterDomain
@@ -404,6 +395,28 @@ func main() {
 	if err != nil {
 		log.Error(err, "Unable to resolve Kubernetes version, defaulting to v1.18")
 		kubernetesVersion = &common.VersionInfo{Major: 1, Minor: 18}
+	}
+
+	// The operator MUST not run within one of the Namespaces that it itself manages. Perform an early check here
+	// to make sure that we're not doing so, and exit if we are.
+	badNamespaces := []string{
+		common.CalicoNamespace,
+		"calico-apiserver", "tigera-system",
+		render.ElasticsearchNamespace,
+		render.ComplianceNamespace,
+		render.IntrusionDetectionNamespace,
+		dpi.DeepPacketInspectionNamespace,
+		render.ECKOperatorNamespace,
+		render.LogCollectorNamespace,
+		render.CSIDaemonSetNamespace,
+		render.ManagerNamespace,
+	}
+	for _, ns := range badNamespaces {
+		if common.OperatorNamespace() == ns {
+			log.Error("Operator must not be run within a Namespace managed by the operator, please select a different namespace")
+			log.Error(fmt.Sprintf("The following namespaces cannot be used: %s", badNamespaces))
+			os.Exit(1)
+		}
 	}
 
 	// Laod the operator's bootstrap configmap, if it exists.
@@ -425,7 +438,6 @@ func main() {
 		DetectedProvider:    provider,
 		EnterpriseCRDExists: enterpriseCRDExists,
 		UsePSP:              usePSP,
-		AmazonCRDExists:     amazonCRDExists,
 		ClusterDomain:       clusterDomain,
 		KubernetesVersion:   kubernetesVersion,
 		ManageCRDs:          manageCRDs,

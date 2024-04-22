@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 /*
 
 
@@ -77,6 +77,7 @@ func init() {
 // APIServerDeploymentContainer is an API server Deployment container.
 type APIServerDeploymentContainer struct {
 	// Name is an enum which identifies the API server Deployment container by name.
+	// Supported values are: calico-apiserver, tigera-queryserver
 	// +kubebuilder:validation:Enum=calico-apiserver;tigera-queryserver
 	Name string `json:"name"`
 
@@ -91,6 +92,7 @@ type APIServerDeploymentContainer struct {
 // APIServerDeploymentInitContainer is an API server Deployment init container.
 type APIServerDeploymentInitContainer struct {
 	// Name is an enum which identifies the API server Deployment init container by name.
+	// Supported values are: calico-apiserver-certs-key-cert-provisioner
 	// +kubebuilder:validation:Enum=calico-apiserver-certs-key-cert-provisioner
 	Name string `json:"name"`
 
@@ -299,4 +301,8 @@ func (c *APIServerDeployment) GetTerminationGracePeriodSeconds() *int64 {
 
 func (c *APIServerDeployment) GetDeploymentStrategy() *appsv1.DeploymentStrategy {
 	return nil
+}
+
+func (c *APIServerDeployment) GetPriorityClassName() string {
+	return ""
 }

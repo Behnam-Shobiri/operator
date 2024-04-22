@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -41,6 +41,13 @@ type LogCollectorSpec struct {
 	// the management cluster's tenant services are running.
 	// +optional
 	MultiTenantManagementClusterNamespace string `json:"multiTenantManagementClusterNamespace,omitempty"`
+
+	// FluentdDaemonSet configures the Fluentd DaemonSet.
+	FluentdDaemonSet *FluentdDaemonSet `json:"fluentdDaemonSet,omitempty"`
+
+	// EKSLogForwarderDeployment configures the EKSLogForwarderDeployment Deployment.
+	// +optional
+	EKSLogForwarderDeployment *EKSLogForwarderDeployment `json:"eksLogForwarderDeployment,omitempty"`
 }
 
 type CollectProcessPathOption string

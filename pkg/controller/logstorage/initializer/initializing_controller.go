@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,9 +19,8 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
-	operatorv1 "github.com/tigera/operator/api/v1"
-	corev1 "k8s.io/api/core/v1"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -31,20 +30,28 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/controller/options"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
+	"github.com/tigera/operator/pkg/ctrlruntime"
 	"github.com/tigera/operator/pkg/render"
 )
 
 var log = logf.Log.WithName("controller_logstorage")
 
 const (
-	DefaultElasticsearchStorageClass = "tigera-elasticsearch"
-	TigeraStatusName                 = "log-storage"
-	defaultEckOperatorMemorySetting  = "512Mi"
+	DefaultElasticsearchStorageClass     = "tigera-elasticsearch"
+	TigeraStatusName                     = "log-storage"
+	defaultEckOperatorMemorySetting      = "512Mi"
+	TigeraStatusLogStorageKubeController = "log-storage-kubecontrollers"
+	TigeraStatusLogStorageAccess         = "log-storage-access"
+	TigeraStatusLogStorageElastic        = "log-storage-elastic"
+	TigeraStatusLogStorageSecrets        = "log-storage-secrets"
+	TigeraStatusLogStorageUsers          = "log-storage-users"
+	TigeraStatusLogStorageESMetrics      = "log-storage-esmetrics"
+	TigeraStatusLogStorageDashboards     = "log-storage-dashboards"
 )
 
 // Add creates a new LogStorage Controller and adds it to the Manager. The Manager will set fields on the Controller
@@ -64,16 +71,16 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	r.status.Run(opts.ShutdownContext)
 
 	// Create a controller using the reconciler and register it with the manager to receive reconcile calls.
-	c, err := controller.New("log-storage-initializing-controller", mgr, controller.Options{Reconciler: r})
+	c, err := ctrlruntime.NewController("log-storage-initializing-controller", mgr, controller.Options{Reconciler: r})
 	if err != nil {
 		return err
 	}
 
 	// Configure watches for operator.tigera.io APIs this controller cares about.
-	if err = c.Watch(&source.Kind{Type: &operatorv1.LogStorage{}}, &handler.EnqueueRequestForObject{}); err != nil {
+	if err = c.WatchObject(&operatorv1.LogStorage{}, &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("log-storage-initializing-controller failed to watch LogStorage resource: %w", err)
 	}
-	if err = c.Watch(&source.Kind{Type: &operatorv1.Installation{}}, &handler.EnqueueRequestForObject{}); err != nil {
+	if err = c.WatchObject(&operatorv1.Installation{}, &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("log-storage-initializing-controller failed to watch Installation resource: %w", err)
 	}
 

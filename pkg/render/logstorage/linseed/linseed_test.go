@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,13 +18,6 @@ import (
 	"context"
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/api/resource"
-
-	"k8s.io/apiserver/pkg/authentication/serviceaccount"
-
-	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
-	"github.com/tigera/operator/pkg/render/logstorage"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
@@ -33,25 +26,31 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apiserver/pkg/authentication/serviceaccount"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
+	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	"github.com/tigera/operator/pkg/render/common/podaffinity"
 	rtest "github.com/tigera/operator/pkg/render/common/test"
+	"github.com/tigera/operator/pkg/render/logstorage"
 	"github.com/tigera/operator/pkg/render/testutils"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
+	"github.com/tigera/operator/test"
 )
 
 type resourceTestObj struct {
@@ -143,6 +142,7 @@ var _ = Describe("Linseed rendering tests", func() {
 					"client.key": {4, 5, 6},
 				},
 			}
+			cfg.ExternalElastic = true
 			component := Linseed(cfg)
 			createResources, _ := component.Objects()
 			d, ok := rtest.GetResource(createResources, DeploymentName, render.ElasticsearchNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
@@ -270,6 +270,77 @@ var _ = Describe("Linseed rendering tests", func() {
 			d, ok := rtest.GetResource(resources, DeploymentName, render.ElasticsearchNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
 			Expect(ok).To(BeTrue(), "Deployment not found")
 			Expect(d.Spec.Template.Spec.Tolerations).To(ConsistOf(t))
+		})
+
+		It("should render deployment with resource requests and limits", func() {
+			secret, err := certificatemanagement.CreateSelfSignedSecret("", "", "", nil)
+			Expect(err).NotTo(HaveOccurred())
+			installation.CertificateManagement = &operatorv1.CertificateManagement{CACert: secret.Data[corev1.TLSCertKey]}
+			kp, tokenKP, bundle := getTLS(installation)
+
+			linseedResources := corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					"cpu":     resource.MustParse("2"),
+					"memory":  resource.MustParse("300Mi"),
+					"storage": resource.MustParse("20Gi"),
+				},
+				Requests: corev1.ResourceList{
+					"cpu":     resource.MustParse("1"),
+					"memory":  resource.MustParse("150Mi"),
+					"storage": resource.MustParse("10Gi"),
+				},
+			}
+			cfg.LogStorage = &operatorv1.LogStorage{
+				Spec: operatorv1.LogStorageSpec{
+					LinseedDeployment: &operatorv1.LinseedDeployment{
+						Spec: &operatorv1.LinseedDeploymentSpec{
+							Template: &operatorv1.LinseedDeploymentPodTemplateSpec{
+								Spec: &operatorv1.LinseedDeploymentPodSpec{
+									InitContainers: []operatorv1.LinseedDeploymentInitContainer{
+										{
+											Name:      "tigera-secure-linseed-token-tls-key-cert-provisioner",
+											Resources: &linseedResources,
+										},
+										{
+											Name:      "tigera-secure-linseed-cert-key-cert-provisioner",
+											Resources: &linseedResources,
+										},
+									},
+									Containers: []operatorv1.LinseedDeploymentContainer{{
+										Name:      "tigera-linseed",
+										Resources: &linseedResources,
+									}},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			cfg.KeyPair = kp
+			cfg.TokenKeyPair = tokenKP
+			cfg.TrustedBundle = bundle
+
+			component := Linseed(cfg)
+			resources, _ := component.Objects()
+			d, ok := rtest.GetResource(resources, DeploymentName, render.ElasticsearchNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
+			Expect(ok).To(BeTrue(), "Deployment not found")
+
+			Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
+
+			container := test.GetContainer(d.Spec.Template.Spec.Containers, "tigera-linseed")
+			Expect(container).NotTo(BeNil())
+			Expect(container.Resources).To(Equal(linseedResources))
+
+			Expect(d.Spec.Template.Spec.InitContainers).To(HaveLen(2))
+			initContainer := test.GetContainer(d.Spec.Template.Spec.InitContainers, "tigera-secure-linseed-token-tls-key-cert-provisioner")
+			Expect(initContainer).NotTo(BeNil())
+			Expect(initContainer.Resources).To(Equal(linseedResources))
+
+			initContainer = test.GetContainer(d.Spec.Template.Spec.InitContainers, "tigera-secure-linseed-cert-key-cert-provisioner")
+			Expect(initContainer).NotTo(BeNil())
+			Expect(initContainer.Resources).To(Equal(linseedResources))
+
 		})
 
 		Context("allow-tigera rendering", func() {
@@ -432,6 +503,7 @@ var _ = Describe("Linseed rendering tests", func() {
 				ElasticHost:     "tigera-secure-es-http.tigera-elasticsearch.svc",
 				ElasticPort:     "9200",
 				BindNamespaces:  []string{tenant.Namespace, "tigera-elasticsearch"},
+				ExternalElastic: true,
 			}
 		})
 
@@ -688,8 +760,9 @@ var _ = Describe("Linseed rendering tests", func() {
 			Expect(cr.Rules).NotTo(ContainElements(expectedRules))
 		})
 
-		It("should render single-tenant environment variables", func() {
+		It("should render single-tenant environment variables with external elastic", func() {
 			cfg.ManagementCluster = true
+			cfg.ExternalElastic = true
 			component := Linseed(cfg)
 			Expect(component).NotTo(BeNil())
 			resources, _ := component.Objects()
@@ -705,13 +778,31 @@ var _ = Describe("Linseed rendering tests", func() {
 				Expect(env.Name).NotTo(Equal("BACKEND"))
 			}
 		})
+
+		It("should render single-tenant environment variables with internal elastic", func() {
+			cfg.ManagementCluster = true
+			cfg.ExternalElastic = false
+			component := Linseed(cfg)
+			Expect(component).NotTo(BeNil())
+			resources, _ := component.Objects()
+			d := rtest.GetResource(resources, DeploymentName, cfg.Namespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
+			envs := d.Spec.Template.Spec.Containers[0].Env
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MANAGEMENT_OPERATOR_NS", Value: "tigera-operator"}))
+
+			// These are only set for multi-tenant clusters. Make sure they aren't set here.
+			for _, env := range envs {
+				Expect(env.Name).NotTo(Equal("LINSEED_MULTI_CLUSTER_FORWARDING_ENDPOINT"))
+				Expect(env.Name).NotTo(Equal("LINSEED_TENANT_NAMESPACE"))
+				Expect(env.Name).NotTo(Equal("BACKEND"))
+			}
+		})
 	})
 })
 
 func getTLS(installation *operatorv1.InstallationSpec) (certificatemanagement.KeyPairInterface, certificatemanagement.KeyPairInterface, certificatemanagement.TrustedBundle) {
 	scheme := runtime.NewScheme()
 	Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
-	cli := fake.NewClientBuilder().WithScheme(scheme).Build()
+	cli := ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 
 	certificateManager, err := certificatemanager.Create(cli, installation, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 	Expect(err).NotTo(HaveOccurred())

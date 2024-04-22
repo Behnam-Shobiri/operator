@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,7 +28,6 @@ import (
 type AddOptions struct {
 	DetectedProvider    v1.Provider
 	EnterpriseCRDExists bool
-	AmazonCRDExists     bool
 	ClusterDomain       string
 	KubernetesVersion   *common.VersionInfo
 	ManageCRDs          bool

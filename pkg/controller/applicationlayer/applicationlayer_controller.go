@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ import (
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
 	"github.com/tigera/operator/pkg/controller/utils/imageset"
+	"github.com/tigera/operator/pkg/ctrlruntime"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/applicationlayer"
 	"github.com/tigera/operator/pkg/render/applicationlayer/embed"
@@ -33,7 +34,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -43,7 +43,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 const ResourceName = "applicationlayer"
@@ -65,7 +64,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 
 	reconciler := newReconciler(mgr, opts, licenseAPIReady)
 
-	c, err := controller.New("applicationlayer-controller", mgr, controller.Options{Reconciler: reconcile.Reconciler(reconciler)})
+	c, err := ctrlruntime.NewController("applicationlayer-controller", mgr, controller.Options{Reconciler: reconcile.Reconciler(reconciler)})
 	if err != nil {
 		return err
 	}
@@ -97,11 +96,11 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions, licenseAPIReady
 }
 
 // add adds watches for resources that are available at startup.
-func add(mgr manager.Manager, c controller.Controller) error {
+func add(mgr manager.Manager, c ctrlruntime.Controller) error {
 	var err error
 
 	// Watch for changes to primary resource applicationlayer.
-	err = c.Watch(&source.Kind{Type: &operatorv1.ApplicationLayer{}}, &handler.EnqueueRequestForObject{})
+	err = c.WatchObject(&operatorv1.ApplicationLayer{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return err
 	}
@@ -136,7 +135,7 @@ func add(mgr manager.Manager, c controller.Controller) error {
 	}
 
 	// Watch for changes to FelixConfiguration.
-	err = c.Watch(&source.Kind{Type: &crdv1.FelixConfiguration{}}, &handler.EnqueueRequestForObject{})
+	err = c.WatchObject(&crdv1.FelixConfiguration{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return fmt.Errorf("applicationlayer-controller failed to watch FelixConfiguration resource: %w", err)
 	}
@@ -261,7 +260,7 @@ func (r *ReconcileApplicationLayer) Reconcile(ctx context.Context, request recon
 			return reconcile.Result{}, err
 		}
 		if err = validateModSecurityRuleSet(modSecurityRuleSet); err != nil {
-			r.status.SetDegraded(operatorv1.ResourceValidationError, "Error validating Web Application Firewall ModSecurity rule set", err, reqLogger)
+			r.status.SetDegraded(operatorv1.ResourceValidationError, "Error validating Web Application Firewall rule set", err, reqLogger)
 			return reconcile.Result{}, err
 		}
 	}
@@ -280,6 +279,7 @@ func (r *ReconcileApplicationLayer) Reconcile(ctx context.Context, request recon
 		UseRemoteAddressXFF:    instance.Spec.EnvoySettings.UseRemoteAddress,
 		NumTrustedHopsXFF:      instance.Spec.EnvoySettings.XFFNumTrustedHops,
 		UsePSP:                 r.usePSP,
+		ApplicationLayer:       instance,
 	}
 	component := applicationlayer.ApplicationLayer(config)
 
@@ -419,31 +419,25 @@ func (r *ReconcileApplicationLayer) getModSecurityRuleSet(ctx context.Context) (
 }
 
 func getDefaultCoreRuleset(ctx context.Context) (*corev1.ConfigMap, error) {
-	data, err := embed.AsMap()
+	ruleset, err := embed.AsConfigMap(
+		applicationlayer.ModSecurityRulesetConfigMapName,
+		common.OperatorNamespace(),
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	ruleset := &corev1.ConfigMap{
-		TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: "v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      applicationlayer.ModSecurityRulesetConfigMapName,
-			Namespace: common.OperatorNamespace(),
-		},
-		Data: data,
-	}
 	return ruleset, nil
 }
 
 func validateModSecurityRuleSet(cm *corev1.ConfigMap) error {
 	requiredFiles := []string{
-		"modsecdefault.conf",
-		"crs-setup.conf",
+		"tigera.conf",
 	}
 
 	for _, f := range requiredFiles {
 		if _, ok := cm.Data[f]; !ok {
-			return fmt.Errorf("file must be found in Web Application Firewall rule set: %s", f)
+			return fmt.Errorf("file must be present with ruleset files: %s", f)
 		}
 	}
 
@@ -516,7 +510,7 @@ func (r *ReconcileApplicationLayer) getTProxyMode(al *operatorv1.ApplicationLaye
 // patchFelixConfiguration takes all application layer specs as arguments and patches felix config.
 // If at least one of the specs requires TPROXYMode as "Enabled" it'll be patched as "Enabled" otherwise it is "Disabled".
 func (r *ReconcileApplicationLayer) patchFelixConfiguration(ctx context.Context, al *operatorv1.ApplicationLayer) error {
-	_, err := utils.PatchFelixConfiguration(ctx, r.client, func(fc *crdv1.FelixConfiguration) bool {
+	_, err := utils.PatchFelixConfiguration(ctx, r.client, func(fc *crdv1.FelixConfiguration) (bool, error) {
 		var tproxyMode crdv1.TPROXYModeOption
 		if ok, v := r.getTProxyMode(al); ok {
 			tproxyMode = v
@@ -529,7 +523,7 @@ func (r *ReconcileApplicationLayer) patchFelixConfiguration(ctx context.Context,
 				//
 				// The felix bug was fixed in v3.16, v3.15.1 and v3.14.4; it should be safe to set new config fields
 				// once we know we're only upgrading from those versions and above.
-				return false
+				return false, nil
 			}
 
 			// If the mode is already set, fall through to the normal logic, it's safe to force-set the field now.
@@ -544,7 +538,7 @@ func (r *ReconcileApplicationLayer) patchFelixConfiguration(ctx context.Context,
 
 		// If tproxy mode is already set to desired state return false to indicate patch not needed.
 		if policySyncPrefixSetDesired && tproxyModeSetDesired {
-			return false
+			return false, nil
 		}
 
 		fc.Spec.TPROXYMode = &tproxyMode
@@ -555,7 +549,7 @@ func (r *ReconcileApplicationLayer) patchFelixConfiguration(ctx context.Context,
 			"policySyncPathPrefix", fc.Spec.PolicySyncPathPrefix,
 			"tproxyMode", string(tproxyMode),
 		)
-		return true
+		return true, nil
 	})
 
 	return err

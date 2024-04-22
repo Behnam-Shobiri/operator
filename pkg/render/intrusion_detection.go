@@ -20,12 +20,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tigera/operator/pkg/ptr"
+	batchv1 "k8s.io/api/batch/v1"
 
 	appsv1 "k8s.io/api/apps/v1"
-	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -33,16 +31,14 @@ import (
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/components"
+	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
-	rkibana "github.com/tigera/operator/pkg/render/common/kibana"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 	"github.com/tigera/operator/pkg/tls/certkeyusage"
-	"github.com/tigera/operator/pkg/url"
 )
 
 const (
@@ -71,26 +67,6 @@ const (
 	ADDetectorPolicyName        = networkpolicy.TigeraComponentPolicyPrefix + adDetectorName
 )
 
-var adAlgorithms = []string{
-	"dga",
-	"http-connection-spike",
-	"http-response-codes",
-	"http-verbs",
-	"port-scan",
-	"generic-dns",
-	"generic-flows",
-	"multivariable-flow",
-	"generic-l7",
-	"dns-latency",
-	"dns-tunnel",
-	"l7-bytes",
-	"l7-latency",
-	"bytes-in",
-	"bytes-out",
-	"process-bytes",
-	"process-restarts",
-}
-
 // Register secret/certs that need Server and Client Key usage
 var (
 	intrusionDetectionNamespaceSelector = fmt.Sprintf("projectcalico.org/name == '%s'", IntrusionDetectionNamespace)
@@ -118,11 +94,9 @@ func IntrusionDetection(cfg *IntrusionDetectionConfiguration) Component {
 
 // IntrusionDetectionConfiguration contains all the config information needed to render the component.
 type IntrusionDetectionConfiguration struct {
-	IntrusionDetection operatorv1.IntrusionDetection
+	IntrusionDetection *operatorv1.IntrusionDetection
 	LogCollector       *operatorv1.LogCollector
-	ESSecrets          []*corev1.Secret
 	Installation       *operatorv1.InstallationSpec
-	ESClusterConfig    *relasticsearch.ClusterConfig
 	PullSecrets        []*corev1.Secret
 	Openshift          bool
 	ClusterDomain      string
@@ -131,16 +105,17 @@ type IntrusionDetectionConfiguration struct {
 	ManagementCluster  bool
 
 	HasNoLicense                 bool
-	TrustedCertBundle            certificatemanagement.TrustedBundle
+	TrustedCertBundle            certificatemanagement.TrustedBundleRO
 	IntrusionDetectionCertSecret certificatemanagement.KeyPairInterface
 
-	// Whether the cluster supports pod security policies.
-	UsePSP bool
+	Namespace       string
+	BindNamespaces  []string
+	Tenant          *operatorv1.Tenant
+	ExternalElastic bool
 }
 
 type intrusionDetectionComponent struct {
 	cfg                    *IntrusionDetectionConfiguration
-	jobInstallerImage      string
 	controllerImage        string
 	webhooksProcessorImage string
 }
@@ -151,12 +126,6 @@ func (c *intrusionDetectionComponent) ResolveImages(is *operatorv1.ImageSet) err
 	prefix := c.cfg.Installation.ImagePrefix
 	var errMsgs []string
 	var err error
-	if !c.cfg.ManagedCluster {
-		c.jobInstallerImage, err = components.GetReference(components.ComponentElasticTseeInstaller, reg, path, prefix, is)
-		if err != nil {
-			errMsgs = append(errMsgs, err.Error())
-		}
-	}
 
 	c.controllerImage, err = components.GetReference(components.ComponentIntrusionDetectionController, reg, path, prefix, is)
 	if err != nil {
@@ -186,16 +155,21 @@ func (c *intrusionDetectionComponent) Objects() ([]client.Object, []client.Objec
 		pss = PSSPrivileged
 	}
 
-	objs := []client.Object{
-		CreateNamespace(IntrusionDetectionNamespace, c.cfg.Installation.KubernetesProvider, PodSecurityStandard(pss)),
-		c.intrusionDetectionControllerAllowTigeraPolicy(),
-		networkpolicy.AllowTigeraDefaultDeny(IntrusionDetectionNamespace),
+	objs := []client.Object{}
+	if !c.cfg.Tenant.MultiTenant() {
+		// In multi-tenant environments, the namespace is pre-created. So, only create it if we're not in a multi-tenant environment.
+		objs = append(objs, CreateNamespace(c.cfg.Namespace, c.cfg.Installation.KubernetesProvider, PodSecurityStandard(pss)))
+
+		// GlobalAlertTemplates are not used in multi-tenant management clusters.
+		objs = append(objs, c.globalAlertTemplates()...)
 	}
-	objs = append(objs, secret.ToRuntimeObjects(secret.CopyToNamespace(IntrusionDetectionNamespace, c.cfg.PullSecrets...)...)...)
+
+	objs = append(objs, secret.ToRuntimeObjects(secret.CopyToNamespace(c.cfg.Namespace, c.cfg.PullSecrets...)...)...)
 
 	objs = append(objs,
+		c.intrusionDetectionControllerAllowTigeraPolicy(),
+		networkpolicy.AllowTigeraDefaultDeny(c.cfg.Namespace),
 		c.intrusionDetectionServiceAccount(),
-		c.intrusionDetectionJobServiceAccount(),
 		c.intrusionDetectionClusterRole(),
 		c.intrusionDetectionClusterRoleBinding(),
 		c.intrusionDetectionRole(),
@@ -203,96 +177,27 @@ func (c *intrusionDetectionComponent) Objects() ([]client.Object, []client.Objec
 		c.intrusionDetectionDeployment(),
 	)
 
-	objs = append(objs, secret.ToRuntimeObjects(secret.CopyToNamespace(IntrusionDetectionNamespace, c.cfg.ESSecrets...)...)...)
-	objs = append(objs, c.globalAlertTemplates()...)
-
-	var objsToDelete []client.Object
-
-	// Anomaly Detection is now EoL; delete all of the GlobalAlertTemplates and corresponding
-	// GlobalAlerts that might exist.
-	for _, alg := range adAlgorithms {
-		objsToDelete = append(objsToDelete,
-			&v3.GlobalAlertTemplate{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "GlobalAlertTemplate",
-					APIVersion: "projectcalico.org/v3",
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name: adDetectorPrefixName + alg,
-				},
-			},
-			&v3.GlobalAlert{
-				TypeMeta: metav1.TypeMeta{
-					Kind:       "GlobalAlert",
-					APIVersion: "projectcalico.org/v3",
-				},
-				ObjectMeta: metav1.ObjectMeta{
-					Name: adDetectorPrefixName + alg,
-				},
-			},
-		)
+	objsToDelete := []client.Object{
+		// PSPs have been removed from the Kubenretes API since v1.25, so we can delete
+		// any resources related to them that might still exist.
+		c.intrusionDetectionPSPClusterRole(),
+		c.intrusionDetectionPSPClusterRoleBinding(),
 	}
 
-	// AD Related deployment only for management/standalone cluster
-	// When FIPS mode is enabled, we currently disable our python based images.
-	if !c.cfg.ManagedCluster {
-		var adObjs []client.Object
-
-		// Service + Deployment + RBAC for AD API
-		adObjs = append(adObjs,
-			c.adAPIAllowTigeraPolicy(),
-			c.adAPIServiceAccount(),
-			c.adAPIAccessClusterRole(),
-			c.adAPIAccessRoleBinding(),
-		)
-
-		adObjs = append(adObjs, c.adPersistentVolumeClaim())
-
-		adObjs = append(adObjs,
-			c.adAPIService(),
-			c.adAPIDeployment(),
-		)
-
-		// RBAC for AD Detector Pods
-		adObjs = append(adObjs,
-			c.adDetectorAllowTigeraPolicy(),
-			c.adDetectorServiceAccount(),
-			c.adDetectorSecret(),
-			c.adDetectorAccessRole(),
-			c.adDetectorAccessClusterRole(),
-			c.adDetectorRoleBinding(),
-			c.adDetectorClusterRoleBinding(),
-		)
-		adObjs = append(adObjs, c.adDetectorPodTemplates()...)
-
-		if c.cfg.UsePSP {
-			adObjs = append(adObjs, c.adAPIPodSecurityPolicy())
-		}
-
-		// Delete all of those possible AD resources.
-		objsToDelete = append(objsToDelete, adObjs...)
+	if !c.cfg.ManagedCluster && !c.cfg.Tenant.MultiTenant() {
+		// Delete any anomaly detection components that might still exist.
+		// These were removed in an earlier version of the operator.
+		objsToDelete = append(objsToDelete, c.adComponentsToDelete()...)
 	}
 
-	// When FIPS mode is enabled, we currently disable our python based images.
-	if !c.cfg.ManagedCluster {
+	if !c.cfg.ManagedCluster && !c.cfg.Tenant.MultiTenant() {
+		// For now, we don't create the installer job in multi-tenant clusters.
 		idsObjs := []client.Object{
+			c.intrusionDetectionJobServiceAccount(),
 			c.intrusionDetectionElasticsearchAllowTigeraPolicy(),
 			c.intrusionDetectionElasticsearchJob(),
 		}
-
-		if !operatorv1.IsFIPSModeEnabled(c.cfg.Installation.FIPSMode) {
-			objs = append(objs, idsObjs...)
-		} else {
-			objsToDelete = append(objsToDelete, idsObjs...)
-		}
-	}
-
-	if c.cfg.UsePSP {
-		objs = append(objs,
-			c.intrusionDetectionPSPClusterRole(),
-			c.intrusionDetectionPSPClusterRoleBinding(),
-			c.intrusionDetectionPodSecurityPolicy(),
-		)
+		objsToDelete = append(objsToDelete, idsObjs...)
 	}
 
 	if c.cfg.ManagedCluster {
@@ -308,7 +213,6 @@ func (c *intrusionDetectionComponent) Objects() ([]client.Object, []client.Objec
 	if c.cfg.HasNoLicense {
 		return nil, objs
 	}
-
 	return objs, objsToDelete
 }
 
@@ -317,104 +221,12 @@ func (c *intrusionDetectionComponent) Ready() bool {
 }
 
 func (c *intrusionDetectionComponent) intrusionDetectionElasticsearchJob() *batchv1.Job {
-	podTemplate := relasticsearch.DecorateAnnotations(&corev1.PodTemplateSpec{
-		ObjectMeta: metav1.ObjectMeta{
-			Labels: map[string]string{"job-name": IntrusionDetectionInstallerJobName},
-		},
-		Spec: corev1.PodSpec{
-			Tolerations:  c.cfg.Installation.ControlPlaneTolerations,
-			NodeSelector: c.cfg.Installation.ControlPlaneNodeSelector,
-			// This value needs to be set to never. The PodFailurePolicy will still ensure that this job will run until completion.
-			RestartPolicy:    corev1.RestartPolicyNever,
-			ImagePullSecrets: secret.GetReferenceList(c.cfg.PullSecrets),
-			Containers: []corev1.Container{
-				c.intrusionDetectionJobContainer(),
-			},
-			Volumes:            []corev1.Volume{c.cfg.TrustedCertBundle.Volume()},
-			ServiceAccountName: IntrusionDetectionInstallerJobName,
-		},
-	}, c.cfg.ESSecrets).(*corev1.PodTemplateSpec)
-
 	return &batchv1.Job{
 		TypeMeta: metav1.TypeMeta{Kind: "Job", APIVersion: "batch/v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      IntrusionDetectionInstallerJobName,
-			Namespace: IntrusionDetectionNamespace,
+			Namespace: c.cfg.Namespace,
 		},
-		Spec: batchv1.JobSpec{
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"job-name": IntrusionDetectionInstallerJobName,
-				},
-			},
-			Template: *podTemplate,
-			// PodFailurePolicy is not available for k8s < 1.26; setting BackoffLimit to a higher number (default is 6)
-			// to lessen the frequency of installation failures when responses from Elastic Search takes more time.
-			BackoffLimit: ptr.Int32ToPtr(30),
-			PodFailurePolicy: &batchv1.PodFailurePolicy{
-				Rules: []batchv1.PodFailurePolicyRule{
-					// We don't want the job to fail, so we keep retrying by ignoring incrementing the backoff.
-					{
-						Action: "Ignore",
-						OnExitCodes: &batchv1.PodFailurePolicyOnExitCodesRequirement{
-							Operator: "NotIn",
-							Values:   []int32{0},
-						},
-					},
-				},
-			},
-		},
-	}
-}
-
-func (c *intrusionDetectionComponent) intrusionDetectionJobContainer() corev1.Container {
-	kScheme, kHost, kPort, _ := url.ParseEndpoint(rkibana.HTTPSEndpoint(c.SupportedOSType(), c.cfg.ClusterDomain))
-	secretName := ElasticsearchIntrusionDetectionJobUserSecret
-	return corev1.Container{
-		Name:            "elasticsearch-job-installer",
-		Image:           c.jobInstallerImage,
-		ImagePullPolicy: ImagePullPolicy(),
-		Env: []corev1.EnvVar{
-			{
-				Name:  "KIBANA_HOST",
-				Value: kHost,
-			},
-			{
-				Name:  "KIBANA_PORT",
-				Value: kPort,
-			},
-			{
-				Name:  "KIBANA_SCHEME",
-				Value: kScheme,
-			},
-			{
-				// We no longer need to start the xpack trial from the installer pod. Logstorage
-				// now takes care of this in combination with the ECK operator (v1).
-				Name:  "START_XPACK_TRIAL",
-				Value: "false",
-			},
-			{
-				Name:      "USER",
-				ValueFrom: secret.GetEnvVarSource(secretName, "username", false),
-			},
-			{
-				Name:      "PASSWORD",
-				ValueFrom: secret.GetEnvVarSource(secretName, "password", false),
-			},
-			{
-				Name:  "KB_CA_CERT",
-				Value: c.cfg.TrustedCertBundle.MountPath(),
-			},
-			{
-				Name:  "FIPS_MODE_ENABLED",
-				Value: operatorv1.IsFIPSModeEnabledString(c.cfg.Installation.FIPSMode),
-			},
-			relasticsearch.ElasticIndexSuffixEnvVar(c.cfg.ESClusterConfig.ClusterName()),
-			relasticsearch.ElasticUserEnvVar(ElasticsearchIntrusionDetectionJobUserSecret),
-			relasticsearch.ElasticPasswordEnvVar(ElasticsearchIntrusionDetectionJobUserSecret),
-		},
-		SecurityContext: securitycontext.NewNonRootContext(),
-		VolumeMounts:    c.cfg.TrustedCertBundle.VolumeMounts(c.SupportedOSType()),
 	}
 }
 
@@ -423,7 +235,7 @@ func (c *intrusionDetectionComponent) intrusionDetectionServiceAccount() *corev1
 		TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      IntrusionDetectionName,
-			Namespace: IntrusionDetectionNamespace,
+			Namespace: c.cfg.Namespace,
 		},
 	}
 }
@@ -433,7 +245,7 @@ func (c *intrusionDetectionComponent) intrusionDetectionJobServiceAccount() *cor
 		TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      IntrusionDetectionInstallerJobName,
-			Namespace: IntrusionDetectionNamespace,
+			Namespace: c.cfg.Namespace,
 		},
 	}
 }
@@ -501,21 +313,21 @@ func (c *intrusionDetectionComponent) intrusionDetectionClusterRole() *rbacv1.Cl
 			},
 			Verbs: []string{"get"},
 		},
-	}
-
-	if c.deployWebhooksController() {
-		rules = append(rules,
-			rbacv1.PolicyRule{
-				APIGroups: []string{""},
-				Resources: []string{"secrets", "configmaps"},
-				Verbs:     []string{"get", "watch"},
-			},
-			rbacv1.PolicyRule{
-				APIGroups: []string{"crd.projectcalico.org"},
-				Resources: []string{"securityeventwebhooks"},
-				Verbs:     []string{"get", "watch", "update"},
-			},
-		)
+		{
+			APIGroups: []string{""},
+			Resources: []string{"secrets", "configmaps"},
+			Verbs:     []string{"get", "watch"},
+		},
+		{
+			APIGroups: []string{"crd.projectcalico.org"},
+			Resources: []string{"securityeventwebhooks"},
+			Verbs:     []string{"get", "watch", "update"},
+		},
+		{
+			APIGroups: []string{"crd.projectcalico.org"},
+			Resources: []string{"alertexceptions"},
+			Verbs:     []string{"get", "list"},
+		},
 	}
 
 	if !c.cfg.ManagedCluster {
@@ -580,24 +392,7 @@ func (c *intrusionDetectionComponent) intrusionDetectionClusterRole() *rbacv1.Cl
 }
 
 func (c *intrusionDetectionComponent) intrusionDetectionClusterRoleBinding() *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: IntrusionDetectionName,
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     IntrusionDetectionName,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      IntrusionDetectionName,
-				Namespace: IntrusionDetectionNamespace,
-			},
-		},
-	}
+	return rcomponents.ClusterRoleBinding(IntrusionDetectionName, IntrusionDetectionName, IntrusionDetectionName, c.cfg.BindNamespaces)
 }
 
 func (c *intrusionDetectionComponent) externalLinseedRoleBinding() *rbacv1.RoleBinding {
@@ -608,7 +403,7 @@ func (c *intrusionDetectionComponent) externalLinseedRoleBinding() *rbacv1.RoleB
 		TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      linseed,
-			Namespace: IntrusionDetectionNamespace,
+			Namespace: c.cfg.Namespace,
 		},
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
@@ -630,20 +425,19 @@ func (c *intrusionDetectionComponent) intrusionDetectionRole() *rbacv1.Role {
 		TypeMeta: metav1.TypeMeta{Kind: "Role", APIVersion: "rbac.authorization.k8s.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      IntrusionDetectionName,
-			Namespace: IntrusionDetectionNamespace,
+			Namespace: c.cfg.Namespace,
 		},
 		Rules: []rbacv1.PolicyRule{
 			{
-				APIGroups: []string{
-					"",
-				},
-				Resources: []string{
-					"secrets",
-					"configmaps",
-				},
-				Verbs: []string{
-					"get",
-				},
+				APIGroups: []string{""},
+				Resources: []string{"secrets"},
+				Verbs:     []string{"get"},
+			},
+			{
+				// Intrusion detection forwarder snapshots its state to a specific ConfigMap.
+				APIGroups: []string{""},
+				Resources: []string{"configmaps"},
+				Verbs:     []string{"get", "create", "update"},
 			},
 		},
 	}
@@ -654,7 +448,7 @@ func (c *intrusionDetectionComponent) intrusionDetectionRoleBinding() *rbacv1.Ro
 		TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      IntrusionDetectionName,
-			Namespace: IntrusionDetectionNamespace,
+			Namespace: c.cfg.Namespace,
 		},
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
@@ -665,7 +459,7 @@ func (c *intrusionDetectionComponent) intrusionDetectionRoleBinding() *rbacv1.Ro
 			{
 				Kind:      "ServiceAccount",
 				Name:      IntrusionDetectionName,
-				Namespace: IntrusionDetectionNamespace,
+				Namespace: c.cfg.Namespace,
 			},
 		},
 	}
@@ -674,17 +468,24 @@ func (c *intrusionDetectionComponent) intrusionDetectionRoleBinding() *rbacv1.Ro
 func (c *intrusionDetectionComponent) intrusionDetectionDeployment() *appsv1.Deployment {
 	var replicas int32 = 1
 
-	return &appsv1.Deployment{
+	d := &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      IntrusionDetectionName,
-			Namespace: IntrusionDetectionNamespace,
+			Namespace: c.cfg.Namespace,
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: &replicas,
 			Template: *c.deploymentPodTemplate(),
 		},
 	}
+
+	if c.cfg.IntrusionDetection != nil {
+		if overrides := c.cfg.IntrusionDetection.Spec.IntrusionDetectionControllerDeployment; overrides != nil {
+			rcomponents.ApplyDeploymentOverrides(d, overrides)
+		}
+	}
+	return d
 }
 
 func (c *intrusionDetectionComponent) deploymentPodTemplate() *corev1.PodTemplateSpec {
@@ -735,18 +536,18 @@ func (c *intrusionDetectionComponent) deploymentPodTemplate() *corev1.PodTemplat
 	}
 	var initContainers []corev1.Container
 	if c.cfg.IntrusionDetectionCertSecret != nil && c.cfg.IntrusionDetectionCertSecret.UseCertificateManagement() {
-		initContainers = append(initContainers, c.cfg.IntrusionDetectionCertSecret.InitContainer(IntrusionDetectionNamespace))
+		initContainers = append(initContainers, c.cfg.IntrusionDetectionCertSecret.InitContainer(c.cfg.Namespace))
 	}
 
-	containers := []corev1.Container{intrusionDetectionContainer}
-	if c.deployWebhooksController() {
-		containers = append(containers, c.webhooksControllerContainer())
+	containers := []corev1.Container{
+		intrusionDetectionContainer,
+		c.webhooksControllerContainer(),
 	}
 
-	return relasticsearch.DecorateAnnotations(&corev1.PodTemplateSpec{
+	return &corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        IntrusionDetectionName,
-			Namespace:   IntrusionDetectionNamespace,
+			Namespace:   c.cfg.Namespace,
 			Annotations: c.intrusionDetectionAnnotations(),
 		},
 		Spec: corev1.PodSpec{
@@ -758,12 +559,7 @@ func (c *intrusionDetectionComponent) deploymentPodTemplate() *corev1.PodTemplat
 			Containers:         containers,
 			Volumes:            volumes,
 		},
-	}, c.cfg.ESSecrets).(*corev1.PodTemplateSpec)
-}
-
-func (c *intrusionDetectionComponent) deployWebhooksController() bool {
-	// deploy webhooks controller container only for managed clusters or stand-alone enterprise clusters
-	return c.cfg.ManagedCluster || !c.cfg.ManagementCluster
+	}
 }
 
 func (c *intrusionDetectionComponent) webhooksControllerContainer() corev1.Container {
@@ -811,7 +607,6 @@ func (c *intrusionDetectionComponent) webhooksControllerContainer() corev1.Conta
 }
 
 func (c *intrusionDetectionComponent) intrusionDetectionControllerContainer() corev1.Container {
-	esScheme, esHost, esPort, _ := url.ParseEndpoint(relasticsearch.GatewayEndpoint(c.SupportedOSType(), c.cfg.ClusterDomain, ElasticsearchNamespace))
 	envs := []corev1.EnvVar{
 		{
 			Name:  "MULTI_CLUSTER_FORWARDING_CA",
@@ -823,7 +618,7 @@ func (c *intrusionDetectionComponent) intrusionDetectionControllerContainer() co
 		},
 		{
 			Name:  "LINSEED_URL",
-			Value: relasticsearch.LinseedEndpoint(c.SupportedOSType(), c.cfg.ClusterDomain, ElasticsearchNamespace),
+			Value: relasticsearch.LinseedEndpoint(c.SupportedOSType(), c.cfg.ClusterDomain, LinseedNamespace(c.cfg.Tenant)),
 		},
 		{
 			Name:  "LINSEED_CA",
@@ -841,15 +636,20 @@ func (c *intrusionDetectionComponent) intrusionDetectionControllerContainer() co
 			Name:  "LINSEED_TOKEN",
 			Value: GetLinseedTokenPath(c.cfg.ManagedCluster),
 		},
-		relasticsearch.ElasticIndexSuffixEnvVar(c.cfg.ESClusterConfig.ClusterName()),
-		relasticsearch.ElasticUserEnvVar(ElasticsearchIntrusionDetectionUserSecret),
-		relasticsearch.ElasticPasswordEnvVar(ElasticsearchIntrusionDetectionUserSecret),
-		relasticsearch.ElasticHostEnvVar(esHost),
-		relasticsearch.ElasticPortEnvVar(esPort),
-		relasticsearch.ElasticSchemeEnvVar(esScheme),
-		relasticsearch.ElasticCAEnvVar(c.SupportedOSType()),
 	}
 
+	if c.cfg.Tenant != nil {
+		// Configure the tenant id in order to read /write linseed data using the correct tenant ID
+		// Multi-tenant and single tenant with external elastic needs this variable set
+		if c.cfg.ExternalElastic {
+			envs = append(envs, corev1.EnvVar{Name: "TENANT_ID", Value: c.cfg.Tenant.Spec.ID})
+		}
+
+		if c.cfg.Tenant.MultiTenant() {
+			envs = append(envs, corev1.EnvVar{Name: "TENANT_NAMESPACE", Value: c.cfg.Tenant.Namespace})
+			envs = append(envs, corev1.EnvVar{Name: "MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: ManagerService(c.cfg.Tenant)})
+		}
+	}
 	sc := securitycontext.NewNonRootContext()
 
 	// If syslog forwarding is enabled then set the necessary ENV var and volume mount to
@@ -1157,217 +957,13 @@ func (c *intrusionDetectionComponent) globalAlertTemplates() []client.Object {
 	return globalAlertTemplates
 }
 
-func (c *intrusionDetectionComponent) intrusionDetectionPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	psp := podsecuritypolicy.NewBasePolicy("intrusion-detection")
-	if c.syslogForwardingIsEnabled() {
-		psp.Spec.Volumes = append(psp.Spec.Volumes, policyv1beta1.HostPath)
-		psp.Spec.AllowedHostPaths = []policyv1beta1.AllowedHostPath{
-			{
-				PathPrefix: "/var/log/calico",
-				ReadOnly:   false,
-			},
-		}
-		psp.Spec.RunAsUser.Rule = policyv1beta1.RunAsUserStrategyRunAsAny
-	}
-	return psp
-}
-
-func (c *intrusionDetectionComponent) intrusionDetectionPSPClusterRole() *rbacv1.ClusterRole {
-	return &rbacv1.ClusterRole{
-		TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "intrusion-detection-psp",
-		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				// Allow access to the pod security policy in case this is enforced on the cluster
-				APIGroups:     []string{"policy"},
-				Resources:     []string{"podsecuritypolicies"},
-				Verbs:         []string{"use"},
-				ResourceNames: []string{"intrusion-detection"},
-			},
-		},
-	}
-}
-
-func (c *intrusionDetectionComponent) intrusionDetectionPSPClusterRoleBinding() *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "intrusion-detection-psp",
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     "intrusion-detection-psp",
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      IntrusionDetectionName,
-				Namespace: IntrusionDetectionNamespace,
-			},
-			{
-				Kind:      "ServiceAccount",
-				Name:      IntrusionDetectionInstallerJobName,
-				Namespace: IntrusionDetectionNamespace,
-			},
-		},
-	}
-}
-
 func (c *intrusionDetectionComponent) intrusionDetectionAnnotations() map[string]string {
 	return c.cfg.TrustedCertBundle.HashAnnotations()
 }
 
-// AD API RBAC for accessing token and subject access reviews for AD Pod token verification
-func (c *intrusionDetectionComponent) adAPIServiceAccount() *corev1.ServiceAccount {
-	return &corev1.ServiceAccount{
-		TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ADAPIObjectName,
-			Namespace: IntrusionDetectionNamespace,
-		},
-	}
-}
-
-func (c *intrusionDetectionComponent) adAPIAccessClusterRole() *rbacv1.ClusterRole {
-	return &rbacv1.ClusterRole{
-		TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: ADAPIObjectName,
-		},
-	}
-}
-
-func (c *intrusionDetectionComponent) adAPIAccessRoleBinding() *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: ADAPIObjectName,
-		},
-	}
-}
-
-// AD API Service and Deployment
-func (c *intrusionDetectionComponent) adAPIService() *corev1.Service {
-	return &corev1.Service{
-		TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ADAPIObjectName,
-			Namespace: IntrusionDetectionNamespace,
-		},
-	}
-}
-
-func (c *intrusionDetectionComponent) adPersistentVolumeClaim() *corev1.PersistentVolumeClaim {
-	adPVC := corev1.PersistentVolumeClaim{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "PersistentVolumeClaim",
-			APIVersion: "v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ADPersistentVolumeClaimName,
-			Namespace: IntrusionDetectionNamespace,
-		},
-	}
-
-	return &adPVC
-}
-
-func (c *intrusionDetectionComponent) adAPIPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(ADAPIPodSecurityPolicyName)
-}
-
-func (c *intrusionDetectionComponent) adAPIDeployment() *appsv1.Deployment {
-	return &appsv1.Deployment{
-		TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ADAPIObjectName,
-			Namespace: IntrusionDetectionNamespace,
-		},
-	}
-}
-
-func (c *intrusionDetectionComponent) adDetectorServiceAccount() *corev1.ServiceAccount {
-	return &corev1.ServiceAccount{
-		TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      adDetectorName,
-			Namespace: IntrusionDetectionNamespace,
-		},
-	}
-}
-
-func (c *intrusionDetectionComponent) adDetectorSecret() *corev1.Secret {
-	return &corev1.Secret{
-		TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      adDetectorName,
-			Namespace: IntrusionDetectionNamespace,
-		},
-	}
-}
-
-func (c *intrusionDetectionComponent) adDetectorAccessRole() *rbacv1.Role {
-	return &rbacv1.Role{
-		TypeMeta: metav1.TypeMeta{Kind: "Role", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      adDetectorName,
-			Namespace: IntrusionDetectionNamespace,
-		},
-	}
-}
-
-func (c *intrusionDetectionComponent) adDetectorAccessClusterRole() *rbacv1.ClusterRole {
-	return &rbacv1.ClusterRole{
-		TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: adDetectorName,
-		},
-	}
-}
-
-func (c *intrusionDetectionComponent) adDetectorRoleBinding() *rbacv1.RoleBinding {
-	return &rbacv1.RoleBinding{
-		TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      adDetectorName,
-			Namespace: IntrusionDetectionNamespace,
-		},
-	}
-}
-
-func (c *intrusionDetectionComponent) adDetectorClusterRoleBinding() *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: adDetectorName,
-		},
-	}
-}
-
-func (c *intrusionDetectionComponent) adDetectorPodTemplates() []client.Object {
-	trainingJobPodTemplate := c.getBaseADDetectorsPodTemplate(ADJobPodTemplateBaseName + ".training")
-	detecionADJobPodTemplate := c.getBaseADDetectorsPodTemplate(ADJobPodTemplateBaseName + ".detection")
-
-	return []client.Object{&trainingJobPodTemplate, &detecionADJobPodTemplate}
-}
-
-func (c *intrusionDetectionComponent) getBaseADDetectorsPodTemplate(podTemplateName string) corev1.PodTemplate {
-	return corev1.PodTemplate{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "PodTemplate",
-			APIVersion: "v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: IntrusionDetectionNamespace,
-			Name:      podTemplateName,
-		},
-	}
-}
-
 func (c *intrusionDetectionComponent) intrusionDetectionControllerAllowTigeraPolicy() *v3.NetworkPolicy {
+	helper := networkpolicy.Helper(c.cfg.Tenant.MultiTenant(), c.cfg.Namespace)
+
 	egressRules := []v3.Rule{
 		// Block any link local IPs, e.g. cloud metadata, which are often targets of server-side request forgery (SSRF) attacks
 		{
@@ -1396,14 +992,8 @@ func (c *intrusionDetectionComponent) intrusionDetectionControllerAllowTigeraPol
 		egressRules = append(egressRules, v3.Rule{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.DefaultHelper().ESGatewayEntityRule(),
+			Destination: helper.LinseedEntityRule(),
 		})
-		egressRules = append(egressRules, v3.Rule{
-			Action:      v3.Allow,
-			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.DefaultHelper().LinseedEntityRule(),
-		})
-
 	}
 	egressRules = append(egressRules, []v3.Rule{
 		{
@@ -1421,7 +1011,7 @@ func (c *intrusionDetectionComponent) intrusionDetectionControllerAllowTigeraPol
 		TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      IntrusionDetectionControllerPolicyName,
-			Namespace: IntrusionDetectionNamespace,
+			Namespace: c.cfg.Namespace,
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
@@ -1440,46 +1030,213 @@ func (c *intrusionDetectionComponent) intrusionDetectionControllerAllowTigeraPol
 }
 
 func (c *intrusionDetectionComponent) intrusionDetectionElasticsearchAllowTigeraPolicy() *v3.NetworkPolicy {
-	egressRules := []v3.Rule{}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, c.cfg.Openshift)
-	egressRules = append(egressRules, v3.Rule{
-		Action:      v3.Allow,
-		Protocol:    &networkpolicy.TCPProtocol,
-		Destination: networkpolicy.DefaultHelper().ESGatewayEntityRule(),
-	})
-
 	return &v3.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      IntrusionDetectionInstallerPolicyName,
-			Namespace: IntrusionDetectionNamespace,
-		},
-		Spec: v3.NetworkPolicySpec{
-			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
-			Selector: fmt.Sprintf("job-name == '%s'", IntrusionDetectionInstallerJobName),
-			Types:    []v3.PolicyType{v3.PolicyTypeEgress},
-			Egress:   egressRules,
+			Namespace: c.cfg.Namespace,
 		},
 	}
 }
 
-func (c *intrusionDetectionComponent) adAPIAllowTigeraPolicy() *v3.NetworkPolicy {
-	return &v3.NetworkPolicy{
-		TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ADAPIPolicyName,
-			Namespace: IntrusionDetectionNamespace,
+// adComponentsToDelete returns a list of objects to delete. Anomaly detection used to be installed here,
+// but has since been removed. This function is kept around to clean up any old objects that may be left.
+func (c intrusionDetectionComponent) adComponentsToDelete() []client.Object {
+	objs := []client.Object{
+		&corev1.ServiceAccount{
+			TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      ADAPIObjectName,
+				Namespace: IntrusionDetectionNamespace,
+			},
 		},
+
+		&rbacv1.ClusterRole{
+			TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: ADAPIObjectName,
+			},
+		},
+
+		&rbacv1.ClusterRoleBinding{
+			TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: ADAPIObjectName,
+			},
+		},
+
+		&corev1.Service{
+			TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      ADAPIObjectName,
+				Namespace: IntrusionDetectionNamespace,
+			},
+		},
+
+		&corev1.PersistentVolumeClaim{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "PersistentVolumeClaim",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      ADPersistentVolumeClaimName,
+				Namespace: IntrusionDetectionNamespace,
+			},
+		},
+
+		&appsv1.Deployment{
+			TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      ADAPIObjectName,
+				Namespace: IntrusionDetectionNamespace,
+			},
+		},
+
+		&corev1.ServiceAccount{
+			TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      adDetectorName,
+				Namespace: IntrusionDetectionNamespace,
+			},
+		},
+
+		&corev1.Secret{
+			TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      adDetectorName,
+				Namespace: IntrusionDetectionNamespace,
+			},
+		},
+
+		&rbacv1.Role{
+			TypeMeta: metav1.TypeMeta{Kind: "Role", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      adDetectorName,
+				Namespace: IntrusionDetectionNamespace,
+			},
+		},
+
+		&rbacv1.ClusterRole{
+			TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: adDetectorName,
+			},
+		},
+
+		&rbacv1.RoleBinding{
+			TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      adDetectorName,
+				Namespace: IntrusionDetectionNamespace,
+			},
+		},
+
+		&rbacv1.ClusterRoleBinding{
+			TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: adDetectorName,
+			},
+		},
+
+		&v3.NetworkPolicy{
+			TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      ADAPIPolicyName,
+				Namespace: IntrusionDetectionNamespace,
+			},
+		},
+
+		&v3.NetworkPolicy{
+			TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      ADDetectorPolicyName,
+				Namespace: IntrusionDetectionNamespace,
+			},
+		},
+
+		&corev1.PodTemplate{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "PodTemplate",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: IntrusionDetectionNamespace,
+				Name:      ADJobPodTemplateBaseName + ".training",
+			},
+		},
+
+		&corev1.PodTemplate{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "PodTemplate",
+				APIVersion: "v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: IntrusionDetectionNamespace,
+				Name:      ADJobPodTemplateBaseName + ".detection",
+			},
+		},
+	}
+
+	adAlgorithms := []string{
+		"dga",
+		"http-connection-spike",
+		"http-response-codes",
+		"http-verbs",
+		"port-scan",
+		"generic-dns",
+		"generic-flows",
+		"multivariable-flow",
+		"generic-l7",
+		"dns-latency",
+		"dns-tunnel",
+		"l7-bytes",
+		"l7-latency",
+		"bytes-in",
+		"bytes-out",
+		"process-bytes",
+		"process-restarts",
+	}
+
+	for _, alg := range adAlgorithms {
+		objs = append(objs,
+			&v3.GlobalAlertTemplate{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "GlobalAlertTemplate",
+					APIVersion: "projectcalico.org/v3",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name: adDetectorPrefixName + alg,
+				},
+			},
+			&v3.GlobalAlert{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "GlobalAlert",
+					APIVersion: "projectcalico.org/v3",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name: adDetectorPrefixName + alg,
+				},
+			},
+		)
+	}
+
+	return objs
+}
+
+// instrusionDetectionPSPClusterRole returns metadata for the legacy PSP cluster role. This is no longer installed, and this function
+// exists solely to remove it from the cluster if it exists.
+func (c *intrusionDetectionComponent) intrusionDetectionPSPClusterRole() *rbacv1.ClusterRole {
+	return &rbacv1.ClusterRole{
+		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "intrusion-detection-psp"},
 	}
 }
 
-func (c *intrusionDetectionComponent) adDetectorAllowTigeraPolicy() *v3.NetworkPolicy {
-	return &v3.NetworkPolicy{
-		TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ADDetectorPolicyName,
-			Namespace: IntrusionDetectionNamespace,
-		},
+// intrusionDetectionPSPClusterRoleBinding returns metadata for the legacy PSP cluster role binding. This is no longer installed, and this function
+// exists solely to remove it from the cluster if it exists.
+func (c *intrusionDetectionComponent) intrusionDetectionPSPClusterRoleBinding() *rbacv1.ClusterRoleBinding {
+	return &rbacv1.ClusterRoleBinding{
+		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: "intrusion-detection-psp"},
 	}
 }

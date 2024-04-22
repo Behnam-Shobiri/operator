@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,5 @@ const (
 	// point to a testing repo but the init image will be pushed to quay, so having
 	// these separate allows pulling the proper test images for the Tigera components
 	// and Init image when testing.
-	ECKRegistry     = "quay.io/"
-	InitRegistry    = "quay.io/"
-	CSRInitRegistry = "quay.io/"
+	InitRegistry = "quay.io/"
 )

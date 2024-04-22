@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,7 +28,6 @@ import (
 
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 
-	"github.com/elastic/cloud-on-k8s/v2/pkg/utils/stringsutil"
 	"github.com/go-logr/logr"
 	configv1 "github.com/openshift/api/config/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -54,10 +53,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operator "github.com/tigera/operator/api/v1"
+	v1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/active"
 	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
 	"github.com/tigera/operator/pkg/common"
@@ -71,10 +70,10 @@ import (
 	"github.com/tigera/operator/pkg/controller/utils"
 	"github.com/tigera/operator/pkg/controller/utils/imageset"
 	"github.com/tigera/operator/pkg/crds"
+	"github.com/tigera/operator/pkg/ctrlruntime"
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
-	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/common/resourcequota"
 	"github.com/tigera/operator/pkg/render/kubecontrollers"
@@ -88,34 +87,35 @@ const (
 	// The default port used by calico/node to report Calico Enterprise internal metrics.
 	// This is separate from the calico/node prometheus metrics port, which is user configurable.
 	defaultNodeReporterPort = 9081
-	CalicoFinalizer         = "tigera.io/operator-cleanup"
 )
 
 const InstallationName string = "calico"
 
-//// Node and Installation finalizer
-// There is a problem with tearing down the calico resources where removing the calico-node ClusterRoleBinding
-// will block the kube-controller pod from teminating because the CNI plugin no longer has permissions.
-// To ensure this problem does not happen we add a finalizer to the Installation resource and to the
-// calico-node ClusterRoleBinding, ClusterRole, and ServiceAccount.
-// The finalizer on the Installation resource is so that the controller knows that it is time to tear down
-// and cleanup. This also allows the Installation resource to remain while the controller cleans up.
-// The finalizer on the calico-node resources is to ensure those resources remain when the Installation
-// is deleted (has the DeletionTimestamp added) because kubernetes will start cleaning up the resources.
+//// Use of Finalizers for graceful termination
 //
-// When the Installation resource is not being deleted the core controller will add a finalizer to
-// the Installation CR and a separate finalizer to the calico-node ClusterRoleBinding, ClusterRole,
-// and ServiceAccount.
+// There is a problem with tearing down the Calico resources where removing the calico-cni RBAC resources
+// prevents pod-networked pods (e.g., kube-controllers) from teminating because the CNI plugin no longer has the necessary permissions.
 //
-// When the Installation resource is being deleted (has a DeletionTimestamp) the following sequence is
-// expected:
-//   1. The kubernetes system will begin cleaning up the installation resources.
-//   2. Core reconciliation will pass terminating to the kube-controller render, this will ensure
-//      the kube-controller resources are returned to be deleted.
-//   3. Once the kube-controller pod is terminated we will re-render the calico-node ClusterRoleBinding,
+// To ensure this problem does not happen we make liberal use of finalizers to ensure a staged teardown of resources created by this operator.
+//
+// - Each controller (including this one) that requires the CNI plugin for teardown can add its own finalizer to the Installation CR, and is responsible
+//   for removing this finalizer when its finalization logic is complete.
+// - This controller adds a finalizer to the Calico CNI resources to ensure they remain even when the Installation
+//   is deleted. This finalizer is only removed once all per-controller finalizers on the Installation are removed.
+// - This controller adds a finalizer to the Installation that is only removed after the CNI resources have had their finalizers removed.
+//   This allows the Installation resource to remain while the operator as a whole cleans up.
+//
+// When the Installation resource is being deleted (has a DeletionTimestamp) the following sequence occurs:
+//
+//   1. Kubernetes will begin cleaning up any resources owned by the Installation.
+//   2. This controller will pass Terminating=true to the kube-controllers render code, ensuring
+//      the kube-controllers resources are explicitly deleted.
+//   3. Once kube-controllers is terminated we will remove this controller's Finalizer from the Installation.
+//   4. Once there are no more per-controller finalizers on the Installation, this controller will re-render the calico-cni ClusterRoleBinding,
 //      ClusterRole, and ServiceAccount resources to remove the finalizers on them.
-//   4. Once the calico-node ClusterRoleBinding finalizer is removed we have cleaned up everything
-//      necessary so we can remove the Installation finalizer and we're done.
+//   4. Once the calico-cni finalizers are emoved, this controller will remove the tigera.io/operator-cleanup finalizer
+//      from the Installation, allowing it to be deleted.
+//   5. Deletion of the Installation will trigger cleanup of the remaining calico-system resources left in the cluster.
 
 var (
 	log                    = logf.Log.WithName("controller_installation")
@@ -130,7 +130,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		return fmt.Errorf("failed to create Core Reconciler: %w", err)
 	}
 
-	c, err := controller.New("tigera-installation-controller", mgr, controller.Options{Reconciler: ri})
+	c, err := ctrlruntime.NewController("tigera-installation-controller", mgr, controller.Options{Reconciler: ri})
 	if err != nil {
 		return fmt.Errorf("Failed to create tigera-installation-controller: %w", err)
 	}
@@ -188,7 +188,6 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions) (*ReconcileInst
 		status:               statusManager,
 		typhaAutoscaler:      typhaScaler,
 		namespaceMigration:   nm,
-		amazonCRDExists:      opts.AmazonCRDExists,
 		enterpriseCRDsExist:  opts.EnterpriseCRDExists,
 		clusterDomain:        opts.ClusterDomain,
 		manageCRDs:           opts.ManageCRDs,
@@ -201,9 +200,9 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions) (*ReconcileInst
 }
 
 // add adds watches for resources that are available at startup
-func add(c controller.Controller, r *ReconcileInstallation) error {
+func add(c ctrlruntime.Controller, r *ReconcileInstallation) error {
 	// Watch for changes to primary resource Installation
-	err := c.Watch(&source.Kind{Type: &operator.Installation{}}, &handler.EnqueueRequestForObject{})
+	err := c.WatchObject(&operator.Installation{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return fmt.Errorf("tigera-installation-controller failed to watch primary resource: %w", err)
 	}
@@ -216,7 +215,7 @@ func add(c controller.Controller, r *ReconcileInstallation) error {
 	if r.autoDetectedProvider == operator.ProviderOpenShift {
 		// Watch for openshift network configuration as well. If we're running in OpenShift, we need to
 		// merge this configuration with our own and the write back the status object.
-		err = c.Watch(&source.Kind{Type: &configv1.Network{}}, &handler.EnqueueRequestForObject{})
+		err = c.WatchObject(&configv1.Network{}, &handler.EnqueueRequestForObject{})
 		if err != nil {
 			if !apierrors.IsNotFound(err) {
 				return fmt.Errorf("tigera-installation-controller failed to watch openshift network config: %w", err)
@@ -242,15 +241,6 @@ func add(c controller.Controller, r *ReconcileInstallation) error {
 		return fmt.Errorf("tigera-installation-controller failed to watch ConfigMap %s: %w", active.ActiveConfigMapName, err)
 	}
 
-	// Only watch the AmazonCloudIntegration if the CRD is available
-	if r.amazonCRDExists {
-		err = c.Watch(&source.Kind{Type: &operator.AmazonCloudIntegration{}}, &handler.EnqueueRequestForObject{})
-		if err != nil {
-			log.V(5).Info("Failed to create AmazonCloudIntegration watch", "err", err)
-			return fmt.Errorf("amazoncloudintegration-controller failed to watch primary resource: %w", err)
-		}
-	}
-
 	if err = imageset.AddImageSetWatch(c); err != nil {
 		return fmt.Errorf("tigera-installation-controller failed to watch ImageSet: %w", err)
 	}
@@ -262,38 +252,38 @@ func add(c controller.Controller, r *ReconcileInstallation) error {
 	}
 
 	// Watch for changes to KubeControllersConfiguration.
-	err = c.Watch(&source.Kind{Type: &crdv1.KubeControllersConfiguration{}}, &handler.EnqueueRequestForObject{})
+	err = c.WatchObject(&crdv1.KubeControllersConfiguration{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return fmt.Errorf("tigera-installation-controller failed to watch KubeControllersConfiguration resource: %w", err)
 	}
 
 	// Watch for changes to FelixConfiguration.
-	err = c.Watch(&source.Kind{Type: &crdv1.FelixConfiguration{}}, &handler.EnqueueRequestForObject{})
+	err = c.WatchObject(&crdv1.FelixConfiguration{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return fmt.Errorf("tigera-installation-controller failed to watch FelixConfiguration resource: %w", err)
 	}
 
 	// Watch for changes to BGPConfiguration.
-	err = c.Watch(&source.Kind{Type: &crdv1.BGPConfiguration{}}, &handler.EnqueueRequestForObject{})
+	err = c.WatchObject(&crdv1.BGPConfiguration{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return fmt.Errorf("tigera-installation-controller failed to watch BGPConfiguration resource: %w", err)
 	}
 
 	if r.enterpriseCRDsExist {
 		// Watch for changes to primary resource ManagementCluster
-		err = c.Watch(&source.Kind{Type: &operator.ManagementCluster{}}, &handler.EnqueueRequestForObject{})
+		err = c.WatchObject(&operator.ManagementCluster{}, &handler.EnqueueRequestForObject{})
 		if err != nil {
 			return fmt.Errorf("tigera-installation-controller failed to watch primary resource: %v", err)
 		}
 
 		// Watch for changes to primary resource ManagementClusterConnection
-		err = c.Watch(&source.Kind{Type: &operator.ManagementClusterConnection{}}, &handler.EnqueueRequestForObject{})
+		err = c.WatchObject(&operator.ManagementClusterConnection{}, &handler.EnqueueRequestForObject{})
 		if err != nil {
 			return fmt.Errorf("tigera-installation-controller failed to watch primary resource: %v", err)
 		}
 
 		// watch for change to primary resource LogCollector
-		err = c.Watch(&source.Kind{Type: &operator.LogCollector{}}, &handler.EnqueueRequestForObject{})
+		err = c.WatchObject(&operator.LogCollector{}, &handler.EnqueueRequestForObject{})
 		if err != nil {
 			return fmt.Errorf("tigera-installation-controller failed to watch primary resource: %v", err)
 		}
@@ -314,6 +304,12 @@ func add(c controller.Controller, r *ReconcileInstallation) error {
 				return fmt.Errorf("tigera-installation-controller failed to watch CRD resource: %v", err)
 			}
 		}
+	}
+
+	// Watch for changes to IPPool.
+	err = c.WatchObject(&crdv1.IPPool{}, &handler.EnqueueRequestForObject{})
+	if err != nil {
+		return fmt.Errorf("tigera-installation-controller failed to watch IPPool resource: %w", err)
 	}
 
 	// Perform periodic reconciliation. This acts as a backstop to catch reconcile issues,
@@ -371,6 +367,22 @@ type ReconcileInstallation struct {
 	tierWatchReady       *utils.ReadyFlag
 }
 
+// getActivePools returns the full set of enabled IP pools in the cluster.
+func getActivePools(ctx context.Context, client client.Client) (*crdv1.IPPoolList, error) {
+	allPools := crdv1.IPPoolList{}
+	if err := client.List(ctx, &allPools); err != nil && !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("unable to list IPPools: %s", err.Error())
+	}
+	filtered := crdv1.IPPoolList{}
+	for _, pool := range allPools.Items {
+		if pool.Spec.Disabled {
+			continue
+		}
+		filtered.Items = append(filtered.Items, pool)
+	}
+	return &filtered, nil
+}
+
 // updateInstallationWithDefaults returns the default installation instance with defaults populated.
 func updateInstallationWithDefaults(ctx context.Context, client client.Client, instance *operator.Installation, provider operator.Provider) error {
 	// Determine the provider in use by combining any auto-detected value with any value
@@ -380,27 +392,6 @@ func updateInstallationWithDefaults(ctx context.Context, client client.Client, i
 		return err
 	}
 
-	var openshiftConfig *configv1.Network
-	var kubeadmConfig *corev1.ConfigMap
-	if instance.Spec.KubernetesProvider == operator.ProviderOpenShift {
-		openshiftConfig = &configv1.Network{}
-		// If configured to run in openshift, then also fetch the openshift configuration API.
-		err = client.Get(ctx, types.NamespacedName{Name: openshiftNetworkConfig}, openshiftConfig)
-		if err != nil {
-			return fmt.Errorf("Unable to read openshift network configuration: %s", err.Error())
-		}
-	} else {
-		// Check if we're running on kubeadm by getting the config map.
-		kubeadmConfig = &corev1.ConfigMap{}
-		key := types.NamespacedName{Name: kubeadmConfigMap, Namespace: metav1.NamespaceSystem}
-		err = client.Get(ctx, key, kubeadmConfig)
-		if err != nil {
-			if !apierrors.IsNotFound(err) {
-				return fmt.Errorf("Unable to read kubeadm config map: %s", err.Error())
-			}
-			kubeadmConfig = nil
-		}
-	}
 	awsNode := &appsv1.DaemonSet{}
 	key := types.NamespacedName{Name: "aws-node", Namespace: metav1.NamespaceSystem}
 	err = client.Get(ctx, key, awsNode)
@@ -411,38 +402,32 @@ func updateInstallationWithDefaults(ctx context.Context, client client.Client, i
 		awsNode = nil
 	}
 
-	err = mergeAndFillDefaults(instance, openshiftConfig, kubeadmConfig, awsNode)
+	currentPools, err := getActivePools(ctx, client)
+	if err != nil {
+		return fmt.Errorf("unable to list IPPools: %s", err.Error())
+	}
+
+	err = MergeAndFillDefaults(instance, awsNode, currentPools)
 	if err != nil {
 		return err
 	}
 	return nil
 }
 
-// mergeAndFillDefaults merges in configuration from the Kubernetes provider, if applicable, and then
+// MergeAndFillDefaults merges in configuration from the Kubernetes provider, if applicable, and then
 // populates defaults in the Installation instance.
-func mergeAndFillDefaults(i *operator.Installation, o *configv1.Network, kubeadmConfig *corev1.ConfigMap, awsNode *appsv1.DaemonSet) error {
-	if o != nil {
-		// Merge in OpenShift configuration.
-		if err := updateInstallationForOpenshiftNetwork(i, o); err != nil {
-			return fmt.Errorf("Could not resolve CalicoNetwork IPPool and OpenShift network: %s", err.Error())
-		}
-	} else if kubeadmConfig != nil {
-		// Merge in kubeadm configuration.
-		if err := updateInstallationForKubeadm(i, kubeadmConfig); err != nil {
-			return fmt.Errorf("Could not resolve CalicoNetwork IPPool and kubeadm configuration: %s", err.Error())
-		}
-	}
+func MergeAndFillDefaults(i *operator.Installation, awsNode *appsv1.DaemonSet, currentPools *crdv1.IPPoolList) error {
 	if awsNode != nil {
 		if err := updateInstallationForAWSNode(i, awsNode); err != nil {
 			return fmt.Errorf("Could not resolve AWS node configuration: %s", err.Error())
 		}
 	}
 
-	return fillDefaults(i)
+	return fillDefaults(i, currentPools)
 }
 
 // fillDefaults populates the default values onto an Installation object.
-func fillDefaults(instance *operator.Installation) error {
+func fillDefaults(instance *operator.Installation, currentPools *crdv1.IPPoolList) error {
 	// Populate the instance with defaults for any fields not provided by the user.
 	if len(instance.Spec.Registry) != 0 && instance.Spec.Registry != components.UseDefault && !strings.HasSuffix(instance.Spec.Registry, "/") {
 		// Make sure registry, except for the special case "UseDefault", always ends with a slash.
@@ -458,23 +443,6 @@ func fillDefaults(instance *operator.Installation) error {
 	if instance.Spec.NonPrivileged == nil {
 		npd := operator.NonPrivilegedDisabled
 		instance.Spec.NonPrivileged = &npd
-	}
-
-	// Default the CNI plugin based on the Kubernetes provider.
-	if instance.Spec.CNI == nil {
-		instance.Spec.CNI = &operator.CNISpec{}
-	}
-	if instance.Spec.CNI.Type == "" {
-		switch instance.Spec.KubernetesProvider {
-		case operator.ProviderAKS:
-			instance.Spec.CNI.Type = operator.PluginAzureVNET
-		case operator.ProviderEKS:
-			instance.Spec.CNI.Type = operator.PluginAmazonVPC
-		case operator.ProviderGKE:
-			instance.Spec.CNI.Type = operator.PluginGKE
-		default:
-			instance.Spec.CNI.Type = operator.PluginCalico
-		}
 	}
 
 	if instance.Spec.TyphaAffinity == nil {
@@ -508,11 +476,27 @@ func fillDefaults(instance *operator.Installation) error {
 		}
 	}
 
+	// Default the CNI plugin based on the Kubernetes provider.
+	if instance.Spec.CNI == nil {
+		instance.Spec.CNI = &operator.CNISpec{}
+	}
+	if instance.Spec.CNI.Type == "" {
+		switch instance.Spec.KubernetesProvider {
+		case operator.ProviderAKS:
+			instance.Spec.CNI.Type = operator.PluginAzureVNET
+		case operator.ProviderEKS:
+			instance.Spec.CNI.Type = operator.PluginAmazonVPC
+		case operator.ProviderGKE:
+			instance.Spec.CNI.Type = operator.PluginGKE
+		default:
+			instance.Spec.CNI.Type = operator.PluginCalico
+		}
+	}
+
 	// Default IPAM based on CNI.
 	if instance.Spec.CNI.IPAM == nil {
 		instance.Spec.CNI.IPAM = &operator.IPAMSpec{}
 	}
-
 	if instance.Spec.CNI.IPAM.Type == "" {
 		switch instance.Spec.CNI.Type {
 		case operator.PluginAzureVNET:
@@ -563,26 +547,6 @@ func fillDefaults(instance *operator.Installation) error {
 		}
 	}
 
-	// Only default IP pools if explicitly nil; we use the empty slice to mean "no IP pools".
-	// Only default IP pools if we're using Calico IPAM, otherwise there's no-one to use the IP pool.
-	if instance.Spec.CalicoNetwork.IPPools == nil && instance.Spec.CNI.IPAM.Type == operator.IPAMPluginCalico {
-		switch instance.Spec.KubernetesProvider {
-		case operator.ProviderEKS:
-			// On EKS, default to a CIDR that doesn't overlap with the host range,
-			// and also use VXLAN encap by default.
-			instance.Spec.CalicoNetwork.IPPools = []operator.IPPool{
-				{
-					CIDR:          "172.16.0.0/16",
-					Encapsulation: operator.EncapsulationVXLAN,
-				},
-			}
-		default:
-			instance.Spec.CalicoNetwork.IPPools = []operator.IPPool{
-				{CIDR: "192.168.0.0/16"},
-			}
-		}
-	}
-
 	// Default BGP enablement based on CNI plugin and provider.
 	if instance.Spec.CalicoNetwork.BGP == nil {
 		enabled := operator.BGPEnabled
@@ -608,30 +572,25 @@ func fillDefaults(instance *operator.Installation) error {
 		// BPF dataplane requires IP autodetection even if we're not using Calico IPAM.
 		needIPv4Autodetection = true
 	}
-
-	var v4pool, v6pool *operator.IPPool
-	v4pool = render.GetIPv4Pool(instance.Spec.CalicoNetwork.IPPools)
-	v6pool = render.GetIPv6Pool(instance.Spec.CalicoNetwork.IPPools)
-
-	if v4pool != nil {
-		if v4pool.Encapsulation == "" {
-			if instance.Spec.CNI.Type == operator.PluginCalico {
-				v4pool.Encapsulation = operator.EncapsulationIPIP
-			} else {
-				v4pool.Encapsulation = operator.EncapsulationNone
+	if currentPools != nil {
+		for _, pool := range currentPools.Items {
+			ip, _, err := net.ParseCIDR(pool.Spec.CIDR)
+			if err != nil {
+				return fmt.Errorf("failed to parse CIDR %s: %s", pool.Spec.CIDR, err)
+			}
+			if ip.To4() != nil {
+				// This is an IPv4 pool - we should default IPv4 autodetection if not specified.
+				needIPv4Autodetection = true
+			} else if ip.To16() != nil {
+				// This is an IPv6 pool - we should default IPv6 autodetection if not specified.
+				if instance.Spec.CalicoNetwork.NodeAddressAutodetectionV6 == nil {
+					t := true
+					instance.Spec.CalicoNetwork.NodeAddressAutodetectionV6 = &operator.NodeAddressAutodetection{
+						FirstFound: &t,
+					}
+				}
 			}
 		}
-		if v4pool.NATOutgoing == "" {
-			v4pool.NATOutgoing = operator.NATOutgoingEnabled
-		}
-		if v4pool.NodeSelector == "" {
-			v4pool.NodeSelector = operator.NodeSelectorDefault
-		}
-		if v4pool.BlockSize == nil {
-			var twentySix int32 = 26
-			v4pool.BlockSize = &twentySix
-		}
-		needIPv4Autodetection = true
 	}
 
 	if needIPv4Autodetection && instance.Spec.CalicoNetwork.NodeAddressAutodetectionV4 == nil {
@@ -657,27 +616,11 @@ func fillDefaults(instance *operator.Installation) error {
 		}
 	}
 
-	if v6pool != nil {
-		if v6pool.Encapsulation == "" {
-			v6pool.Encapsulation = operator.EncapsulationNone
-		}
-		if v6pool.NATOutgoing == "" {
-			v6pool.NATOutgoing = operator.NATOutgoingDisabled
-		}
-		if v6pool.NodeSelector == "" {
-			v6pool.NodeSelector = operator.NodeSelectorDefault
-		}
-		if instance.Spec.CalicoNetwork.NodeAddressAutodetectionV6 == nil {
-			// Default IPv6 address detection to "first found" if not specified.
-			t := true
-			instance.Spec.CalicoNetwork.NodeAddressAutodetectionV6 = &operator.NodeAddressAutodetection{
-				FirstFound: &t,
-			}
-		}
-		if v6pool.BlockSize == nil {
-			var oneTwentyTwo int32 = 122
-			v6pool.BlockSize = &oneTwentyTwo
-		}
+	if instance.Spec.CNI.Type == operator.PluginCalico &&
+		*instance.Spec.CalicoNetwork.LinuxDataplane == operator.LinuxDataplaneIptables &&
+		instance.Spec.CalicoNetwork.LinuxPolicySetupTimeoutSeconds == nil {
+		var delay int32 = 0
+		instance.Spec.CalicoNetwork.LinuxPolicySetupTimeoutSeconds = &delay
 	}
 
 	// While a number of the fields in this section are relevant to all CNI plugins,
@@ -810,8 +753,8 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		return reconcile.Result{}, err
 	}
 
-	terminating := (instance.DeletionTimestamp != nil)
-	if terminating {
+	installationMarkedForDeletion := (instance.DeletionTimestamp != nil)
+	if installationMarkedForDeletion {
 		reqLogger.Info("Installation object is terminating")
 	}
 	preDefaultPatchFrom := client.MergeFrom(instance.DeepCopy())
@@ -864,8 +807,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		r.status.SetDegraded(operator.ResourceReadError, "Error querying installation", err, reqLogger)
 		return reconcile.Result{}, err
 	}
-
-	reqLogger.V(2).Info("Loaded config", "config", instance)
+	reqLogger.V(2).Info("Loaded config", "installation", instance)
 
 	// Validate the configuration.
 	if err := validateCustomResource(instance); err != nil {
@@ -873,14 +815,30 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		return reconcile.Result{}, err
 	}
 
-	// See the section 'Node and Installation finalizer' at the top of this file for details.
-	if terminating {
-		// Keep a finalizer on the Installation object until all necessary dependencies have been cleaned up.
+	// See the section 'Use of Finalizers for graceful termination' at the top of this file for details.
+	if installationMarkedForDeletion {
+		// This controller manages a finalizer to track whether its own pods have been properly torn down. Only remove it
+		// when all pod-networked Pods managed by this controller have been torn down. For now, this is just calico-kube-controllers.
+		l := &appsv1.Deployment{}
+		err = r.client.Get(ctx, types.NamespacedName{Name: "calico-kube-controllers", Namespace: common.CalicoNamespace}, l)
+		if err != nil && !apierrors.IsNotFound(err) {
+			r.status.SetDegraded(operator.ResourceReadError, "Unable to read calico-kube-controllers deployment", err, reqLogger)
+			return reconcile.Result{}, err
+		} else if apierrors.IsNotFound(err) {
+			reqLogger.Info("calico-kube-controllers has been deleted, removing finalizer", "finalizer", render.InstallationControllerFinalizer)
+			utils.RemoveInstallationFinalizer(instance, render.InstallationControllerFinalizer)
+		} else {
+			reqLogger.Info("calico-kube-controller is still present, waiting for termination")
+		}
+
+		// Keep an overarching finalizer on the Installation object until ALL necessary dependencies have been cleaned up.
 		// This ensures we don't delete the CNI plugin and calico-node too early, as they are a pre-requisite for tearing
 		// down networking for other pods deployed by this operator.
 		doneTerminating := true
+		reqLogger.V(1).Info("Checking if we can remove Installation finalizer", "finalizer", render.OperatorCompleteFinalizer)
 
-		// Wait until the calico-node cluster role binding has been cleaned up.
+		// Wait until the calico-node cluster role binding has been cleaned up. This ClusterRole will only be removed after all other
+		// controllers have completed their finalization logic and removed their finalizer from the Installation.
 		crb := rbacv1.ClusterRoleBinding{}
 		key := types.NamespacedName{Name: "calico-node"}
 		err := r.client.Get(ctx, key, &crb)
@@ -889,27 +847,25 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 			return reconcile.Result{}, err
 		}
 		for _, x := range crb.Finalizers {
-			if x == render.NodeFinalizer {
+			if x == render.CNIFinalizer {
+				reqLogger.V(1).Info("Installation still finalizing: ClusterRoleBinding calico-node still active")
 				doneTerminating = false
 			}
 		}
 
-		// Wait until the apiserver namespace has been deleted.
-		ns := corev1.Namespace{}
-		key = types.NamespacedName{Name: rmeta.APIServerNamespace(instance.Spec.Variant)}
-		err = r.client.Get(ctx, key, &ns)
-		if !apierrors.IsNotFound(err) {
-			// We're not ready to terminate if the apiserer namespace hasn't been deleted.
-			doneTerminating = false
-		}
-
-		// If all of the above checks passed, we can clear the finalizer.
+		// If all of the above checks passed, we can clear the finalizer responsible for tracking
+		// whether all operator cleanup has completed.
 		if doneTerminating {
-			reqLogger.Info("Removing installation finalizer")
-			removeInstallationFinalizer(instance)
+			reqLogger.Info("Removing Installation finalizer", "finalizer", render.OperatorCompleteFinalizer)
+			utils.RemoveInstallationFinalizer(instance, render.OperatorCompleteFinalizer)
 		}
 	} else {
-		setInstallationFinalizer(instance)
+		// Add a finalizer to track whether or not this controller's specific finalization logic has completed.
+		utils.SetInstallationFinalizer(instance, render.InstallationControllerFinalizer)
+
+		// Add a finalizer to ensure the Installation is not deleted until all Operator finalization
+		// logic has completed.
+		utils.SetInstallationFinalizer(instance, render.OperatorCompleteFinalizer)
 	}
 
 	// Write the discovered configuration back to the API. This is essentially a poor-man's defaulting, and
@@ -921,7 +877,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		return reconcile.Result{}, err
 	}
 
-	// update Installation with 'overlay'
+	// Update Installation with 'overlay'
 	overlay := operator.Installation{}
 	if err := r.client.Get(ctx, utils.OverlayInstanceKey, &overlay); err != nil {
 		if !apierrors.IsNotFound(err) {
@@ -944,7 +900,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		return reconcile.Result{}, err
 	}
 
-	// now that migrated config is stored in the installation resource, we no longer need
+	// Now that migrated config is stored in the installation resource, we no longer need
 	// to check if a migration is needed for the lifetime of the operator.
 	r.migrationChecked = true
 
@@ -957,6 +913,31 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 			r.status.SetDegraded(operator.ResourceUpdateError, "Failed to write default status", err, reqLogger)
 			return reconcile.Result{}, err
 		}
+	}
+
+	// Wait for IP pools to be programmed. This may be done out-of-band by the user, or by the operator's IP pool controller.
+	currentPools, err := getActivePools(ctx, r.client)
+	if err != nil {
+		r.status.SetDegraded(operator.ResourceReadError, "error querying IP pools", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+
+	// Make sure CNI is configured before continuing.
+	if instance.Spec.CNI == nil || instance.Spec.CNI.IPAM == nil {
+		r.status.SetDegraded(operator.InvalidConfigurationError, "waiting for spec.cni to be filled in", nil, reqLogger)
+		return reconcile.Result{}, nil
+	}
+
+	// Determine if this cluster needs IP pools in order to operate.
+	// - If the installation has IP pools specified, then the cluster wants IP pools.
+	// - If the installation has no IP pools specified, it may still need them if it's using Calico IPAM or networking.
+	needsIPPools := instance.Spec.CalicoNetwork != nil && len(instance.Spec.CalicoNetwork.IPPools) != 0
+	if instance.Spec.CNI.Type == operator.PluginCalico || instance.Spec.CNI.IPAM.Type == operator.IPAMPluginCalico {
+		needsIPPools = true
+	}
+	if needsIPPools && len(currentPools.Items) == 0 {
+		r.status.SetDegraded(operator.ResourceNotFound, "waiting for enabled IP pools to be created", nil, reqLogger)
+		return reconcile.Result{}, nil
 	}
 
 	// If the autoscalar is degraded then trigger a run and recheck the degraded status. If it is still degraded after the
@@ -987,21 +968,6 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		// this controller to fail.
 		reqLogger.Info("Scheduling a retry", "when", utils.StandardRetry)
 		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
-	}
-
-	// The operator supports running without the AmazonCloudIntegration when it's CRD is not installed.
-	// If, when this controller was started, the CRD didn't exist, but it does now, then reboot.
-	if !r.amazonCRDExists {
-		amazonCRDRequired, err := utils.RequiresAmazonController(r.config)
-		if err != nil {
-			r.status.SetDegraded(operator.ResourceNotFound, "Error discovering AmazonCloudIntegration CRD", err, reqLogger)
-			reqLogger.Info("Scheduling a retry", "when", utils.StandardRetry)
-			return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
-		}
-		if amazonCRDRequired {
-			log.Info("Rebooting to enable AWS controllers")
-			os.Exit(0)
-		}
 	}
 
 	// Query for pull secrets in operator namespace
@@ -1131,20 +1097,9 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		return reconcile.Result{}, err
 	}
 
-	var aci *operator.AmazonCloudIntegration
-	if r.amazonCRDExists {
-		aci, err = utils.GetAmazonCloudIntegration(ctx, r.client)
-		if apierrors.IsNotFound(err) {
-			aci = nil
-		} else if err != nil {
-			r.status.SetDegraded(operator.ResourceReadError, "Error reading AmazonCloudIntegration", err, reqLogger)
-			return reconcile.Result{}, err
-		}
-	}
-
 	// Set any non-default FelixConfiguration values that we need.
-	felixConfiguration, err := utils.PatchFelixConfiguration(ctx, r.client, func(fc *crdv1.FelixConfiguration) bool {
-		return r.setDefaultsOnFelixConfiguration(instance, fc)
+	felixConfiguration, err := utils.PatchFelixConfiguration(ctx, r.client, func(fc *crdv1.FelixConfiguration) (bool, error) {
+		return r.setDefaultsOnFelixConfiguration(ctx, instance, fc, reqLogger)
 	})
 	if err != nil {
 		return reconcile.Result{}, err
@@ -1248,7 +1203,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 	// Render namespaces for Calico.
 	components = append(components, render.Namespaces(namespaceCfg))
 
-	if newActiveCM != nil && !terminating {
+	if newActiveCM != nil && !installationMarkedForDeletion {
 		log.Info("adding active configmap")
 		components = append(components, render.NewPassthrough(newActiveCM))
 	}
@@ -1298,33 +1253,26 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 
 	// Build a configuration for rendering calico/typha.
 	typhaCfg := render.TyphaConfiguration{
-		K8sServiceEp:           k8sapi.Endpoint,
-		Installation:           &instance.Spec,
-		TLS:                    typhaNodeTLS,
-		AmazonCloudIntegration: aci,
-		MigrateNamespaces:      needNsMigration,
-		ClusterDomain:          r.clusterDomain,
-		FelixHealthPort:        *felixConfiguration.Spec.HealthPort,
-		UsePSP:                 r.usePSP,
+		K8sServiceEp:      k8sapi.Endpoint,
+		Installation:      &instance.Spec,
+		TLS:               typhaNodeTLS,
+		MigrateNamespaces: needNsMigration,
+		ClusterDomain:     r.clusterDomain,
+		FelixHealthPort:   *felixConfiguration.Spec.HealthPort,
+		UsePSP:            r.usePSP,
 	}
 	components = append(components, render.Typha(&typhaCfg))
 
-	// See the section 'Node and Installation finalizer' at the top of this file for terminating details.
-	nodeTerminating := false
-	if terminating {
-		// Wait for the calico-kube-controllers deployment to be removed before cleaning up calico/node resources.
-		// The existence of the deployment is a signal that the pods have not been torn down, as Kubernetes waits for its children to be deleted
-		// before removing the deployment itself.
-		l := &appsv1.Deployment{}
-		err = r.client.Get(ctx, types.NamespacedName{Name: "calico-kube-controllers", Namespace: common.CalicoNamespace}, l)
-		if err != nil && !apierrors.IsNotFound(err) {
-			r.status.SetDegraded(operator.ResourceReadError, "Unable to read calico-kube-controllers deployment", err, reqLogger)
-			return reconcile.Result{}, err
-		} else if apierrors.IsNotFound(err) {
-			reqLogger.Info("calico-kube-controllers has been deleted, calico-node RBAC resources can now be removed")
-			nodeTerminating = true
-		} else {
-			reqLogger.Info("calico-kube-controller is still present, waiting for termination")
+	// See the section 'Use of Finalizers for graceful termination' at the top of this file for terminating details.
+	canRemoveCNI := false
+	if installationMarkedForDeletion {
+		// Wait for other controllers to complete their finalizer teardown before removing the CNI plugin.
+		canRemoveCNI = true
+		for _, f := range instance.Finalizers {
+			if f != render.OperatorCompleteFinalizer {
+				reqLogger.Info("Waiting for finalization to complete before removing CNI resources", "finalizer", f)
+				canRemoveCNI = false
+			}
 		}
 	}
 
@@ -1340,7 +1288,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 	nodeCfg := render.NodeConfiguration{
 		K8sServiceEp:            k8sapi.Endpoint,
 		Installation:            &instance.Spec,
-		AmazonCloudIntegration:  aci,
+		IPPools:                 crdPoolsToOperator(currentPools.Items),
 		LogCollector:            logCollector,
 		BirdTemplates:           birdTemplates,
 		TLS:                     typhaNodeTLS,
@@ -1349,7 +1297,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		BGPLayouts:              bgpLayout,
 		NodeAppArmorProfile:     nodeAppArmorProfile,
 		MigrateNamespaces:       needNsMigration,
-		Terminating:             nodeTerminating,
+		CanRemoveCNIFinalizer:   canRemoveCNI,
 		PrometheusServerTLS:     nodePrometheusTLS,
 		FelixHealthPort:         *felixConfiguration.Spec.HealthPort,
 		BindMode:                bgpConfiguration.Spec.BindMode,
@@ -1359,7 +1307,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 
 	csiCfg := render.CSIConfiguration{
 		Installation: &instance.Spec,
-		Terminating:  terminating,
+		Terminating:  installationMarkedForDeletion,
 		UsePSP:       r.usePSP,
 		OpenShift:    instance.Spec.KubernetesProvider == operator.ProviderOpenShift,
 	}
@@ -1373,7 +1321,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		ManagementClusterConnection: managementClusterConnection,
 		ClusterDomain:               r.clusterDomain,
 		MetricsPort:                 kubeControllersMetricsPort,
-		Terminating:                 terminating,
+		Terminating:                 installationMarkedForDeletion,
 		UsePSP:                      r.usePSP,
 		MetricsServerTLS:            kubeControllerTLS,
 		TrustedBundle:               typhaNodeTLS.TrustedBundle,
@@ -1419,8 +1367,8 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 
 	// TODO: We handle too many components in this controller at the moment. Once we are done consolidating,
 	// we can have the CreateOrUpdate logic handle this for us.
-	r.status.AddDaemonsets([]types.NamespacedName{{Name: "calico-node", Namespace: "calico-system"}})
-	r.status.AddDeployments([]types.NamespacedName{{Name: "calico-kube-controllers", Namespace: "calico-system"}})
+	r.status.AddDaemonsets([]types.NamespacedName{{Name: common.NodeDaemonSetName, Namespace: common.CalicoNamespace}})
+	r.status.AddDeployments([]types.NamespacedName{{Name: common.KubeControllersDeploymentName, Namespace: common.CalicoNamespace}})
 	certificateManager.AddToStatusManager(r.status, common.CalicoNamespace)
 
 	// Run this after we have rendered our components so the new (operator created)
@@ -1488,6 +1436,15 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 
 	// Tell the status manager that we're ready to monitor the resources we've told it about and receive statuses.
 	r.status.ReadyToMonitor()
+
+	// If eBPF is enabled in the operator API, patch FelixConfiguration to enable it within Felix.
+	_, err = utils.PatchFelixConfiguration(ctx, r.client, func(fc *crdv1.FelixConfiguration) (bool, error) {
+		return r.setBPFUpdatesOnFelixConfiguration(ctx, instance, fc, reqLogger)
+	})
+	if err != nil {
+		r.status.SetDegraded(operator.ResourceUpdateError, "Error updating resource", err, reqLogger)
+		return reconcile.Result{}, err
+	}
 
 	// We can clear the degraded state now since as far as we know everything is in order.
 	r.status.ClearDegraded()
@@ -1618,7 +1575,7 @@ func getOrCreateTyphaNodeTLSConfig(cli client.Client, certificateManager certifi
 
 // setDefaultOnFelixConfiguration will take the passed in fc and add any defaulting needed
 // based on the install config.
-func (r *ReconcileInstallation) setDefaultsOnFelixConfiguration(install *operator.Installation, fc *crdv1.FelixConfiguration) bool {
+func (r *ReconcileInstallation) setDefaultsOnFelixConfiguration(ctx context.Context, install *operator.Installation, fc *crdv1.FelixConfiguration, reqLogger logr.Logger) (bool, error) {
 	updated := false
 
 	switch install.Spec.CNI.Type {
@@ -1696,7 +1653,75 @@ func (r *ReconcileInstallation) setDefaultsOnFelixConfiguration(install *operato
 			}
 		}
 	}
-	return updated
+
+	// If BPF is enabled, but not set on FelixConfiguration, do so here. This could happen when an older
+	// version of operator is replaced by the new one. Older versions of the operator used an
+	// environment variable to enable BPF, but we no longer do so. In order to prevent disruption
+	// when the environment variable is removed by the render code of the new operator, make sure
+	// FelixConfiguration has the correct value set.
+
+	// If calico-node daemonset exists, we need to check the ENV VAR and set FelixConfiguration accordingly.
+	// Otherwise, just move on.
+	ds := &appsv1.DaemonSet{}
+	err := r.client.Get(ctx, types.NamespacedName{Namespace: common.CalicoNamespace, Name: common.NodeDaemonSetName}, ds)
+	if err != nil {
+		if !apierrors.IsNotFound(err) {
+			reqLogger.Error(err, "An error occurred when getting the Daemonset resource")
+			return false, err
+		}
+	} else {
+		bpfEnabledOnDaemonsetWithEnvVar, err := bpfEnabledOnDaemonsetWithEnvVar(ds)
+		if err != nil {
+			reqLogger.Error(err, "An error occurred when querying the Daemonset resource")
+			return false, err
+		} else if bpfEnabledOnDaemonsetWithEnvVar && !bpfEnabledOnFelixConfig(fc) {
+			err = setBPFEnabledOnFelixConfiguration(fc, true)
+			if err != nil {
+				reqLogger.Error(err, "Unable to enable eBPF data plane")
+				return false, err
+			} else {
+				updated = true
+			}
+		}
+	}
+
+	return updated, nil
+}
+
+// setBPFUpdatesOnFelixConfiguration will take the passed in fc and update any BPF properties needed
+// based on the install config and the daemonset.
+func (r *ReconcileInstallation) setBPFUpdatesOnFelixConfiguration(ctx context.Context, install *operator.Installation, fc *crdv1.FelixConfiguration, reqLogger logr.Logger) (bool, error) {
+	updated := false
+
+	bpfEnabledOnInstall := install.Spec.BPFEnabled()
+	if bpfEnabledOnInstall {
+		ds := &appsv1.DaemonSet{}
+		err := r.client.Get(ctx, types.NamespacedName{Namespace: common.CalicoNamespace, Name: common.NodeDaemonSetName}, ds)
+		if err != nil {
+			return false, err
+		}
+		if !bpfEnabledOnFelixConfig(fc) && isRolloutCompleteWithBPFVolumes(ds) {
+			err := setBPFEnabledOnFelixConfiguration(fc, bpfEnabledOnInstall)
+			if err != nil {
+				reqLogger.Error(err, "Unable to enable eBPF data plane")
+				return false, err
+			} else {
+				updated = true
+			}
+		}
+	} else {
+		if fc.Spec.BPFEnabled == nil || *fc.Spec.BPFEnabled {
+			err := setBPFEnabledOnFelixConfiguration(fc, bpfEnabledOnInstall)
+			if err != nil {
+				reqLogger.Error(err, "Unable to enable eBPF data plane")
+				return false, err
+			} else {
+				updated = true
+			}
+		}
+	}
+
+	return updated, nil
 }
 
 var osExitOverride = os.Exit
@@ -1791,38 +1816,6 @@ func isOpenshiftOnAws(install *operator.Installation, ctx context.Context, clien
 	return (infra.Status.PlatformStatus.Type == "AWS"), nil
 }
 
-func updateInstallationForOpenshiftNetwork(i *operator.Installation, o *configv1.Network) error {
-	// If CNI plugin is specified and not Calico then skip any CalicoNetwork initialization
-	if i.Spec.CNI != nil && i.Spec.CNI.Type != operator.PluginCalico {
-		return nil
-	}
-	if i.Spec.CalicoNetwork == nil {
-		i.Spec.CalicoNetwork = &operator.CalicoNetworkSpec{}
-	}
-
-	platformCIDRs := []string{}
-	for _, c := range o.Spec.ClusterNetwork {
-		platformCIDRs = append(platformCIDRs, c.CIDR)
-	}
-	return mergePlatformPodCIDRs(i, platformCIDRs)
-}
-
-func updateInstallationForKubeadm(i *operator.Installation, c *corev1.ConfigMap) error {
-	// If CNI plugin is specified and not Calico then skip any CalicoNetwork initialization
-	if i.Spec.CNI != nil && i.Spec.CNI.Type != operator.PluginCalico {
-		return nil
-	}
-	if i.Spec.CalicoNetwork == nil {
-		i.Spec.CalicoNetwork = &operator.CalicoNetworkSpec{}
-	}
-
-	platformCIDRs, err := extractKubeadmCIDRs(c)
-	if err != nil {
-		return err
-	}
-	return mergePlatformPodCIDRs(i, platformCIDRs)
-}
-
 func updateInstallationForAWSNode(i *operator.Installation, ds *appsv1.DaemonSet) error {
 	if ds == nil {
 		return nil
@@ -1838,90 +1831,7 @@ func updateInstallationForAWSNode(i *operator.Installation, ds *appsv1.DaemonSet
 	return nil
 }
 
-func mergePlatformPodCIDRs(i *operator.Installation, platformCIDRs []string) error {
-	// If IPPools is nil, add IPPool with CIDRs detected from platform configuration.
-	if i.Spec.CalicoNetwork.IPPools == nil {
-		if len(platformCIDRs) == 0 {
-			// If the platform has no CIDRs defined as well, then return and let the
-			// normal defaulting happen.
-			return nil
-		}
-		v4found := false
-		v6found := false
-
-		// Currently we only support a single IPv4 and a single IPv6 CIDR configured via the operator.
-		// So, grab the 1st IPv4 and IPv6 cidrs we find and use those. This will allow the
-		// operator to work in situations where there are more than one of each.
-		for _, c := range platformCIDRs {
-			addr, _, err := net.ParseCIDR(c)
-			if err != nil {
-				log.Error(err, "Failed to parse platform's pod network CIDR.")
-				continue
-			}
-
-			if addr.To4() == nil {
-				if v6found {
-					continue
-				}
-				v6found = true
-				i.Spec.CalicoNetwork.IPPools = append(i.Spec.CalicoNetwork.IPPools,
-					operator.IPPool{CIDR: c})
-			} else {
-				if v4found {
-					continue
-				}
-				v4found = true
-				i.Spec.CalicoNetwork.IPPools = append(i.Spec.CalicoNetwork.IPPools,
-					operator.IPPool{CIDR: c})
-			}
-			if v6found && v4found {
-				break
-			}
-		}
-	} else if len(i.Spec.CalicoNetwork.IPPools) == 0 {
-		// Empty IPPools list so nothing to do.
-		return nil
-	} else {
-		// Pools are configured on the Installation. Make sure they are compatible with
-		// the configuration set in the underlying Kubernetes platform.
-		for _, pool := range i.Spec.CalicoNetwork.IPPools {
-			within := false
-			for _, c := range platformCIDRs {
-				within = within || cidrWithinCidr(c, pool.CIDR)
-			}
-			if !within {
-				return fmt.Errorf("IPPool %v is not within the platform's configured pod network CIDR(s) %v", pool.CIDR, platformCIDRs)
-			}
-		}
-	}
-	return nil
-}
-
-// cidrWithinCidr checks that all IPs in the pool passed in are within the
-// passed in CIDR
-func cidrWithinCidr(cidr, pool string) bool {
-	_, cNet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return false
-	}
-	_, pNet, err := net.ParseCIDR(pool)
-	if err != nil {
-		return false
-	}
-	ipMin := pNet.IP
-	pOnes, _ := pNet.Mask.Size()
-	cOnes, _ := cNet.Mask.Size()
-
-	// If the cidr contains the network (1st) address of the pool and the
-	// prefix on the pool is larger than or equal to the cidr prefix (the pool size is
-	// smaller than the cidr) then the pool network is within the cidr network.
-	if cNet.Contains(ipMin) && pOnes >= cOnes {
-		return true
-	}
-	return false
-}
-
-func addCRDWatches(c controller.Controller, v operator.ProductVariant) error {
+func addCRDWatches(c ctrlruntime.Controller, v operator.ProductVariant) error {
 	pred := predicate.Funcs{
 		CreateFunc: func(e event.CreateEvent) bool {
 			// Create occurs because we've created it, so we can safely ignore it.
@@ -1929,21 +1839,19 @@ func addCRDWatches(c controller.Controller, v operator.ProductVariant) error {
 		},
 	}
 	for _, x := range crds.GetCRDs(v) {
-		if err := c.Watch(&source.Kind{Type: x}, &handler.EnqueueRequestForObject{}, pred); err != nil {
+		if err := c.WatchObject(x, &handler.EnqueueRequestForObject{}, pred); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func setInstallationFinalizer(i *operator.Installation) {
-	if !stringsutil.StringInSlice(CalicoFinalizer, i.GetFinalizers()) {
-		i.SetFinalizers(append(i.GetFinalizers(), CalicoFinalizer))
+func crdPoolsToOperator(crds []crdv1.IPPool) []operator.IPPool {
+	pools := []v1.IPPool{}
+	for _, p := range crds {
+		op := v1.IPPool{}
+		op.FromProjectCalicoV1(p)
+		pools = append(pools, op)
 	}
-}
-
-func removeInstallationFinalizer(i *operator.Installation) {
-	if stringsutil.StringInSlice(CalicoFinalizer, i.GetFinalizers()) {
-		i.SetFinalizers(stringsutil.RemoveStringInSlice(CalicoFinalizer, i.GetFinalizers()))
-	}
+	return pools
 }

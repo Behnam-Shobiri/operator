@@ -33,6 +33,7 @@ import (
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
 	"github.com/tigera/operator/pkg/controller/utils/imageset"
+	"github.com/tigera/operator/pkg/ctrlruntime"
 	"github.com/tigera/operator/pkg/render"
 	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
@@ -46,7 +47,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
 const (
@@ -69,10 +69,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 
 	reconciler := newReconciler(mgr, opts, licenseAPIReady, tierWatchReady, policyRecScopeWatchReady)
 
-	policyRecController, err := controller.New(PolicyRecommendationControllerName, mgr,
-		controller.Options{
-			Reconciler: reconciler,
-		})
+	c, err := ctrlruntime.NewController(PolicyRecommendationControllerName, mgr, controller.Options{Reconciler: reconciler})
 	if err != nil {
 		return err
 	}
@@ -83,30 +80,40 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		return err
 	}
 
+	// Determine how to handle watch events for cluster-scoped resources. For multi-tenant clusters,
+	// we should update all tenants whenever one changes. For single-tenant clusters, we can just queue the object.
+	var eventHandler handler.EventHandler = &handler.EnqueueRequestForObject{}
+	if opts.MultiTenant {
+		eventHandler = utils.EnqueueAllTenants(mgr.GetClient())
+		if err = c.WatchObject(&operatorv1.Tenant{}, &handler.EnqueueRequestForObject{}); err != nil {
+			return fmt.Errorf("policy-recommendation-controller failed to watch Tenant resource: %w", err)
+		}
+	}
+
 	installNS, _, watchNamespaces := tenancy.GetWatchNamespaces(opts.MultiTenant, render.PolicyRecommendationNamespace)
 
-	go utils.WaitToAddLicenseKeyWatch(policyRecController, k8sClient, log, licenseAPIReady)
-	go utils.WaitToAddPolicyRecommendationScopeWatch(policyRecController, k8sClient, log, policyRecScopeWatchReady)
-	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, policyRecController, k8sClient, log, tierWatchReady)
-	go utils.WaitToAddNetworkPolicyWatches(policyRecController, k8sClient, log, []types.NamespacedName{
+	go utils.WaitToAddLicenseKeyWatch(c, k8sClient, log, licenseAPIReady)
+	go utils.WaitToAddPolicyRecommendationScopeWatch(c, k8sClient, log, policyRecScopeWatchReady)
+	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, k8sClient, log, tierWatchReady)
+	go utils.WaitToAddNetworkPolicyWatches(c, k8sClient, log, []types.NamespacedName{
 		{Name: render.PolicyRecommendationPolicyName, Namespace: installNS},
 		{Name: networkpolicy.TigeraComponentDefaultDenyPolicyName, Namespace: installNS},
 	})
 
-	err = policyRecController.Watch(&source.Kind{Type: &operatorv1.PolicyRecommendation{}}, &handler.EnqueueRequestForObject{})
+	err = c.WatchObject(&operatorv1.PolicyRecommendation{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return err
 	}
 
-	if err = utils.AddInstallationWatch(policyRecController); err != nil {
+	if err = c.WatchObject(&operatorv1.Installation{}, eventHandler); err != nil {
 		return fmt.Errorf("policy-recommendation-controller failed to watch Installation resource: %w", err)
 	}
 
-	if err = imageset.AddImageSetWatch(policyRecController); err != nil {
+	if err = c.WatchObject(&operatorv1.ImageSet{}, eventHandler); err != nil {
 		return fmt.Errorf("policy-recommendation-controller failed to watch ImageSet: %w", err)
 	}
 
-	if err = utils.AddAPIServerWatch(policyRecController); err != nil {
+	if err = c.WatchObject(&operatorv1.APIServer{}, eventHandler); err != nil {
 		return fmt.Errorf("policy-recommendation-controller failed to watch APIServer resource: %w", err)
 	}
 
@@ -117,25 +124,24 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 			certificatemanagement.CASecretName,
 			render.ManagerInternalTLSSecretName,
 			render.TigeraLinseedSecret,
+			render.PolicyRecommendationTLSSecretName,
 		} {
-			if err = utils.AddSecretsWatch(policyRecController, secretName, namespace); err != nil {
+			if err = utils.AddSecretsWatch(c, secretName, namespace); err != nil {
 				return fmt.Errorf("policy-recommendation-controller failed to watch the secret '%s' in '%s' namespace: %w", secretName, namespace, err)
 			}
 		}
 	}
 
-	err = policyRecController.Watch(&source.Kind{Type: &operatorv1.ManagementCluster{}}, &handler.EnqueueRequestForObject{})
-	if err != nil {
+	if err = c.WatchObject(&operatorv1.ManagementCluster{}, eventHandler); err != nil {
 		return fmt.Errorf("policy-recommendation-controller failed to watch ManagementCluster resource: %w", err)
 	}
 
-	err = policyRecController.Watch(&source.Kind{Type: &operatorv1.ManagementClusterConnection{}}, &handler.EnqueueRequestForObject{})
-	if err != nil {
+	if err = c.WatchObject(&operatorv1.ManagementClusterConnection{}, eventHandler); err != nil {
 		return fmt.Errorf("policy-recommendation-controller failed to watch ManagementClusterConnection resource: %w", err)
 	}
 
 	// Watch for changes to TigeraStatus
-	if err = utils.AddTigeraStatusWatch(policyRecController, ResourceName); err != nil {
+	if err = utils.AddTigeraStatusWatch(c, ResourceName); err != nil {
 		return fmt.Errorf("policy-recommendation-controller failed to watch policy-recommendation Tigerastatus: %w", err)
 	}
 
@@ -161,6 +167,7 @@ func newReconciler(
 		policyRecScopeWatchReady: policyRecScopeWatchReady,
 		usePSP:                   opts.UsePSP,
 		multiTenant:              opts.MultiTenant,
+		externalElastic:          opts.ElasticExternal,
 	}
 
 	r.status.Run(opts.ShutdownContext)
@@ -185,6 +192,7 @@ type ReconcilePolicyRecommendation struct {
 	provider                 operatorv1.Provider
 	usePSP                   bool
 	multiTenant              bool
+	externalElastic          bool
 }
 
 func GetPolicyRecommendation(ctx context.Context, cli client.Client, mt bool, ns string) (*operatorv1.PolicyRecommendation, error) {
@@ -268,7 +276,7 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 	// Ensure the allow-tigera tier exists, before rendering any network policies within it.
 	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.TigeraComponentTierName}, &v3.Tier{}); err != nil {
 		if errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for allow-tigera tier to be created", err, logc)
+			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for allow-tigera tier to be created, see the 'tiers' TigeraStatus for more information", err, logc)
 			return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 		} else {
 			log.Error(err, "Error querying allow-tigera tier")
@@ -342,30 +350,10 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 	}
 
 	logc.V(3).Info("rendering components")
-	policyRecommendationCfg := &render.PolicyRecommendationConfiguration{
-		ClusterDomain:        r.clusterDomain,
-		Installation:         installation,
-		ManagedCluster:       isManagedCluster,
-		PullSecrets:          pullSecrets,
-		Openshift:            r.provider == operatorv1.ProviderOpenShift,
-		UsePSP:               r.usePSP,
-		Namespace:            helper.InstallNamespace(),
-		Tenant:               tenant,
-		BindingNamespaces:    bindNamespaces,
-		PolicyRecommendation: policyRecommendation,
-	}
-
-	// Render the desired objects from the CRD and create or update them.
-	component := render.PolicyRecommendation(policyRecommendationCfg)
-
-	if err = imageset.ApplyImageSet(ctx, r.client, variant, component); err != nil {
-		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error with images from ImageSet", err, logc)
-		return reconcile.Result{}, err
-	}
-
-	components := []render.Component{
-		component,
-	}
+	var policyRecommendationKeyPair certificatemanagement.KeyPairInterface
+	var trustedBundleRO certificatemanagement.TrustedBundleRO
+	var trustedBundleRW certificatemanagement.TrustedBundle
+	var components []render.Component
 
 	if !isManagedCluster {
 		opts := []certificatemanager.Option{
@@ -398,10 +386,8 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 			return reconcile.Result{}, nil
 		}
 
-		trustedBundle := certificateManager.CreateTrustedBundle(managerInternalTLSSecret, linseedCertificate)
-
 		// policyRecommendationKeyPair is the key pair policy recommendation presents to identify itself
-		policyRecommendationKeyPair, err := certificateManager.GetOrCreateKeyPair(r.client, render.PolicyRecommendationTLSSecretName, helper.TruthNamespace(), []string{render.PolicyRecommendationTLSSecretName})
+		policyRecommendationKeyPair, err = certificateManager.GetOrCreateKeyPair(r.client, render.PolicyRecommendationTLSSecretName, helper.TruthNamespace(), []string{render.PolicyRecommendationTLSSecretName})
 		if err != nil {
 			r.status.SetDegraded(operatorv1.ResourceCreateError, "Error creating TLS certificate", err, logc)
 			return reconcile.Result{}, err
@@ -409,8 +395,19 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 
 		certificateManager.AddToStatusManager(r.status, helper.InstallNamespace())
 
-		policyRecommendationCfg.TrustedBundle = trustedBundle
-		policyRecommendationCfg.PolicyRecommendationCertSecret = policyRecommendationKeyPair
+		if !r.multiTenant {
+			// Zero-tenant and single tenant setups install resources inside tigera-policy-recommendation namespace. Thus,
+			// we need to create a tigera-ca-bundle inside this namespace in order to allow communication with Linseed
+			trustedBundleRW = certificateManager.CreateTrustedBundle(managerInternalTLSSecret, linseedCertificate)
+			trustedBundleRO = trustedBundleRW.(certificatemanagement.TrustedBundleRO)
+		} else {
+			// Multi-tenant setups need to load the bundle the created by pkg/controller/secrets/tenant_controller.go
+			trustedBundleRO, err = certificateManager.LoadTrustedBundle(ctx, r.client, helper.InstallNamespace())
+			if err != nil {
+				r.status.SetDegraded(operatorv1.ResourceReadError, "Error getting trusted bundle", err, logc)
+				return reconcile.Result{}, err
+			}
+		}
 
 		components = append(components,
 			rcertificatemanagement.CertificateManagement(&rcertificatemanagement.Config{
@@ -420,7 +417,11 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 				KeyPairOptions: []rcertificatemanagement.KeyPairOption{
 					rcertificatemanagement.NewKeyPairOption(policyRecommendationKeyPair, true, true),
 				},
-				TrustedBundle: trustedBundle,
+				// Zero and single tenant setups need to create tigera-ca-bundle configmap because we install resources
+				// in namespace tigera-policy-recommendation
+				// Multi-tenant setups need to use the config map that was created by pkg/controller/secrets/tenant_controller.go
+				// in the tenant namespace. This parameter needs to be nil in this case
+				TrustedBundle: trustedBundleRW,
 			}),
 		)
 	}
@@ -431,6 +432,32 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 		return reconcile.Result{}, nil
 	}
 
+	policyRecommendationCfg := &render.PolicyRecommendationConfiguration{
+		ClusterDomain:                  r.clusterDomain,
+		Installation:                   installation,
+		ManagedCluster:                 isManagedCluster,
+		PullSecrets:                    pullSecrets,
+		Openshift:                      r.provider == operatorv1.ProviderOpenShift,
+		UsePSP:                         r.usePSP,
+		Namespace:                      helper.InstallNamespace(),
+		Tenant:                         tenant,
+		BindingNamespaces:              bindNamespaces,
+		ExternalElastic:                r.externalElastic,
+		TrustedBundle:                  trustedBundleRO,
+		PolicyRecommendationCertSecret: policyRecommendationKeyPair,
+		PolicyRecommendation:           policyRecommendation,
+	}
+
+	// Render the desired objects from the CRD and create or update them.
+	component := render.PolicyRecommendation(policyRecommendationCfg)
+
+	if err = imageset.ApplyImageSet(ctx, r.client, variant, component); err != nil {
+		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error with images from ImageSet", err, logc)
+		return reconcile.Result{}, err
+	}
+
+	// Prepend PolicyRecommendation before certificate creation
+	components = append([]render.Component{component}, components...)
 	for _, cmp := range components {
 		if err := handler.CreateOrUpdateOrDelete(context.Background(), cmp, r.status); err != nil {
 			r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating resource", err, logc)
@@ -480,6 +507,9 @@ func (r *ReconcilePolicyRecommendation) createDefaultPolicyRecommendationScope(c
 	prs.ObjectMeta.Name = "default"
 	prs.Spec.NamespaceSpec.RecStatus = "Disabled"
 	prs.Spec.NamespaceSpec.Selector = "!(projectcalico.org/name starts with 'tigera-') && !(projectcalico.org/name starts with 'calico-') && !(projectcalico.org/name starts with 'kube-')"
+	if r.provider == operatorv1.ProviderOpenShift {
+		prs.Spec.NamespaceSpec.Selector += " && !(projectcalico.org/name starts with 'openshift-')"
+	}
 
 	if err := r.client.Create(ctx, prs); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to Create default PolicyRecommendationScope", err, log)

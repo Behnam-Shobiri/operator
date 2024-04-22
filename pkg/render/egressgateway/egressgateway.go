@@ -1,4 +1,4 @@
-// Copyright (c) 2023 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -258,9 +258,11 @@ func (c *component) egwVolumeMounts() []corev1.VolumeMount {
 
 func (c *component) egwEnvVars() []corev1.EnvVar {
 	egressPodIp := &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}
+	egressPodIps := &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIPs"}}
 	envVar := []corev1.EnvVar{
 		{Name: "HEALTH_PORT", Value: fmt.Sprintf("%d", DefaultHealthPort)},
 		{Name: "EGRESS_POD_IP", ValueFrom: egressPodIp},
+		{Name: "EGRESS_POD_IPS", ValueFrom: egressPodIps},
 		{Name: "EGRESS_VXLAN_VNI", Value: fmt.Sprintf("%d", c.config.VXLANVNI)},
 		{Name: "LOG_SEVERITY", Value: c.config.EgressGW.GetLogSeverity()},
 	}
@@ -294,10 +296,12 @@ func (c *component) egwEnvVars() []corev1.EnvVar {
 
 func (c *component) egwInitEnvVars() []corev1.EnvVar {
 	egressPodIp := &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}
+	egressPodIps := &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIPs"}}
 	envVar := []corev1.EnvVar{
 		{Name: "EGRESS_VXLAN_VNI", Value: fmt.Sprintf("%d", c.config.VXLANVNI)},
 		{Name: "EGRESS_VXLAN_PORT", Value: fmt.Sprintf("%d", c.config.VXLANPort)},
 		{Name: "EGRESS_POD_IP", ValueFrom: egressPodIp},
+		{Name: "EGRESS_POD_IPS", ValueFrom: egressPodIps},
 	}
 	if c.config.IptablesBackend != "" {
 		envVar = append(envVar, corev1.EnvVar{Name: "IPTABLES_BACKEND", Value: c.config.IptablesBackend})

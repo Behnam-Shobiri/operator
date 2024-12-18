@@ -25,7 +25,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -40,8 +39,8 @@ import (
 	rcomp "github.com/tigera/operator/pkg/render/common/components"
 	"github.com/tigera/operator/pkg/render/common/configmap"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
 
@@ -126,8 +125,9 @@ type NodeConfiguration struct {
 	// should this value change.
 	BindMode string
 
-	// Whether the cluster supports pod security policies.
-	UsePSP bool
+	FelixPrometheusMetricsEnabled bool
+
+	FelixPrometheusMetricsPort int
 }
 
 // Node creates the node daemonset and other resources for the daemonset to operate normally.
@@ -158,11 +158,7 @@ func (c *nodeComponent) ResolveImages(is *operatorv1.ImageSet) error {
 	}
 
 	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
-		if operatorv1.IsFIPSModeEnabled(c.cfg.Installation.FIPSMode) {
-			c.cniImage = appendIfErr(components.GetReference(components.ComponentTigeraCNIFIPS, reg, path, prefix, is))
-		} else {
-			c.cniImage = appendIfErr(components.GetReference(components.ComponentTigeraCNI, reg, path, prefix, is))
-		}
+		c.cniImage = appendIfErr(components.GetReference(components.ComponentTigeraCNI, reg, path, prefix, is))
 		c.nodeImage = appendIfErr(components.GetReference(components.ComponentTigeraNode, reg, path, prefix, is))
 		c.flexvolImage = appendIfErr(components.GetReference(components.ComponentTigeraFlexVolume, reg, path, prefix, is))
 	} else {
@@ -177,7 +173,7 @@ func (c *nodeComponent) ResolveImages(is *operatorv1.ImageSet) error {
 	}
 
 	if len(errMsgs) != 0 {
-		return fmt.Errorf(strings.Join(errMsgs, ","))
+		return fmt.Errorf("%s", strings.Join(errMsgs, ","))
 	}
 	return nil
 }
@@ -225,12 +221,8 @@ func (c *nodeComponent) Objects() ([]client.Object, []client.Object) {
 		objs = append(objs, btcm)
 	}
 
-	if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderDockerEE {
+	if c.cfg.Installation.KubernetesProvider.IsDockerEE() {
 		objs = append(objs, c.clusterAdminClusterRoleBinding())
-	}
-
-	if c.cfg.UsePSP {
-		objs = append(objs, c.nodePodSecurityPolicy())
 	}
 
 	objs = append(objs, c.nodeDaemonset(cniConfig))
@@ -251,6 +243,19 @@ func (c *nodeComponent) Objects() ([]client.Object, []client.Object) {
 
 func (c *nodeComponent) Ready() bool {
 	return true
+}
+
+// CNIPluginFinalizedObjects returns a list of objects that use the CNIFinalizer that should be
+// removed only after the CNI plugin is removed.
+func CNIPluginFinalizedObjects() []client.Object {
+	return []client.Object{
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: CalicoNodeObjectName, Namespace: common.CalicoNamespace}},
+		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: CalicoCNIPluginObjectName, Namespace: common.CalicoNamespace}},
+		&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: CalicoNodeObjectName}},
+		&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: CalicoCNIPluginObjectName}},
+		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: CalicoNodeObjectName}},
+		&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: CalicoCNIPluginObjectName}},
+	}
 }
 
 // nodeServiceAccount creates the node's service account.
@@ -393,6 +398,12 @@ func (c *nodeComponent) nodeRole() *rbacv1.ClusterRole {
 				Verbs:     []string{"watch", "list"},
 			},
 			{
+				// For enforcing admin network policies.
+				APIGroups: []string{"policy.networking.k8s.io"},
+				Resources: []string{"adminnetworkpolicies", "baselineadminnetworkpolicies"},
+				Verbs:     []string{"watch", "list"},
+			},
+			{
 				// Metadata from these are used in conjunction with network policy.
 				APIGroups: []string{""},
 				Resources: []string{"pods", "namespaces", "serviceaccounts"},
@@ -421,24 +432,25 @@ func (c *nodeComponent) nodeRole() *rbacv1.ClusterRole {
 				// For monitoring Calico-specific configuration.
 				APIGroups: []string{"crd.projectcalico.org"},
 				Resources: []string{
-					"bgpfilters",
 					"bgpconfigurations",
-					"bgppeers",
 					"bgpfilters",
+					"bgpfilters",
+					"bgppeers",
 					"blockaffinities",
 					"clusterinformations",
 					"felixconfigurations",
 					"globalnetworkpolicies",
-					"stagedglobalnetworkpolicies",
 					"globalnetworksets",
 					"hostendpoints",
 					"ipamblocks",
 					"ippools",
 					"ipreservations",
 					"networkpolicies",
+					"networksets",
+					"stagedglobalnetworkpolicies",
 					"stagedkubernetesnetworkpolicies",
 					"stagednetworkpolicies",
-					"networksets",
+					"tiers",
 				},
 				Verbs: []string{"get", "list", "watch"},
 			},
@@ -471,6 +483,14 @@ func (c *nodeComponent) nodeRole() *rbacv1.ClusterRole {
 				Verbs: []string{"create", "update"},
 			},
 			{
+				// Calico creates some tiers on startup.
+				APIGroups: []string{"crd.projectcalico.org"},
+				Resources: []string{
+					"tiers",
+				},
+				Verbs: []string{"create"},
+			},
+			{
 				// Calico monitors nodes for some networking configuration.
 				APIGroups: []string{""},
 				Resources: []string{"nodes"},
@@ -483,8 +503,8 @@ func (c *nodeComponent) nodeRole() *rbacv1.ClusterRole {
 				Resources: []string{
 					"blockaffinities",
 					"ipamblocks",
-					"ipamhandles",
 					"ipamconfigs",
+					"ipamhandles",
 				},
 				Verbs: []string{"get", "list", "create", "update", "delete"},
 			},
@@ -505,28 +525,20 @@ func (c *nodeComponent) nodeRole() *rbacv1.ClusterRole {
 	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
 		extraRules := []rbacv1.PolicyRule{
 			{
-				// Tigera Secure needs to be able to read licenses, tiers, and config.
+				// Calico Enterprise needs to be able to read additional resources.
 				APIGroups: []string{"crd.projectcalico.org"},
 				Resources: []string{
-					"externalnetworks",
+					"bfdconfigurations",
 					"egressgatewaypolicies",
+					"externalnetworks",
 					"licensekeys",
+					"packetcaptures",
 					"remoteclusterconfigurations",
 					"stagedglobalnetworkpolicies",
 					"stagedkubernetesnetworkpolicies",
 					"stagednetworkpolicies",
-					"tiers",
-					"packetcaptures",
 				},
 				Verbs: []string{"get", "list", "watch"},
-			},
-			{
-				// Tigera Secure creates some tiers on startup.
-				APIGroups: []string{"crd.projectcalico.org"},
-				Resources: []string{
-					"tiers",
-				},
-				Verbs: []string{"create"},
 			},
 			{
 				// Tigera Secure updates status for packet captures.
@@ -539,21 +551,12 @@ func (c *nodeComponent) nodeRole() *rbacv1.ClusterRole {
 		}
 		role.Rules = append(role.Rules, extraRules...)
 	}
-	if c.cfg.UsePSP {
-		// Allow access to the pod security policy in case this is enforced on the cluster
-		role.Rules = append(role.Rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
-			Verbs:         []string{"use"},
-			ResourceNames: []string{common.NodeDaemonSetName},
-		})
-	}
-	if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderOpenShift {
+	if c.cfg.Installation.KubernetesProvider.IsOpenShift() {
 		role.Rules = append(role.Rules, rbacv1.PolicyRule{
 			APIGroups:     []string{"security.openshift.io"},
 			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{PSSPrivileged},
+			ResourceNames: []string{securitycontextconstraints.Privileged},
 		})
 	}
 	return role
@@ -930,7 +933,7 @@ func (c *nodeComponent) nodeDaemonset(cniCfgMap *corev1.ConfigMap) *appsv1.Daemo
 	}
 
 	var affinity *corev1.Affinity
-	if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderAKS {
+	if c.cfg.Installation.KubernetesProvider.IsAKS() {
 		affinity = &corev1.Affinity{
 			NodeAffinity: &corev1.NodeAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
@@ -944,7 +947,7 @@ func (c *nodeComponent) nodeDaemonset(cniCfgMap *corev1.ConfigMap) *appsv1.Daemo
 				},
 			},
 		}
-	} else if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderEKS {
+	} else if c.cfg.Installation.KubernetesProvider.IsEKS() {
 		affinity = &corev1.Affinity{
 			NodeAffinity: &corev1.NodeAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
@@ -1056,7 +1059,7 @@ func (c *nodeComponent) nodeVolumes() []corev1.Volume {
 	} else {
 		volumes = append(volumes,
 			c.varRunCalicoVolume(),
-			corev1.Volume{Name: "var-lib-calico", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/lib/calico"}}},
+			corev1.Volume{Name: "var-lib-calico", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/lib/calico", Type: &dirOrCreate}}},
 		)
 	}
 
@@ -1082,7 +1085,7 @@ func (c *nodeComponent) nodeVolumes() []corev1.Volume {
 	if c.cfg.Installation.CNI.Type == operatorv1.PluginCalico {
 		// Determine directories to use for CNI artifacts based on the provider.
 		cniNetDir, cniBinDir, cniLogDir := c.cniDirectories()
-		volumes = append(volumes, corev1.Volume{Name: "cni-bin-dir", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: cniBinDir}}})
+		volumes = append(volumes, corev1.Volume{Name: "cni-bin-dir", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: cniBinDir, Type: &dirOrCreate}}})
 		volumes = append(volumes, corev1.Volume{Name: "cni-net-dir", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: cniNetDir}}})
 		volumes = append(volumes, corev1.Volume{Name: "cni-log-dir", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: cniLogDir}}})
 	}
@@ -1141,7 +1144,13 @@ func (c *nodeComponent) nodeVolumes() []corev1.Volume {
 }
 
 func (c *nodeComponent) varRunCalicoVolume() corev1.Volume {
-	return corev1.Volume{Name: "var-run-calico", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/run/calico"}}}
+	dirOrCreate := corev1.HostPathDirectoryOrCreate
+	return corev1.Volume{
+		Name: "var-run-calico",
+		VolumeSource: corev1.VolumeSource{
+			HostPath: &corev1.HostPathVolumeSource{Path: "/var/run/calico", Type: &dirOrCreate},
+		},
+	}
 }
 
 func (c *nodeComponent) vppDataplaneEnabled() bool {
@@ -1433,7 +1442,6 @@ func (c *nodeComponent) nodeEnvVars() []corev1.EnvVar {
 		{Name: "FELIX_TYPHACAFILE", Value: c.cfg.TLS.TrustedBundle.MountPath()},
 		{Name: "FELIX_TYPHACERTFILE", Value: c.cfg.TLS.NodeSecret.VolumeMountCertificateFilePath()},
 		{Name: "FELIX_TYPHAKEYFILE", Value: c.cfg.TLS.NodeSecret.VolumeMountKeyFilePath()},
-		{Name: "FIPS_MODE_ENABLED", Value: operatorv1.IsFIPSModeEnabledString(c.cfg.Installation.FIPSMode)},
 		{Name: "NO_DEFAULT_POOLS", Value: "true"},
 	}
 
@@ -1468,7 +1476,7 @@ func (c *nodeComponent) nodeEnvVars() []corev1.EnvVar {
 			Name:  "FELIX_XDPENABLED",
 			Value: "false",
 		})
-		if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderEKS {
+		if c.cfg.Installation.KubernetesProvider.IsEKS() {
 			nodeEnv = append(nodeEnv, corev1.EnvVar{
 				Name:  "FELIX_AWSSRCDSTCHECK",
 				Value: "Disable",
@@ -1713,6 +1721,32 @@ func (c *nodeComponent) nodeLivenessReadinessProbes() (*corev1.Probe, *corev1.Pr
 // This service is used internally by Calico Enterprise and is separate from general
 // Prometheus metrics which are user-configurable.
 func (c *nodeComponent) nodeMetricsService() *corev1.Service {
+	ports := []corev1.ServicePort{
+		{
+			Name:       "calico-metrics-port",
+			Port:       int32(c.cfg.NodeReporterMetricsPort),
+			TargetPort: intstr.FromInt(c.cfg.NodeReporterMetricsPort),
+			Protocol:   corev1.ProtocolTCP,
+		},
+		{
+			Name:       "calico-bgp-metrics-port",
+			Port:       nodeBGPReporterPort,
+			TargetPort: intstr.FromInt(int(nodeBGPReporterPort)),
+			Protocol:   corev1.ProtocolTCP,
+		},
+	}
+
+	if c.cfg.FelixPrometheusMetricsEnabled {
+		felixMetricsPort := int32(c.cfg.FelixPrometheusMetricsPort)
+
+		ports = append(ports, corev1.ServicePort{
+			Name:       "felix-metrics-port",
+			Port:       felixMetricsPort,
+			TargetPort: intstr.FromInt(int(felixMetricsPort)),
+			Protocol:   corev1.ProtocolTCP,
+		})
+	}
+
 	return &corev1.Service{
 		TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -1727,38 +1761,9 @@ func (c *nodeComponent) nodeMetricsService() *corev1.Service {
 			// a huge set of iptables rules for this service since there's an instance
 			// on every node.
 			ClusterIP: "None",
-			Ports: []corev1.ServicePort{
-				{
-					Name:       "calico-metrics-port",
-					Port:       int32(c.cfg.NodeReporterMetricsPort),
-					TargetPort: intstr.FromInt(c.cfg.NodeReporterMetricsPort),
-					Protocol:   corev1.ProtocolTCP,
-				},
-				{
-					Name:       "calico-bgp-metrics-port",
-					Port:       nodeBGPReporterPort,
-					TargetPort: intstr.FromInt(int(nodeBGPReporterPort)),
-					Protocol:   corev1.ProtocolTCP,
-				},
-			},
+			Ports:     ports,
 		},
 	}
-}
-
-func (c *nodeComponent) nodePodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	psp := podsecuritypolicy.NewBasePolicy(common.NodeDaemonSetName)
-	psp.Spec.Privileged = true
-	psp.Spec.AllowPrivilegeEscalation = ptr.BoolToPtr(true)
-	psp.Spec.Volumes = append(psp.Spec.Volumes, policyv1beta1.HostPath)
-	psp.Spec.HostNetwork = true
-	// CollectProcessPath feature in logCollectorSpec requires access to hostPID
-	// Hence setting hostPID to true in the calico-node PSP, for this feature
-	// to work with PSP turned on
-	if c.collectProcessPathEnabled() {
-		psp.Spec.HostPID = true
-	}
-	psp.Spec.RunAsUser.Rule = policyv1beta1.RunAsUserStrategyRunAsAny
-	return psp
 }
 
 // hostPathInitContainer creates an init container that changes the permissions on hostPath volumes

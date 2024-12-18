@@ -35,6 +35,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/rest"
 
@@ -90,7 +91,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		return fmt.Errorf("tigera-ippool-controller failed to watch IPPool resource: %w", err)
 	}
 
-	if r.autoDetectedProvider == operator.ProviderOpenShift {
+	if r.autoDetectedProvider.IsOpenShift() {
 		// Watch for openshift network configuration as well. If we're running in OpenShift, we need to
 		// merge this configuration with our own and the write back the status object.
 		err = c.WatchObject(&configv1.Network{}, &handler.EnqueueRequestForObject{})
@@ -190,6 +191,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 	if err != nil && !errors.IsNotFound(err) {
 		r.status.SetDegraded(operator.ResourceReadError, "error querying IP pools", err, reqLogger)
 		return reconcile.Result{}, err
+	}
+	for i := range currentPools.Items {
+		if err := restoreV3Metadata(&currentPools.Items[i]); err != nil {
+			r.status.SetDegraded(operator.ResourceValidationError, "error obtaining v3 IPPool metadata", err, reqLogger)
+			return reconcile.Result{}, err
+		}
 	}
 
 	// Write default IP pool configuration back to the Installation object using patch.
@@ -335,7 +342,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 		if !found {
 			// This pool needs to be deleted. We only ever send deletes via the API server,
 			// since deletion requires rather complex logic. If the API server isn't available,
-			// we'll instead just mark the pool as disabled temporarily.
+			// we won't delete the pool and will mark the controller as degraded.
 			reqLogger.WithValues("cidr", cidr, "valid", installation.Spec.CalicoNetwork.IPPools).Info("Pool needs to be deleted")
 			if apiAvailable {
 				// v3 API is available - send a delete request.
@@ -412,4 +419,21 @@ func v1ToV3(v1pool *crdv1.IPPool) (*v3.IPPool, error) {
 	v3pool.UID = ""
 
 	return &v3pool, nil
+}
+
+func restoreV3Metadata(v1pool *crdv1.IPPool) error {
+	// v1 IP pools store v3 metadata in an annotation. Extract it and use it to restore the v3 metadata.
+	if v3metaJSON, ok := v1pool.Annotations["projectcalico.org/metadata"]; ok {
+		v3meta := metav1.ObjectMeta{}
+		err := json.Unmarshal([]byte(v3metaJSON), &v3meta)
+		if err != nil {
+			return err
+		}
+
+		// Restore the v3 metadata we care about.
+		v1pool.Labels = v3meta.Labels
+		v1pool.Annotations = v3meta.Annotations
+		log.V(1).Info("Restored v3 resource metadata", "labels", v1pool.Labels, "annotations", v1pool.Annotations)
+	}
+	return nil
 }

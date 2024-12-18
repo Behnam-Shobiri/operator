@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/elastic/cloud-on-k8s/v2/pkg/utils/stringsutil"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 
 	"github.com/go-logr/logr"
@@ -56,6 +57,7 @@ import (
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operator "github.com/tigera/operator/api/v1"
+	operatorv1 "github.com/tigera/operator/api/v1"
 	v1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/active"
 	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
@@ -87,6 +89,8 @@ const (
 	// The default port used by calico/node to report Calico Enterprise internal metrics.
 	// This is separate from the calico/node prometheus metrics port, which is user configurable.
 	defaultNodeReporterPort = 9081
+
+	defaultFelixMetricsDefaultPort = 9091
 )
 
 const InstallationName string = "calico"
@@ -132,7 +136,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 
 	c, err := ctrlruntime.NewController("tigera-installation-controller", mgr, controller.Options{Reconciler: ri})
 	if err != nil {
-		return fmt.Errorf("Failed to create tigera-installation-controller: %w", err)
+		return fmt.Errorf("failed to create tigera-installation-controller: %w", err)
 	}
 
 	// Established deferred watches against the v3 API that should succeed after the Enterprise API Server becomes available.
@@ -159,7 +163,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 func newReconciler(mgr manager.Manager, opts options.AddOptions) (*ReconcileInstallation, error) {
 	nm, err := migration.NewCoreNamespaceMigration(mgr.GetConfig())
 	if err != nil {
-		return nil, fmt.Errorf("Failed to initialize Namespace migration: %w", err)
+		return nil, fmt.Errorf("failed to initialize Namespace migration: %w", err)
 	}
 
 	statusManager := status.New(mgr.GetClient(), "calico", opts.KubernetesVersion)
@@ -191,8 +195,8 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions) (*ReconcileInst
 		enterpriseCRDsExist:  opts.EnterpriseCRDExists,
 		clusterDomain:        opts.ClusterDomain,
 		manageCRDs:           opts.ManageCRDs,
-		usePSP:               opts.UsePSP,
 		tierWatchReady:       &utils.ReadyFlag{},
+		newComponentHandler:  utils.NewComponentHandler,
 	}
 	r.status.Run(opts.ShutdownContext)
 	r.typhaAutoscaler.start(opts.ShutdownContext)
@@ -212,13 +216,21 @@ func add(c ctrlruntime.Controller, r *ReconcileInstallation) error {
 		return fmt.Errorf("tigera-installation-controller failed to watch calico Tigerastatus: %w", err)
 	}
 
-	if r.autoDetectedProvider == operator.ProviderOpenShift {
-		// Watch for openshift network configuration as well. If we're running in OpenShift, we need to
+	if r.autoDetectedProvider.IsOpenShift() {
+		// Watch for OpenShift network configuration as well. If we're running in OpenShift, we need to
 		// merge this configuration with our own and the write back the status object.
 		err = c.WatchObject(&configv1.Network{}, &handler.EnqueueRequestForObject{})
 		if err != nil {
 			if !apierrors.IsNotFound(err) {
 				return fmt.Errorf("tigera-installation-controller failed to watch openshift network config: %w", err)
+			}
+		}
+		// Watch for OpenShift infrastructure configuration, we'll need to check this for special setup when
+		// running OpenShift on AWS and/or OpenShift Hosted Control Plane (HCP).
+		err = c.WatchObject(&configv1.Infrastructure{}, &handler.EnqueueRequestForObject{})
+		if err != nil {
+			if !apierrors.IsNotFound(err) {
+				return fmt.Errorf("tigera-installation-controller failed to watch openshift infrastructure config: %w", err)
 			}
 		}
 	}
@@ -363,8 +375,10 @@ type ReconcileInstallation struct {
 	migrationChecked     bool
 	clusterDomain        string
 	manageCRDs           bool
-	usePSP               bool
 	tierWatchReady       *utils.ReadyFlag
+
+	// newComponentHandler returns a new component handler. Useful stub for unit testing.
+	newComponentHandler func(log logr.Logger, client client.Client, scheme *runtime.Scheme, cr metav1.Object) utils.ComponentHandler
 }
 
 // getActivePools returns the full set of enabled IP pools in the cluster.
@@ -397,7 +411,7 @@ func updateInstallationWithDefaults(ctx context.Context, client client.Client, i
 	err = client.Get(ctx, key, awsNode)
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
-			return fmt.Errorf("Unable to read aws-node daemonset: %s", err.Error())
+			return fmt.Errorf("unable to read aws-node daemonset: %s", err.Error())
 		}
 		awsNode = nil
 	}
@@ -419,7 +433,7 @@ func updateInstallationWithDefaults(ctx context.Context, client client.Client, i
 func MergeAndFillDefaults(i *operator.Installation, awsNode *appsv1.DaemonSet, currentPools *crdv1.IPPoolList) error {
 	if awsNode != nil {
 		if err := updateInstallationForAWSNode(i, awsNode); err != nil {
-			return fmt.Errorf("Could not resolve AWS node configuration: %s", err.Error())
+			return fmt.Errorf("could not resolve AWS node configuration: %s", err.Error())
 		}
 	}
 
@@ -678,15 +692,15 @@ func fillDefaults(instance *operator.Installation, currentPools *crdv1.IPPoolLis
 
 	// If not specified by the user, set the flex volume plugin location based on platform.
 	if len(instance.Spec.FlexVolumePath) == 0 {
-		if instance.Spec.KubernetesProvider == operator.ProviderOpenShift {
+		if instance.Spec.KubernetesProvider.IsOpenShift() {
 			// In OpenShift 4.x, the location for flexvolume plugins has changed.
 			// See: https://bugzilla.redhat.com/show_bug.cgi?id=1667606#c5
 			instance.Spec.FlexVolumePath = "/etc/kubernetes/kubelet-plugins/volume/exec/"
-		} else if instance.Spec.KubernetesProvider == operator.ProviderGKE {
+		} else if instance.Spec.KubernetesProvider.IsGKE() {
 			instance.Spec.FlexVolumePath = "/home/kubernetes/flexvolume/"
-		} else if instance.Spec.KubernetesProvider == operator.ProviderAKS {
+		} else if instance.Spec.KubernetesProvider.IsAKS() {
 			instance.Spec.FlexVolumePath = "/etc/kubernetes/volumeplugins/"
-		} else if instance.Spec.KubernetesProvider == operator.ProviderRKE2 {
+		} else if instance.Spec.KubernetesProvider.IsRKE2() {
 			instance.Spec.FlexVolumePath = "/var/lib/kubelet/volumeplugins/"
 		} else {
 			instance.Spec.FlexVolumePath = "/usr/libexec/kubernetes/kubelet-plugins/volume/exec/"
@@ -709,6 +723,11 @@ func fillDefaults(instance *operator.Installation, currentPools *crdv1.IPPoolLis
 		instance.Spec.NodeUpdateStrategy.Type = appsv1.RollingUpdateDaemonSetStrategyType
 	}
 
+	if instance.Spec.KubernetesProvider == operator.ProviderAKS && instance.Spec.Azure == nil {
+		defaultPolicyMode := operator.Default
+		instance.Spec.Azure = &operator.Azure{PolicyMode: &defaultPolicyMode}
+	}
+
 	return nil
 }
 
@@ -716,15 +735,15 @@ func fillDefaults(instance *operator.Installation, currentPools *crdv1.IPPoolLis
 // and updates the Installation CR accordingly. It returns an error if incompatible values are provided.
 func mergeProvider(cr *operator.Installation, provider operator.Provider) error {
 	// If we detected one provider but user set provider to something else, throw an error
-	if provider != operator.ProviderNone && cr.Spec.KubernetesProvider != operator.ProviderNone && cr.Spec.KubernetesProvider != provider {
-		msg := "Installation spec.kubernetesProvider '%s' does not match auto-detected value '%s'"
+	if !provider.IsNone() && !cr.Spec.KubernetesProvider.IsNone() && cr.Spec.KubernetesProvider != provider {
+		msg := "installation spec.kubernetesProvider '%s' does not match auto-detected value '%s'"
 		return fmt.Errorf(msg, cr.Spec.KubernetesProvider, provider)
 	}
 
 	// If we've reached this point, it means only one source of provider is being used - auto-detection or
 	// user-provided, but not both. Or, it means that both have been specified but are the same.
 	// If it's the CR provided one, then just use that. Otherwise, use the auto-detected one.
-	if cr.Spec.KubernetesProvider == operator.ProviderNone {
+	if cr.Spec.KubernetesProvider.IsNone() {
 		cr.Spec.KubernetesProvider = provider
 	}
 	log.WithValues("provider", cr.Spec.KubernetesProvider).V(1).Info("Determined provider")
@@ -961,7 +980,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		} else if err != nil {
 			r.status.SetDegraded(operator.InternalServerError, "Error discovering Tigera Secure availability", err, reqLogger)
 		} else {
-			r.status.SetDegraded(operator.InternalServerError, "Cannot deploy Tigera Secure", fmt.Errorf("Missing Tigera Secure custom resource definitions"), reqLogger)
+			r.status.SetDegraded(operator.InternalServerError, "Cannot deploy Tigera Secure", fmt.Errorf("missing Tigera Secure custom resource definitions"), reqLogger)
 		}
 
 		// Queue a retry. We don't want to watch the APIServer API since it might not exist and would cause
@@ -1079,7 +1098,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 	}
 
 	openShiftOnAws := false
-	if instance.Spec.KubernetesProvider == operator.ProviderOpenShift {
+	if instance.Spec.KubernetesProvider.IsOpenShift() {
 		openShiftOnAws, err = isOpenshiftOnAws(instance, ctx, r.client)
 		if err != nil {
 			r.status.SetDegraded(operator.ResourceReadError, "Error checking if OpenShift is on AWS", err, reqLogger)
@@ -1099,7 +1118,18 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 
 	// Set any non-default FelixConfiguration values that we need.
 	felixConfiguration, err := utils.PatchFelixConfiguration(ctx, r.client, func(fc *crdv1.FelixConfiguration) (bool, error) {
-		return r.setDefaultsOnFelixConfiguration(ctx, instance, fc, reqLogger)
+		// Configure defaults.
+		u, err := r.setDefaultsOnFelixConfiguration(ctx, instance, fc, reqLogger)
+		if err != nil {
+			return false, err
+		}
+
+		// Configure nftables mode.
+		u2, err := r.setNftablesMode(ctx, instance, fc, reqLogger)
+		if err != nil {
+			return false, err
+		}
+		return u || u2, nil
 	})
 	if err != nil {
 		return reconcile.Result{}, err
@@ -1112,17 +1142,23 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 	nodeReporterMetricsPort := defaultNodeReporterPort
 	var nodePrometheusTLS certificatemanagement.KeyPairInterface
 	calicoVersion := components.CalicoRelease
+
+	felixPrometheusMetricsPort := defaultFelixMetricsDefaultPort
+
 	if instance.Spec.Variant == operator.TigeraSecureEnterprise {
 
 		// Determine the port to use for nodeReporter metrics.
 		if felixConfiguration.Spec.PrometheusReporterPort != nil {
 			nodeReporterMetricsPort = *felixConfiguration.Spec.PrometheusReporterPort
 		}
-
 		if nodeReporterMetricsPort == 0 {
 			err := errors.New("felixConfiguration prometheusReporterPort=0 not supported")
 			r.status.SetDegraded(operator.InvalidConfigurationError, "invalid metrics port", err, reqLogger)
 			return reconcile.Result{}, err
+		}
+
+		if felixConfiguration.Spec.PrometheusMetricsPort != nil {
+			felixPrometheusMetricsPort = *felixConfiguration.Spec.PrometheusMetricsPort
 		}
 
 		nodePrometheusTLS, err = certificateManager.GetOrCreateKeyPair(r.client, render.NodePrometheusTLSServerSecret, common.OperatorNamespace(), dns.GetServiceDNSNames(render.CalicoNodeMetricsService, common.CalicoNamespace, r.clusterDomain))
@@ -1211,9 +1247,17 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 	// If we're on OpenShift on AWS render a Job (and needed resources) to
 	// setup the security groups we need for IPIP, BGP, and Typha communication.
 	if openShiftOnAws {
+		// Detect if this cluster is an OpenShift HPC hosted cluster, as AWS
+		// security group setup is different in this case.
+		hostedOpenShift, err := isHostedOpenShift(ctx, r.client)
+		if err != nil {
+			r.status.SetDegraded(operator.ResourceReadError, "Error checking if in a hosted OpenShift HCP cluster on AWS", err, reqLogger)
+			return reconcile.Result{}, err
+		}
 		awsSGSetupCfg := &render.AWSSGSetupConfiguration{
-			PullSecrets:  instance.Spec.ImagePullSecrets,
-			Installation: &instance.Spec,
+			PullSecrets:     instance.Spec.ImagePullSecrets,
+			Installation:    &instance.Spec,
+			HostedOpenShift: hostedOpenShift,
 		}
 		awsSetup, err := render.AWSSecurityGroupSetup(awsSGSetupCfg)
 		if err != nil {
@@ -1225,7 +1269,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		}
 	}
 
-	if instance.Spec.KubernetesProvider == operator.ProviderGKE {
+	if instance.Spec.KubernetesProvider.IsGKE() {
 		// We do this only for GKE as other providers don't (yet?)
 		// automatically add resource quota that constrains whether
 		// Calico components that are marked cluster or node critical
@@ -1259,7 +1303,6 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		MigrateNamespaces: needNsMigration,
 		ClusterDomain:     r.clusterDomain,
 		FelixHealthPort:   *felixConfiguration.Spec.HealthPort,
-		UsePSP:            r.usePSP,
 	}
 	components = append(components, render.Typha(&typhaCfg))
 
@@ -1274,6 +1317,39 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 				canRemoveCNI = false
 			}
 		}
+	} else {
+		// In some rare scenarios, we can hit a deadlock where resources have been marked with a deletion timestamp but the operator
+		// does not recognize that it must remove their finalizers. This can happen if, for example, someone manually
+		// deletes a ServiceAccount instead of deleting the Installation object. In this case, we need
+		// to allow the deletion to complete so the operator can re-create the resources. Otherwise the objects will be stuck terminating forever.
+		toCheck := render.CNIPluginFinalizedObjects()
+		needsCleanup := []client.Object{}
+		for _, obj := range toCheck {
+			if err := r.client.Get(ctx, types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}, obj); err != nil {
+				if !apierrors.IsNotFound(err) {
+					r.status.SetDegraded(operator.ResourceReadError, "Error querying object", err, reqLogger)
+					return reconcile.Result{}, err
+				}
+				// Not found - nothing to do.
+				continue
+			}
+			if obj.GetDeletionTimestamp() != nil {
+				// The object is marked for deletion, but the installation is not terminating. We need to remove the finalizers from this object
+				// so that it can be deleted and recreated.
+				reqLogger.Info("Object is marked for deletion but installation is not terminating",
+					"kind", obj.GetObjectKind(),
+					"name", obj.GetName(),
+					"namespace", obj.GetNamespace(),
+				)
+				obj.SetFinalizers(stringsutil.RemoveStringInSlice(render.CNIFinalizer, obj.GetFinalizers()))
+				needsCleanup = append(needsCleanup, obj)
+			}
+		}
+		if len(needsCleanup) > 0 {
+			// Add a component to remove the finalizers from the objects that need it.
+			reqLogger.Info("Removing finalizers from objects that are wronly marked for deletion")
+			components = append(components, render.NewPassthrough(needsCleanup...))
+		}
 	}
 
 	// Fetch any existing default BGPConfiguration object.
@@ -1286,30 +1362,30 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 
 	// Build a configuration for rendering calico/node.
 	nodeCfg := render.NodeConfiguration{
-		K8sServiceEp:            k8sapi.Endpoint,
-		Installation:            &instance.Spec,
-		IPPools:                 crdPoolsToOperator(currentPools.Items),
-		LogCollector:            logCollector,
-		BirdTemplates:           birdTemplates,
-		TLS:                     typhaNodeTLS,
-		ClusterDomain:           r.clusterDomain,
-		NodeReporterMetricsPort: nodeReporterMetricsPort,
-		BGPLayouts:              bgpLayout,
-		NodeAppArmorProfile:     nodeAppArmorProfile,
-		MigrateNamespaces:       needNsMigration,
-		CanRemoveCNIFinalizer:   canRemoveCNI,
-		PrometheusServerTLS:     nodePrometheusTLS,
-		FelixHealthPort:         *felixConfiguration.Spec.HealthPort,
-		BindMode:                bgpConfiguration.Spec.BindMode,
-		UsePSP:                  r.usePSP,
+		K8sServiceEp:                  k8sapi.Endpoint,
+		Installation:                  &instance.Spec,
+		IPPools:                       crdPoolsToOperator(currentPools.Items),
+		LogCollector:                  logCollector,
+		BirdTemplates:                 birdTemplates,
+		TLS:                           typhaNodeTLS,
+		ClusterDomain:                 r.clusterDomain,
+		NodeReporterMetricsPort:       nodeReporterMetricsPort,
+		BGPLayouts:                    bgpLayout,
+		NodeAppArmorProfile:           nodeAppArmorProfile,
+		MigrateNamespaces:             needNsMigration,
+		CanRemoveCNIFinalizer:         canRemoveCNI,
+		PrometheusServerTLS:           nodePrometheusTLS,
+		FelixHealthPort:               *felixConfiguration.Spec.HealthPort,
+		BindMode:                      bgpConfiguration.Spec.BindMode,
+		FelixPrometheusMetricsEnabled: utils.IsFelixPrometheusMetricsEnabled(felixConfiguration),
+		FelixPrometheusMetricsPort:    felixPrometheusMetricsPort,
 	}
 	components = append(components, render.Node(&nodeCfg))
 
 	csiCfg := render.CSIConfiguration{
 		Installation: &instance.Spec,
 		Terminating:  installationMarkedForDeletion,
-		UsePSP:       r.usePSP,
-		OpenShift:    instance.Spec.KubernetesProvider == operator.ProviderOpenShift,
+		OpenShift:    instance.Spec.KubernetesProvider.IsOpenShift(),
 	}
 	components = append(components, render.CSI(&csiCfg))
 
@@ -1322,7 +1398,6 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		ClusterDomain:               r.clusterDomain,
 		MetricsPort:                 kubeControllersMetricsPort,
 		Terminating:                 installationMarkedForDeletion,
-		UsePSP:                      r.usePSP,
 		MetricsServerTLS:            kubeControllerTLS,
 		TrustedBundle:               typhaNodeTLS.TrustedBundle,
 		Namespace:                   common.CalicoNamespace,
@@ -1346,6 +1421,21 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		return reconcile.Result{}, err
 	}
 
+	if imageSet == nil {
+		// There is no imageSet for the configured variant, but check to see if there are any
+		// ImageSets with a different variant so we can give the user some kind of indication
+		// to why an existing ImageSet is being ignored.
+		nvis, err := imageset.DoesNonVariantImageSetExist(ctx, r.client, instance.Spec.Variant)
+		if err != nil {
+			r.status.SetDegraded(operator.ResourceReadError, "Error checking for non-variant ImageSet", err, reqLogger)
+			return reconcile.Result{}, err
+		} else {
+			if nvis {
+				reqLogger.Info("An ImageSet exists for a different variant")
+			}
+		}
+	}
+
 	if err = imageset.ValidateImageSet(imageSet); err != nil {
 		r.status.SetDegraded(operator.ResourceValidationError, "Error validating ImageSet", err, reqLogger)
 		return reconcile.Result{}, err
@@ -1357,7 +1447,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 	}
 
 	// Create a component handler to create or update the rendered components.
-	handler := utils.NewComponentHandler(log, r.client, r.scheme, instance)
+	handler := r.newComponentHandler(log, r.client, r.scheme, instance)
 	for _, component := range components {
 		if err := handler.CreateOrUpdateOrDelete(ctx, component, nil); err != nil {
 			r.status.SetDegraded(operator.ResourceUpdateError, "Error creating / updating resource", err, reqLogger)
@@ -1383,7 +1473,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 		// Requeue so we can update our resources (without the migration changes)
 		return reconcile.Result{Requeue: true}, nil
 	} else if r.namespaceMigration.NeedCleanup() {
-		if err := r.namespaceMigration.CleanupMigration(ctx); err != nil {
+		if err := r.namespaceMigration.CleanupMigration(ctx, reqLogger); err != nil {
 			r.status.SetDegraded(operator.ResourceMigrationError, "error migrating resources to calico-system", err, reqLogger)
 			return reconcile.Result{}, err
 		}
@@ -1410,7 +1500,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 	}
 
 	// We have successfully reconciled the Calico installation.
-	if instance.Spec.KubernetesProvider == operator.ProviderOpenShift {
+	if instance.Spec.KubernetesProvider.IsOpenShift() {
 		openshiftConfig := &configv1.Network{}
 		err = r.client.Get(ctx, types.NamespacedName{Name: openshiftNetworkConfig}, openshiftConfig)
 		if err != nil {
@@ -1457,7 +1547,7 @@ func (r *ReconcileInstallation) Reconcile(ctx context.Context, request reconcile
 
 	// Write updated status.
 	if statusMTU > math.MaxInt32 || statusMTU < 0 {
-		return reconcile.Result{}, errors.New("The MTU size should be between Max int32 (2147483647) and 0")
+		return reconcile.Result{}, errors.New("the MTU size should be between Max int32 (2147483647) and 0")
 	}
 	instance.Status.MTU = int32(statusMTU)
 	// Variant and CalicoVersion must be updated at the same time.
@@ -1560,7 +1650,7 @@ func getOrCreateTyphaNodeTLSConfig(cli client.Client, certificateManager certifi
 		}
 	}
 	if len(errMsgs) != 0 {
-		return nil, fmt.Errorf(strings.Join(errMsgs, ";"))
+		return nil, fmt.Errorf("%s", strings.Join(errMsgs, ";"))
 	}
 	return &render.TyphaNodeTLS{
 		TrustedBundle:   trustedBundle,
@@ -1571,6 +1661,31 @@ func getOrCreateTyphaNodeTLSConfig(cli client.Client, certificateManager certifi
 		NodeCommonName:  nodeCommonName,
 		NodeURISAN:      nodeURISAN,
 	}, nil
+}
+
+func (r *ReconcileInstallation) setNftablesMode(_ context.Context, install *operator.Installation, fc *crdv1.FelixConfiguration, reqLogger logr.Logger) (bool, error) {
+	updated := false
+
+	// Set the FelixConfiguration nftables dataplane mode based on the operator configuration. We do this unconditonally because
+	// we don't need to handle upgrades from versions that were previously FelixConfiguration only - nftables mode has always
+	// been controlled by the operator.
+	if install.Spec.CalicoNetwork.LinuxDataplane != nil {
+		if *install.Spec.CalicoNetwork.LinuxDataplane == operatorv1.LinuxDataplaneNftables {
+			// The operator is configured to use the nftables dataplane. Configure Felix to use nftables.
+			nftablesMode := crdv1.NFTablesModeEnabled
+			fc.Spec.NFTablesMode = &nftablesMode
+			updated = true
+		} else {
+			// The operator is configured to use another dataplane. Disable nftables.
+			nftablesMode := crdv1.NFTablesModeDisabled
+			fc.Spec.NFTablesMode = &nftablesMode
+			updated = true
+		}
+	}
+	if updated {
+		reqLogger.Info("Patching nftables mode", "nftablesMode", *fc.Spec.NFTablesMode)
+	}
+	return updated, nil
 }
 
 // setDefaultOnFelixConfiguration will take the passed in fc and add any defaulting needed
@@ -1610,7 +1725,7 @@ func (r *ReconcileInstallation) setDefaultsOnFelixConfiguration(ctx context.Cont
 	// Determine the felix health port to use. Prefer the configuration from FelixConfiguration,
 	// but default to 9099 (or 9199 on OpenShift). We will also write back whatever we select to FelixConfiguration.
 	felixHealthPort := 9099
-	if install.Spec.KubernetesProvider == operator.ProviderOpenShift {
+	if install.Spec.KubernetesProvider.IsOpenShift() {
 		felixHealthPort = 9199
 	}
 	if fc.Spec.HealthPort == nil {
@@ -1618,9 +1733,25 @@ func (r *ReconcileInstallation) setDefaultsOnFelixConfiguration(ctx context.Cont
 		updated = true
 	}
 	vxlanVNI := 4096
+	// MKE uses a vxlanVNI:4096 and vxlanPort:4789 for its docker swarm vxlan.
+	// This results in a conflict with calico's VXLAN and the vxlan.calico interface
+	// gets deleted. To fix this we change the vxlanVNI to 10000 as recommended by
+	// MKE docs (https://docs.mirantis.com/mke/3.7/cli-ref/mke-cli-install.html).
+	if install.Spec.KubernetesProvider == operator.ProviderDockerEE {
+		vxlanVNI = 10000
+	}
+
 	if fc.Spec.VXLANVNI == nil {
 		fc.Spec.VXLANVNI = &vxlanVNI
 		updated = true
+	}
+
+	if install.Spec.KubernetesProvider == operator.ProviderDockerEE {
+		// Set bpfHostConntrackBypass to false for eBPF dataplane to work with MKE
+		if install.Spec.BPFEnabled() && fc.Spec.BPFHostConntrackBypass == nil {
+			disableBPFHostConntrackBypass(fc)
+			updated = true
+		}
 	}
 
 	if install.Spec.Variant == operator.TigeraSecureEnterprise {
@@ -1749,7 +1880,7 @@ func (r *ReconcileInstallation) checkActive(log logr.Logger) (*corev1.ConfigMap,
 			"my-namespace", common.OperatorNamespace(),
 			"active-namespace", activeNs)
 		osExitOverride(0)
-		return nil, fmt.Errorf("Returning error for test purposes")
+		return nil, fmt.Errorf("returning error for test purposes")
 	}
 
 	if cm == nil {
@@ -1766,7 +1897,7 @@ func (r *ReconcileInstallation) updateCRDs(ctx context.Context, variant operator
 	crdComponent := render.NewPassthrough(crds.ToRuntimeObjects(crds.GetCRDs(variant)...)...)
 	// Specify nil for the CR so no ownership is put on the CRDs. We do this so removing the
 	// Installation CR will not remove the CRDs.
-	handler := utils.NewComponentHandler(log, r.client, r.scheme, nil)
+	handler := r.newComponentHandler(log, r.client, r.scheme, nil)
 	if err := handler.CreateOrUpdateOrDelete(ctx, crdComponent, nil); err != nil {
 		r.status.SetDegraded(operator.ResourceUpdateError, "Error creating / updating CRD resource", err, log)
 		return err
@@ -1784,7 +1915,7 @@ func getConfigMap(client client.Client, cmName string) (*corev1.ConfigMap, error
 		if apierrors.IsNotFound(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("Failed to read ConfigMap %q: %s", cmName, err)
+		return nil, fmt.Errorf("failed to read ConfigMap %q: %s", cmName, err)
 	}
 	return cm, nil
 }
@@ -1805,15 +1936,24 @@ func getBirdTemplates(client client.Client) (map[string]string, error) {
 // by the KubernetesProvider on the installation and the infrastructure OpenShift
 // status.
 func isOpenshiftOnAws(install *operator.Installation, ctx context.Context, client client.Client) (bool, error) {
-	if install.Spec.KubernetesProvider != operator.ProviderOpenShift {
+	if !install.Spec.KubernetesProvider.IsOpenShift() {
 		return false, nil
 	}
 	infra := configv1.Infrastructure{}
 	// If configured to run in openshift, then also fetch the openshift configuration API.
 	if err := client.Get(ctx, types.NamespacedName{Name: openshiftNetworkConfig}, &infra); err != nil {
-		return false, fmt.Errorf("Unable to read OpenShift infrastructure configuration: %s", err.Error())
+		return false, fmt.Errorf("unable to read OpenShift infrastructure configuration: %w", err)
 	}
 	return (infra.Status.PlatformStatus.Type == "AWS"), nil
+}
+
+// isHostedOpenShift returns true if this cluster is an OpenShift HCP hosted cluster.
+func isHostedOpenShift(ctx context.Context, client client.Client) (bool, error) {
+	infra := configv1.Infrastructure{}
+	if err := client.Get(ctx, types.NamespacedName{Name: openshiftNetworkConfig}, &infra); err != nil {
+		return false, fmt.Errorf("unable to read OpenShift infrastructure configuration: %w", err)
+	}
+	return (infra.Status.ControlPlaneTopology == "External"), nil
 }
 
 func updateInstallationForAWSNode(i *operator.Installation, ds *appsv1.DaemonSet) error {

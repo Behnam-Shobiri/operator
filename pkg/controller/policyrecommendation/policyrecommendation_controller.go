@@ -18,35 +18,35 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/tigera/operator/pkg/controller/tenancy"
-
-	"k8s.io/apimachinery/pkg/types"
-
 	"github.com/go-logr/logr"
-	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
-	"github.com/tigera/operator/pkg/render/common/networkpolicy"
-
-	operatorv1 "github.com/tigera/operator/api/v1"
-	"github.com/tigera/operator/pkg/common"
-	"github.com/tigera/operator/pkg/controller/certificatemanager"
-	"github.com/tigera/operator/pkg/controller/options"
-	"github.com/tigera/operator/pkg/controller/status"
-	"github.com/tigera/operator/pkg/controller/utils"
-	"github.com/tigera/operator/pkg/controller/utils/imageset"
-	"github.com/tigera/operator/pkg/ctrlruntime"
-	"github.com/tigera/operator/pkg/render"
-	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
-	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
+	operatorv1 "github.com/tigera/operator/api/v1"
+	"github.com/tigera/operator/pkg/common"
+	"github.com/tigera/operator/pkg/controller/certificatemanager"
+	"github.com/tigera/operator/pkg/controller/options"
+	"github.com/tigera/operator/pkg/controller/status"
+	"github.com/tigera/operator/pkg/controller/tenancy"
+	"github.com/tigera/operator/pkg/controller/utils"
+	"github.com/tigera/operator/pkg/controller/utils/imageset"
+	"github.com/tigera/operator/pkg/ctrlruntime"
+	"github.com/tigera/operator/pkg/render"
+	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
+	"github.com/tigera/operator/pkg/render/common/networkpolicy"
+	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
 
 const (
@@ -165,7 +165,6 @@ func newReconciler(
 		licenseAPIReady:          licenseAPIReady,
 		tierWatchReady:           tierWatchReady,
 		policyRecScopeWatchReady: policyRecScopeWatchReady,
-		usePSP:                   opts.UsePSP,
 		multiTenant:              opts.MultiTenant,
 		externalElastic:          opts.ElasticExternal,
 	}
@@ -190,7 +189,6 @@ type ReconcilePolicyRecommendation struct {
 	tierWatchReady           *utils.ReadyFlag
 	policyRecScopeWatchReady *utils.ReadyFlag
 	provider                 operatorv1.Provider
-	usePSP                   bool
 	multiTenant              bool
 	externalElastic          bool
 }
@@ -288,6 +286,17 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 	if !r.licenseAPIReady.IsReady() {
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for LicenseKeyAPI to be ready", nil, logc)
 		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
+	}
+
+	// Policy Recommendation is not supported in combination with Windows nodes.
+	hasWindowsNodes, err := common.HasWindowsNodes(r.client)
+	if err != nil {
+		r.status.SetDegraded(operatorv1.ResourceReadError, "Unable to determine if there are Windows nodes", err, logc)
+		return reconcile.Result{}, err
+	}
+	if hasWindowsNodes {
+		r.status.SetDegraded(operatorv1.ResourceValidationError, "Policy Recommendation is not supported in combination with Windows nodes", err, logc)
+		return reconcile.Result{}, err
 	}
 
 	license, err := utils.FetchLicenseKey(ctx, r.client)
@@ -437,8 +446,7 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 		Installation:                   installation,
 		ManagedCluster:                 isManagedCluster,
 		PullSecrets:                    pullSecrets,
-		Openshift:                      r.provider == operatorv1.ProviderOpenShift,
-		UsePSP:                         r.usePSP,
+		OpenShift:                      r.provider.IsOpenShift(),
 		Namespace:                      helper.InstallNamespace(),
 		Tenant:                         tenant,
 		BindingNamespaces:              bindNamespaces,
@@ -507,7 +515,7 @@ func (r *ReconcilePolicyRecommendation) createDefaultPolicyRecommendationScope(c
 	prs.ObjectMeta.Name = "default"
 	prs.Spec.NamespaceSpec.RecStatus = "Disabled"
 	prs.Spec.NamespaceSpec.Selector = "!(projectcalico.org/name starts with 'tigera-') && !(projectcalico.org/name starts with 'calico-') && !(projectcalico.org/name starts with 'kube-')"
-	if r.provider == operatorv1.ProviderOpenShift {
+	if r.provider.IsOpenShift() {
 		prs.Spec.NamespaceSpec.Selector += " && !(projectcalico.org/name starts with 'openshift-')"
 	}
 

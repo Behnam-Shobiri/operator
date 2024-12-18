@@ -24,6 +24,7 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	operator "github.com/tigera/operator/api/v1"
 	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
+	"github.com/tigera/operator/pkg/ptr"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -76,7 +77,7 @@ func fillDefaults(ctx context.Context, client client.Client, instance *operator.
 	// Only add default CIDRs if there are no existing pools in the cluster. If there are existing pools in the cluster,
 	// then we assume that the user has configured them correctly out-of-band and we should not install any others.
 	if currentPools == nil || len(currentPools.Items) == 0 {
-		if instance.Spec.KubernetesProvider == operator.ProviderOpenShift {
+		if instance.Spec.KubernetesProvider.IsOpenShift() {
 			// If configured to run in openshift, then also fetch the openshift configuration API.
 			log.V(1).Info("Fetching OpenShift network configuration")
 			openshiftConfig := &configv1.Network{}
@@ -183,8 +184,7 @@ func fillDefaults(ctx context.Context, client client.Client, instance *operator.
 				pool.NodeSelector = operator.NodeSelectorDefault
 			}
 			if pool.BlockSize == nil {
-				var twentySix int32 = 26
-				pool.BlockSize = &twentySix
+				pool.BlockSize = ptr.ToPtr[int32](26)
 			}
 		} else if err == nil && addr.To16() != nil {
 			// This is an IPv6 pool.
@@ -198,9 +198,12 @@ func fillDefaults(ctx context.Context, client client.Client, instance *operator.
 				pool.NodeSelector = operator.NodeSelectorDefault
 			}
 			if pool.BlockSize == nil {
-				var oneTwentyTwo int32 = 122
-				pool.BlockSize = &oneTwentyTwo
+				pool.BlockSize = ptr.ToPtr[int32](122)
 			}
+		}
+
+		if pool.DisableNewAllocations == nil {
+			pool.DisableNewAllocations = ptr.ToPtr(false)
 		}
 
 		// Default the name if it's not set.
@@ -231,6 +234,10 @@ func fillDefaults(ctx context.Context, client client.Client, instance *operator.
 					return err
 				}
 			}
+		}
+
+		if pool.AssignmentMode == "" {
+			pool.AssignmentMode = crdv1.Automatic
 		}
 	}
 	return nil

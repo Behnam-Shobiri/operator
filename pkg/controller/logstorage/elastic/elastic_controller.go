@@ -24,7 +24,23 @@ import (
 	kbv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/kibana/v1"
 	"github.com/elastic/cloud-on-k8s/v2/pkg/utils/stringsutil"
 	"github.com/go-logr/logr"
+	apps "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
@@ -40,26 +56,12 @@ import (
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	rsecret "github.com/tigera/operator/pkg/render/common/secret"
+	"github.com/tigera/operator/pkg/render/logstorage/eck"
 	"github.com/tigera/operator/pkg/render/logstorage/esgateway"
 	"github.com/tigera/operator/pkg/render/logstorage/esmetrics"
+	"github.com/tigera/operator/pkg/render/logstorage/kibana"
 	"github.com/tigera/operator/pkg/render/monitor"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
-
-	apps "k8s.io/api/apps/v1"
-	corev1 "k8s.io/api/core/v1"
-	storagev1 "k8s.io/api/storage/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
-
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 var log = logf.Log.WithName("controller_logstorage_elastic")
@@ -78,7 +80,6 @@ type ElasticSubController struct {
 	esCliCreator   utils.ElasticsearchClientCreator
 	clusterDomain  string
 	tierWatchReady *utils.ReadyFlag
-	usePSP         bool
 	multiTenant    bool
 }
 
@@ -99,7 +100,6 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		esCliCreator:   utils.NewElasticClient,
 		tierWatchReady: &utils.ReadyFlag{},
 		status:         status.New(mgr.GetClient(), initializer.TigeraStatusLogStorageElastic, opts.KubernetesVersion),
-		usePSP:         opts.UsePSP,
 		clusterDomain:  opts.ClusterDomain,
 		provider:       opts.DetectedProvider,
 		multiTenant:    opts.MultiTenant,
@@ -144,11 +144,11 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, k8sClient, log, r.tierWatchReady)
 	go utils.WaitToAddNetworkPolicyWatches(c, k8sClient, log, []types.NamespacedName{
 		{Name: render.ElasticsearchPolicyName, Namespace: render.ElasticsearchNamespace},
-		{Name: render.KibanaPolicyName, Namespace: render.KibanaNamespace},
-		{Name: render.ECKOperatorPolicyName, Namespace: render.ECKOperatorNamespace},
+		{Name: kibana.PolicyName, Namespace: kibana.Namespace},
+		{Name: eck.OperatorPolicyName, Namespace: eck.OperatorNamespace},
 		{Name: render.ElasticsearchInternalPolicyName, Namespace: render.ElasticsearchNamespace},
 		{Name: networkpolicy.TigeraComponentDefaultDenyPolicyName, Namespace: render.ElasticsearchNamespace},
-		{Name: networkpolicy.TigeraComponentDefaultDenyPolicyName, Namespace: render.KibanaNamespace},
+		{Name: networkpolicy.TigeraComponentDefaultDenyPolicyName, Namespace: kibana.Namespace},
 	})
 
 	// Watch for changes in storage classes, as new storage classes may be made available for LogStorage.
@@ -158,7 +158,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	}
 
 	if err = c.WatchObject(&apps.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{Namespace: render.ECKOperatorNamespace, Name: render.ECKOperatorName},
+		ObjectMeta: metav1.ObjectMeta{Namespace: eck.OperatorNamespace, Name: eck.OperatorName},
 	}, &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("log-storage-elastic-controller failed to watch StatefulSet resource: %w", err)
 	}
@@ -168,7 +168,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		return fmt.Errorf("log-storage-elastic-controller failed to watch Elasticsearch resource: %w", err)
 	}
 	if err = c.WatchObject(&kbv1.Kibana{
-		ObjectMeta: metav1.ObjectMeta{Namespace: render.KibanaNamespace, Name: render.KibanaName},
+		ObjectMeta: metav1.ObjectMeta{Namespace: kibana.Namespace, Name: kibana.CRName},
 	}, &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("log-storage-elastic-controller failed to watch Kibana resource: %w", err)
 	}
@@ -181,7 +181,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	// Establish watches for secrets in the tigera-operator namespace.
 	for _, secretName := range []string{
 		render.TigeraElasticsearchGatewaySecret,
-		render.TigeraKibanaCertSecret,
+		kibana.TigeraKibanaCertSecret,
 		render.OIDCSecretName,
 		render.DexObjectName,
 		esmetrics.ElasticsearchMetricsServerTLSSecret,
@@ -227,7 +227,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		return fmt.Errorf("log-storage-elastic-controller failed to watch ConfigMap resource: %w", err)
 	}
 
-	if err = utils.AddConfigMapWatch(c, render.ECKLicenseConfigMapName, render.ECKOperatorNamespace, &handler.EnqueueRequestForObject{}); err != nil {
+	if err = utils.AddConfigMapWatch(c, eck.LicenseConfigMapName, eck.OperatorNamespace, &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("log-storage-elastic-controller failed to watch ConfigMap resource: %w", err)
 	}
 
@@ -361,15 +361,15 @@ func (r *ElasticSubController) Reconcile(ctx context.Context, request reconcile.
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Failed to create Elasticsearch secrets", err, log)
 		return reconcile.Result{}, err
 	}
-	kbDNSNames := dns.GetServiceDNSNames(render.KibanaServiceName, render.KibanaNamespace, r.clusterDomain)
-	kibanaKeyPair, err := cm.GetKeyPair(r.client, render.TigeraKibanaCertSecret, common.OperatorNamespace(), kbDNSNames)
+	kbDNSNames := dns.GetServiceDNSNames(kibana.ServiceName, kibana.Namespace, r.clusterDomain)
+	kibanaKeyPair, err := cm.GetKeyPair(r.client, kibana.TigeraKibanaCertSecret, common.OperatorNamespace(), kbDNSNames)
 	if err != nil {
 		log.Error(err, err.Error())
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Failed to create Kibana secrets", err, log)
 		return reconcile.Result{}, err
 	}
 
-	kibanaEnabled := !operatorv1.IsFIPSModeEnabled(install.FIPSMode) && !r.multiTenant
+	kibanaEnabled := !r.multiTenant
 
 	// Wait for dependencies to exist.
 	if elasticKeyPair == nil {
@@ -384,8 +384,6 @@ func (r *ElasticSubController) Reconcile(ctx context.Context, request reconcile.
 	// Define variables to be filled in below, conditional on cluster type.
 	var esLicenseType render.ElasticsearchLicenseType
 	var clusterConfig *relasticsearch.ClusterConfig
-	var applyTrial bool
-	var keyStoreSecret *corev1.Secret
 	var esAdminUserSecret *corev1.Secret
 
 	flowShards := logstoragecommon.CalculateFlowShards(ls.Spec.Nodes, logstoragecommon.DefaultElasticsearchShards)
@@ -402,26 +400,6 @@ func (r *ElasticSubController) Reconcile(ctx context.Context, request reconcile.
 		return reconcile.Result{}, err
 	}
 
-	if operatorv1.IsFIPSModeEnabled(install.FIPSMode) {
-		applyTrial, err = r.applyElasticTrialSecret(ctx, install)
-		if err != nil {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get eck trial license", err, reqLogger)
-			return reconcile.Result{}, err
-		}
-
-		keyStoreSecret = &corev1.Secret{}
-		if err := r.client.Get(ctx, types.NamespacedName{Name: render.ElasticsearchKeystoreSecret, Namespace: render.ElasticsearchNamespace}, keyStoreSecret); err != nil {
-			if errors.IsNotFound(err) {
-				// We need to render a new one.
-				keyStoreSecret = render.CreateElasticsearchKeystoreSecret()
-			} else {
-				log.Error(err, "failed to read the Elasticsearch keystore secret")
-				r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to read the Elasticsearch keystore secret", err, reqLogger)
-				return reconcile.Result{}, err
-			}
-		}
-	}
-
 	// Get the admin user secret to copy to the operator namespace.
 	esAdminUserSecret, err = utils.GetSecret(ctx, r.client, render.ElasticsearchAdminUserSecret, render.ElasticsearchNamespace)
 	if err != nil {
@@ -435,9 +413,9 @@ func (r *ElasticSubController) Reconcile(ctx context.Context, request reconcile.
 
 	esLicenseType, err = utils.GetElasticLicenseType(ctx, r.client, reqLogger)
 	if err != nil {
-		// If ECKLicenseConfigMapName is not found, it means ECK operator is not running yet, log the information and proceed
+		// If LicenseConfigMapName is not found, it means ECK operator is not running yet, log the information and proceed
 		if errors.IsNotFound(err) {
-			reqLogger.Info("ConfigMap not found yet", "name", render.ECKLicenseConfigMapName)
+			reqLogger.Info("ConfigMap not found yet", "name", eck.LicenseConfigMapName)
 		} else {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get elastic license", err, reqLogger)
 			return reconcile.Result{}, err
@@ -450,9 +428,9 @@ func (r *ElasticSubController) Reconcile(ctx context.Context, request reconcile.
 		return reconcile.Result{}, err
 	}
 
-	var kibana *kbv1.Kibana
+	var kibanaCR *kbv1.Kibana
 	if kibanaEnabled {
-		kibana, err = r.getKibana(ctx)
+		kibanaCR, err = r.getKibana(ctx)
 		if err != nil {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "An error occurred trying to retrieve Kibana", err, reqLogger)
 			return reconcile.Result{}, err
@@ -519,40 +497,59 @@ func (r *ElasticSubController) Reconcile(ctx context.Context, request reconcile.
 
 	hdler := utils.NewComponentHandler(reqLogger, r.client, r.scheme, ls)
 
-	logStorageCfg := &render.ElasticsearchConfiguration{
-		LogStorage:              ls,
-		Installation:            install,
-		ManagementCluster:       managementCluster,
-		Elasticsearch:           elasticsearch,
-		Kibana:                  kibana,
-		ClusterConfig:           clusterConfig,
-		ElasticsearchUserSecret: esAdminUserSecret,
-		ElasticsearchKeyPair:    elasticKeyPair,
-		KibanaKeyPair:           kibanaKeyPair,
-		PullSecrets:             pullSecrets,
-		Provider:                r.provider,
-		ESService:               esService,
-		KbService:               kbService,
-		ClusterDomain:           r.clusterDomain,
-		BaseURL:                 baseURL,
-		ElasticLicenseType:      esLicenseType,
-		TrustedBundle:           trustedBundle,
-		UnusedTLSSecret:         unusedTLSSecret,
-		UsePSP:                  r.usePSP,
-		ApplyTrial:              applyTrial,
-		KeyStoreSecret:          keyStoreSecret,
-		KibanaEnabled:           kibanaEnabled,
+	components := []render.Component{
+		eck.ECK(&eck.Configuration{
+			LogStorage:         ls,
+			Installation:       install,
+			ManagementCluster:  managementCluster,
+			PullSecrets:        pullSecrets,
+			Provider:           r.provider,
+			ElasticLicenseType: esLicenseType,
+		}),
+		render.LogStorage(&render.ElasticsearchConfiguration{
+			LogStorage:              ls,
+			Installation:            install,
+			ManagementCluster:       managementCluster,
+			Elasticsearch:           elasticsearch,
+			ClusterConfig:           clusterConfig,
+			ElasticsearchUserSecret: esAdminUserSecret,
+			ElasticsearchKeyPair:    elasticKeyPair,
+			PullSecrets:             pullSecrets,
+			Provider:                r.provider,
+			ESService:               esService,
+			ClusterDomain:           r.clusterDomain,
+			ElasticLicenseType:      esLicenseType,
+			TrustedBundle:           trustedBundle,
+			UnusedTLSSecret:         unusedTLSSecret,
+		}),
+		kibana.Kibana(&kibana.Configuration{
+			LogStorage:      ls,
+			Installation:    install,
+			Kibana:          kibanaCR,
+			KibanaKeyPair:   kibanaKeyPair,
+			PullSecrets:     pullSecrets,
+			Provider:        r.provider,
+			KbService:       kbService,
+			ClusterDomain:   r.clusterDomain,
+			BaseURL:         baseURL,
+			TrustedBundle:   trustedBundle,
+			UnusedTLSSecret: unusedTLSSecret,
+			Enabled:         kibanaEnabled,
+		}),
 	}
 
-	component := render.LogStorage(logStorageCfg)
-	if err = imageset.ApplyImageSet(ctx, r.client, variant, component); err != nil {
-		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error with images from ImageSet", err, reqLogger)
-		return reconcile.Result{}, err
+	for _, component := range components {
+		if err = imageset.ApplyImageSet(ctx, r.client, variant, component); err != nil {
+			r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error with images from ImageSet", err, reqLogger)
+			return reconcile.Result{}, err
+		}
 	}
 
-	if err := hdler.CreateOrUpdateOrDelete(ctx, component, r.status); err != nil {
-		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating resource", err, reqLogger)
-		return reconcile.Result{}, err
+	for _, component := range components {
+		if err := hdler.CreateOrUpdateOrDelete(ctx, component, r.status); err != nil {
+			r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating resource", err, reqLogger)
+			return reconcile.Result{}, err
+		}
 	}
 
 	if elasticsearch == nil || elasticsearch.Status.Phase != esv1.ElasticsearchReadyPhase {
@@ -560,10 +557,10 @@ func (r *ElasticSubController) Reconcile(ctx context.Context, request reconcile.
 		return reconcile.Result{}, nil
 	}
 
-	if kibanaEnabled && kibana == nil {
+	if kibanaEnabled && kibanaCR == nil {
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for Kibana cluster to be created", nil, reqLogger)
 		return reconcile.Result{}, nil
-	} else if kibanaEnabled && kibana.Status.AssociationStatus != cmnv1.AssociationEstablished {
+	} else if kibanaEnabled && kibanaCR.Status.AssociationStatus != cmnv1.AssociationEstablished {
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for Kibana association to be established", nil, reqLogger)
 		return reconcile.Result{}, nil
 	}
@@ -571,7 +568,7 @@ func (r *ElasticSubController) Reconcile(ctx context.Context, request reconcile.
 	// In multi-tenant mode, ILM programming is created out of band
 	if !r.multiTenant {
 		if err := r.applyILMPolicies(ls, reqLogger, ctx); err != nil {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Error applying ILM policies", nil, reqLogger)
+			r.status.SetDegraded(operatorv1.ResourceNotReady, "Error applying ILM policies", err, reqLogger)
 			return reconcile.Result{}, err
 		}
 	}
@@ -612,7 +609,7 @@ func (r *ElasticSubController) handleLogStorageFinalizer(ctx context.Context, ls
 			return err
 		}
 		kibana := &kbv1.Kibana{}
-		err = r.client.Get(ctx, client.ObjectKey{Name: render.KibanaName, Namespace: render.KibanaNamespace}, kibana)
+		err = r.client.Get(ctx, client.ObjectKey{Name: kibana.Name, Namespace: kibana.Namespace}, kibana)
 		if errors.IsNotFound(err) {
 			kibana = nil
 		} else if err != nil {
@@ -660,7 +657,7 @@ func (r *ElasticSubController) checkOIDCUsersEsResource(ctx context.Context) err
 
 func (r *ElasticSubController) applyILMPolicies(ls *operatorv1.LogStorage, reqLogger logr.Logger, ctx context.Context) error {
 	// ES should be in ready phase when execution reaches here, apply ILM polices
-	esClient, err := r.esCliCreator(r.client, ctx, relasticsearch.ECKElasticEndpoint())
+	esClient, err := r.esCliCreator(r.client, ctx, relasticsearch.ECKElasticEndpoint(), false)
 	if err != nil {
 		return err
 	}
@@ -685,7 +682,7 @@ func (r *ElasticSubController) getElasticsearchService(ctx context.Context) (*co
 
 func (r *ElasticSubController) getKibana(ctx context.Context) (*kbv1.Kibana, error) {
 	kb := kbv1.Kibana{}
-	err := r.client.Get(ctx, client.ObjectKey{Name: render.KibanaName, Namespace: render.KibanaNamespace}, &kb)
+	err := r.client.Get(ctx, client.ObjectKey{Name: kibana.CRName, Namespace: kibana.Namespace}, &kb)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil, nil
@@ -697,7 +694,7 @@ func (r *ElasticSubController) getKibana(ctx context.Context) (*kbv1.Kibana, err
 
 func (r *ElasticSubController) getKibanaService(ctx context.Context) (*corev1.Service, error) {
 	svc := corev1.Service{}
-	err := r.client.Get(ctx, client.ObjectKey{Name: render.KibanaServiceName, Namespace: render.KibanaNamespace}, &svc)
+	err := r.client.Get(ctx, client.ObjectKey{Name: kibana.ServiceName, Namespace: kibana.Namespace}, &svc)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil, nil
@@ -705,22 +702,4 @@ func (r *ElasticSubController) getKibanaService(ctx context.Context) (*corev1.Se
 		return nil, err
 	}
 	return &svc, nil
-}
-
-// applyElasticTrialSecret returns true if we want to apply a new trial license.
-// Overwriting an existing trial license will invalidate the old trial, and revert the cluster back to basic. When a user
-// installs a valid Elastic license, the trial will be ignored.
-func (r *ElasticSubController) applyElasticTrialSecret(ctx context.Context, installation *operatorv1.InstallationSpec) (bool, error) {
-	if !operatorv1.IsFIPSModeEnabled(installation.FIPSMode) {
-		return false, nil
-	}
-	// FIPS mode is a licensed feature for Elasticsearch.
-	if err := r.client.Get(ctx, types.NamespacedName{Name: render.ECKEnterpriseTrial, Namespace: render.ECKOperatorNamespace}, &corev1.Secret{}); err != nil {
-		if errors.IsNotFound(err) {
-			return true, nil
-		} else {
-			return false, err
-		}
-	}
-	return false, nil
 }

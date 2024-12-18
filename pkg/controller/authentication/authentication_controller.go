@@ -18,6 +18,9 @@ import (
 	"context"
 	"fmt"
 
+	"golang.org/x/net/http/httpproxy"
+	v1 "k8s.io/api/apps/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
@@ -106,7 +109,6 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions, tierWatchReady 
 		status:         status.New(mgr.GetClient(), "authentication", opts.KubernetesVersion),
 		clusterDomain:  opts.ClusterDomain,
 		tierWatchReady: tierWatchReady,
-		usePSP:         opts.UsePSP,
 		multiTenant:    opts.MultiTenant,
 	}
 	r.status.Run(opts.ShutdownContext)
@@ -157,14 +159,15 @@ var _ reconcile.Reconciler = &ReconcileAuthentication{}
 
 // ReconcileAuthentication reconciles an Authentication object
 type ReconcileAuthentication struct {
-	client         client.Client
-	scheme         *runtime.Scheme
-	provider       oprv1.Provider
-	status         status.StatusManager
-	clusterDomain  string
-	tierWatchReady *utils.ReadyFlag
-	usePSP         bool
-	multiTenant    bool
+	client                     client.Client
+	scheme                     *runtime.Scheme
+	provider                   oprv1.Provider
+	status                     status.StatusManager
+	clusterDomain              string
+	tierWatchReady             *utils.ReadyFlag
+	multiTenant                bool
+	resolvedPodProxies         []*httpproxy.Config
+	lastAvailabilityTransition metav1.Time
 }
 
 // Reconcile the cluster state with the Authentication object that is found in the cluster.
@@ -234,17 +237,6 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 	if variant != oprv1.TigeraSecureEnterprise {
 		r.status.SetDegraded(oprv1.ResourceNotReady, fmt.Sprintf("Waiting for network to be %s", oprv1.TigeraSecureEnterprise), nil, reqLogger)
 		return reconcile.Result{}, nil
-	}
-
-	// Make sure the tigera-dex namespace exists, before rendering any objects there.
-	if err := r.client.Get(ctx, client.ObjectKey{Name: render.DexObjectName}, &corev1.Namespace{}); err != nil {
-		if errors.IsNotFound(err) {
-			r.status.SetDegraded(oprv1.ResourceNotFound, "Waiting for namespace tigera-dex to be created", err, reqLogger)
-			return reconcile.Result{}, nil
-		} else {
-			r.status.SetDegraded(oprv1.ResourceReadError, "Error querying tigera-dex namespace", err, reqLogger)
-			return reconcile.Result{}, err
-		}
 	}
 
 	// Validate that the tier watch is ready before querying the tier to ensure we utilize the cache.
@@ -319,6 +311,78 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 		return reconcile.Result{}, err
 	}
 
+	// Determine the current deployment availability.
+	var currentAvailabilityTransition metav1.Time
+	var currentlyAvailable bool
+	dexDeployment := v1.Deployment{}
+	err = r.client.Get(ctx, client.ObjectKey{Name: render.DexObjectName, Namespace: render.DexNamespace}, &dexDeployment)
+	if err != nil && !errors.IsNotFound(err) {
+		r.status.SetDegraded(oprv1.ResourceReadError, "Failed to read the deployment status of Dex", err, reqLogger)
+		return reconcile.Result{}, nil
+	} else if err == nil {
+		for _, condition := range dexDeployment.Status.Conditions {
+			if condition.Type == v1.DeploymentAvailable {
+				currentAvailabilityTransition = condition.LastTransitionTime
+				if condition.Status == corev1.ConditionTrue {
+					currentlyAvailable = true
+				}
+				break
+			}
+		}
+	}
+
+	// Resolve the proxies used by each Dex pod. We only update the resolved proxies if the availability of the
+	// Dex deployment has changed since our last reconcile and the deployment is currently available. We restrict
+	// the resolution of pod proxies in this way to limit the number of pod queries we make.
+	if !currentAvailabilityTransition.Equal(&r.lastAvailabilityTransition) && currentlyAvailable {
+		// Query dex pods.
+		labelSelector := labels.SelectorFromSet(map[string]string{
+			"app.kubernetes.io/name": render.DexObjectName,
+		})
+		pods := corev1.PodList{}
+		err := r.client.List(ctx, &pods, &client.ListOptions{
+			LabelSelector: labelSelector,
+			Namespace:     render.DexNamespace,
+		})
+		if err != nil {
+			r.status.SetDegraded(oprv1.ResourceReadError, "Failed to list the pods of the Dex deployment", err, reqLogger)
+			return reconcile.Result{}, nil
+		}
+
+		// Resolve the proxy config for each pod. Pods without a proxy will have a nil proxy config value.
+		var podProxies []*httpproxy.Config
+		for _, pod := range pods.Items {
+			for _, container := range pod.Spec.Containers {
+				if container.Name == render.DexObjectName {
+					var podProxyConfig *httpproxy.Config
+					var httpProxy, httpsProxy, noProxy string
+					for _, env := range container.Env {
+						switch env.Name {
+						case "http_proxy", "HTTP_PROXY":
+							httpProxy = env.Value
+						case "https_proxy", "HTTPS_PROXY":
+							httpsProxy = env.Value
+						case "no_proxy", "NO_PROXY":
+							noProxy = env.Value
+						}
+					}
+					if httpProxy != "" || httpsProxy != "" || noProxy != "" {
+						podProxyConfig = &httpproxy.Config{
+							HTTPProxy:  httpProxy,
+							HTTPSProxy: httpsProxy,
+							NoProxy:    noProxy,
+						}
+					}
+
+					podProxies = append(podProxies, podProxyConfig)
+				}
+			}
+		}
+
+		r.resolvedPodProxies = podProxies
+	}
+	r.lastAvailabilityTransition = currentAvailabilityTransition
+
 	disableDex := utils.IsDexDisabled(authentication)
 
 	// DexConfig adds convenience methods around dex related objects in k8s and can be used to configure Dex.
@@ -329,15 +393,15 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 
 	dexComponentCfg := &render.DexComponentConfiguration{
 		PullSecrets:    pullSecrets,
-		Openshift:      r.provider == oprv1.ProviderOpenShift,
+		OpenShift:      r.provider.IsOpenShift(),
 		Installation:   install,
 		DexConfig:      dexCfg,
 		ClusterDomain:  r.clusterDomain,
 		DeleteDex:      disableDex,
 		TLSKeyPair:     tlsKeyPair,
 		TrustedBundle:  trustedBundle,
-		UsePSP:         r.usePSP,
 		Authentication: authentication,
+		PodProxies:     r.resolvedPodProxies,
 	}
 
 	// Render the desired objects from the CRD and create or update them.
@@ -349,16 +413,19 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 		return reconcile.Result{}, err
 	}
 
-	components := []render.Component{
-		component,
-		rcertificatemanagement.CertificateManagement(&rcertificatemanagement.Config{
-			Namespace:       render.DexNamespace,
-			ServiceAccounts: []string{render.DexObjectName},
-			KeyPairOptions: []rcertificatemanagement.KeyPairOption{
-				rcertificatemanagement.NewKeyPairOption(tlsKeyPair, true, true),
-			},
-			TrustedBundle: trustedBundle,
-		}),
+	components := []render.Component{component}
+
+	if !disableDex {
+		components = append(components,
+			rcertificatemanagement.CertificateManagement(&rcertificatemanagement.Config{
+				Namespace:       render.DexNamespace,
+				ServiceAccounts: []string{render.DexObjectName},
+				KeyPairOptions: []rcertificatemanagement.KeyPairOption{
+					rcertificatemanagement.NewKeyPairOption(tlsKeyPair, true, true),
+				},
+				TrustedBundle: trustedBundle,
+			}),
+		)
 	}
 
 	for _, comp := range components {

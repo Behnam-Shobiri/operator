@@ -17,23 +17,22 @@ package render_test
 import (
 	"fmt"
 
-	"k8s.io/apiserver/pkg/authentication/serviceaccount"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apiserver/pkg/authentication/serviceaccount"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
 	"github.com/tigera/operator/pkg/common"
@@ -105,36 +104,60 @@ var _ = Describe("compliance rendering tests", func() {
 			ReporterKeyPair:    reporterKP,
 			BenchmarkerKeyPair: benchmarkerKP,
 			SnapshotterKeyPair: snapshotterKP,
-			Openshift:          notOpenshift,
+			OpenShift:          false,
 			ClusterDomain:      clusterDomain,
 			TrustedBundle:      bundle,
-			UsePSP:             true,
 			Namespace:          render.ComplianceNamespace,
 		}
 	})
 
-	It("should render properly when PSP is not supported by the cluster", func() {
-		cfg.UsePSP = false
+	It("should render SecurityContextConstrains properly when provider is OpenShift", func() {
+		cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
+		cfg.OpenShift = true
 		component, err := render.Compliance(cfg)
-		Expect(err).ShouldNot(HaveOccurred())
+		Expect(err).NotTo(HaveOccurred())
 		Expect(component.ResolveImages(nil)).To(BeNil())
 		resources, _ := component.Objects()
 
-		// Should not contain any PodSecurityPolicies
-		for _, r := range resources {
-			Expect(r.GetObjectKind().GroupVersionKind().Kind).NotTo(Equal("PodSecurityPolicy"))
-		}
-	})
+		clusterRole := rtest.GetResource(resources, "tigera-compliance-benchmarker", "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
+		Expect(clusterRole.Rules).To(ContainElement(rbacv1.PolicyRule{
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
+			Verbs:         []string{"use"},
+			ResourceNames: []string{"hostaccess"},
+		}))
 
-	It("should render the env variable for queryserver when FIPS is enabled", func() {
-		fipsEnabled := operatorv1.FIPSModeEnabled
-		cfg.Installation.FIPSMode = &fipsEnabled
-		component, err := render.Compliance(cfg)
-		Expect(err).ShouldNot(HaveOccurred())
-		Expect(component.ResolveImages(nil)).To(BeNil())
-		resources, _ := component.Objects()
-		d := rtest.GetResource(resources, "compliance-server", ns, "apps", "v1", "Deployment").(*appsv1.Deployment)
-		Expect(d.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "FIPS_MODE_ENABLED", Value: "true"}))
+		role := rtest.GetResource(resources, "tigera-compliance-controller", "tigera-compliance", "rbac.authorization.k8s.io", "v1", "Role").(*rbacv1.Role)
+		Expect(role.Rules).To(ContainElement(rbacv1.PolicyRule{
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
+			Verbs:         []string{"use"},
+			ResourceNames: []string{"nonroot-v2"},
+		}))
+
+		clusterRole = rtest.GetResource(resources, "tigera-compliance-reporter", "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
+		Expect(clusterRole.Rules).To(ContainElement(rbacv1.PolicyRule{
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
+			Verbs:         []string{"use"},
+			ResourceNames: []string{"hostaccess"},
+		}))
+
+		clusterRole = rtest.GetResource(resources, "tigera-compliance-server", "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
+		Expect(clusterRole.Rules).To(ContainElement(rbacv1.PolicyRule{
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
+			Verbs:         []string{"use"},
+			ResourceNames: []string{"nonroot-v2"},
+		}))
+
+		clusterRole = rtest.GetResource(resources, "tigera-compliance-snapshotter", "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
+		Expect(clusterRole.Rules).To(ContainElement(rbacv1.PolicyRule{
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
+			Verbs:         []string{"use"},
+			ResourceNames: []string{"nonroot-v2"},
+		}))
 	})
 
 	It("should render resource requests and limits for compliance components", func() {
@@ -363,11 +386,6 @@ var _ = Describe("compliance rendering tests", func() {
 				{"tigera-compliance-server", "", rbac, "v1", "ClusterRole"},
 				{"compliance", ns, "", "v1", "Service"},
 				{"compliance-server", ns, "apps", "v1", "Deployment"},
-				{"compliance-benchmarker", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-controller", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-reporter", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-server", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-snapshotter", "", "policy", "v1beta1", "PodSecurityPolicy"},
 			}
 
 			Expect(len(resources)).To(Equal(len(expectedResources)))
@@ -397,12 +415,6 @@ var _ = Describe("compliance rendering tests", func() {
 					APIGroups: []string{"authentication.k8s.io"},
 					Resources: []string{"tokenreviews"},
 					Verbs:     []string{"create"},
-				},
-				{
-					APIGroups:     []string{"policy"},
-					Resources:     []string{"podsecuritypolicies"},
-					Verbs:         []string{"use"},
-					ResourceNames: []string{"compliance-server"},
 				},
 				{
 					APIGroups: []string{"linseed.tigera.io"},
@@ -520,11 +532,6 @@ var _ = Describe("compliance rendering tests", func() {
 				{"tigera-compliance-server", "", rbac, "v1", "ClusterRole"},
 				{"compliance", ns, "", "v1", "Service"},
 				{"compliance-server", ns, "apps", "v1", "Deployment"},
-				{"compliance-benchmarker", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-controller", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-reporter", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-server", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-snapshotter", "", "policy", "v1beta1", "PodSecurityPolicy"},
 			}
 
 			Expect(len(resources)).To(Equal(len(expectedResources)))
@@ -576,12 +583,6 @@ var _ = Describe("compliance rendering tests", func() {
 					APIGroups: []string{"authentication.k8s.io"},
 					Resources: []string{"tokenreviews"},
 					Verbs:     []string{"create"},
-				},
-				{
-					APIGroups:     []string{"policy"},
-					Resources:     []string{"podsecuritypolicies"},
-					Verbs:         []string{"use"},
-					ResourceNames: []string{"compliance-server"},
 				},
 				{
 					APIGroups: []string{"linseed.tigera.io"},
@@ -637,11 +638,6 @@ var _ = Describe("compliance rendering tests", func() {
 				{"tigera-compliance-server", "", rbac, "v1", "ClusterRoleBinding"},
 				{"tigera-compliance-server", "", rbac, "v1", "ClusterRole"},
 				{"tigera-linseed", ns, rbac, "v1", "RoleBinding"},
-				{"compliance-benchmarker", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-controller", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-reporter", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-server", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-snapshotter", "", "policy", "v1beta1", "PodSecurityPolicy"},
 			}
 
 			Expect(len(resources)).To(Equal(len(expectedResources)))
@@ -698,6 +694,38 @@ var _ = Describe("compliance rendering tests", func() {
 			Expect(dpComplianceController.Spec.Template.Spec.Tolerations).To(ContainElements(append(rmeta.TolerateControlPlane, t)))
 			Expect(complianceSnapshotter.Spec.Template.Spec.Tolerations).To(ContainElements(append(rmeta.TolerateControlPlane, t)))
 			Expect(complianceReporter.Template.Spec.Tolerations).To(ContainElements(append(rmeta.TolerateControlPlane, t)))
+			Expect(complianceBenchmarker.Spec.Template.Spec.Tolerations).To(ContainElements(rmeta.TolerateAll))
+		})
+
+		It("should render toleration on GKE", func() {
+			installation := &operatorv1.InstallationSpec{
+				KubernetesProvider: operatorv1.ProviderGKE,
+			}
+			dpComplianceServer, dpComplianceController, complianceSnapshotter, complianceReporter, complianceBenchmarker := renderCompliance(installation)
+			Expect(dpComplianceServer.Spec.Template.Spec.Tolerations).To(ContainElements(corev1.Toleration{
+				Key:      "kubernetes.io/arch",
+				Operator: corev1.TolerationOpEqual,
+				Value:    "arm64",
+				Effect:   corev1.TaintEffectNoSchedule,
+			}))
+			Expect(dpComplianceController.Spec.Template.Spec.Tolerations).To(ContainElements(corev1.Toleration{
+				Key:      "kubernetes.io/arch",
+				Operator: corev1.TolerationOpEqual,
+				Value:    "arm64",
+				Effect:   corev1.TaintEffectNoSchedule,
+			}))
+			Expect(complianceSnapshotter.Spec.Template.Spec.Tolerations).To(ContainElements(corev1.Toleration{
+				Key:      "kubernetes.io/arch",
+				Operator: corev1.TolerationOpEqual,
+				Value:    "arm64",
+				Effect:   corev1.TaintEffectNoSchedule,
+			}))
+			Expect(complianceReporter.Template.Spec.Tolerations).To(ContainElements(corev1.Toleration{
+				Key:      "kubernetes.io/arch",
+				Operator: corev1.TolerationOpEqual,
+				Value:    "arm64",
+				Effect:   corev1.TaintEffectNoSchedule,
+			}))
 			Expect(complianceBenchmarker.Spec.Template.Spec.Tolerations).To(ContainElements(rmeta.TolerateAll))
 		})
 
@@ -781,11 +809,6 @@ var _ = Describe("compliance rendering tests", func() {
 				{"tigera-compliance-server", "", rbac, "v1", "ClusterRole"},
 				{"compliance", ns, "", "v1", "Service"},
 				{"compliance-server", ns, "apps", "v1", "Deployment"},
-				{"compliance-benchmarker", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-controller", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-reporter", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-server", "", "policy", "v1beta1", "PodSecurityPolicy"},
-				{"compliance-snapshotter", "", "policy", "v1beta1", "PodSecurityPolicy"},
 			}
 
 			for i, expectedRes := range expectedResources {
@@ -1031,7 +1054,7 @@ var _ = Describe("compliance rendering tests", func() {
 
 		DescribeTable("should render allow-tigera policy",
 			func(scenario testutils.AllowTigeraScenario) {
-				cfg.Openshift = scenario.Openshift
+				cfg.OpenShift = scenario.OpenShift
 				if scenario.ManagedCluster {
 					cfg.ManagementClusterConnection = &operatorv1.ManagementClusterConnection{}
 				} else {
@@ -1047,10 +1070,10 @@ var _ = Describe("compliance rendering tests", func() {
 					Expect(policy).To(Equal(expectedPolicy))
 				}
 			},
-			Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: false}),
-			Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: true}),
-			Entry("for managed, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: true, Openshift: false}),
-			Entry("for managed, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: true, Openshift: true}),
+			Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false}),
+			Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true}),
+			Entry("for managed, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: true, OpenShift: false}),
+			Entry("for managed, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: true, OpenShift: true}),
 		)
 	})
 
@@ -1078,8 +1101,7 @@ var _ = Describe("compliance rendering tests", func() {
 			tenantAExpectedResources := []client.Object{
 				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "tigera-compliance-server", Namespace: tenantANamespace}},
 				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-compliance-server"}},
-				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.MultiTenantComplianceManagedClustersAccessClusterRoleName}},
-				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.MultiTenantComplianceManagedClustersAccessClusterRoleName}},
+				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.MultiTenantComplianceManagedClustersAccessRoleBindingName, Namespace: tenantANamespace}},
 				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceSnapshotterServiceAccount}},
 				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceSnapshotterServiceAccount}},
 				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceBenchmarkerServiceAccount}},
@@ -1092,11 +1114,6 @@ var _ = Describe("compliance rendering tests", func() {
 				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "tigera-compliance-server"}},
 				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "compliance", Namespace: tenantANamespace}},
 				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "compliance-server", Namespace: tenantANamespace}},
-				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-benchmarker"}},
-				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-controller"}},
-				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-reporter"}},
-				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-server"}},
-				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-snapshotter"}},
 			}
 
 			rtest.ExpectResources(tenantAResources, tenantAExpectedResources)
@@ -1126,8 +1143,7 @@ var _ = Describe("compliance rendering tests", func() {
 			tenantBExpectedResources := []client.Object{
 				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "tigera-compliance-server", Namespace: tenantBNamespace}},
 				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-compliance-server"}},
-				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.MultiTenantComplianceManagedClustersAccessClusterRoleName}},
-				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.MultiTenantComplianceManagedClustersAccessClusterRoleName}},
+				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.MultiTenantComplianceManagedClustersAccessRoleBindingName, Namespace: tenantBNamespace}},
 				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceSnapshotterServiceAccount}},
 				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceSnapshotterServiceAccount}},
 				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ComplianceBenchmarkerServiceAccount}},
@@ -1140,11 +1156,6 @@ var _ = Describe("compliance rendering tests", func() {
 				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "tigera-compliance-server"}},
 				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "compliance", Namespace: tenantBNamespace}},
 				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "compliance-server", Namespace: tenantBNamespace}},
-				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-benchmarker"}},
-				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-controller"}},
-				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-reporter"}},
-				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-server"}},
-				&v1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "compliance-snapshotter"}},
 			}
 
 			rtest.ExpectResources(tenantBResources, tenantBExpectedResources)
@@ -1153,6 +1164,81 @@ var _ = Describe("compliance rendering tests", func() {
 				deployment := rtest.GetResource(tenantBResources, deploymentName, tenantBNamespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
 				envs := deployment.Spec.Template.Spec.Containers[0].Env
 				Expect(envs).To(ContainElement(corev1.EnvVar{Name: "TIGERA_COMPLIANCE_JOB_NAMESPACE", Value: tenantBNamespace}))
+			}
+		})
+
+		It("should bind multiple tenant to clusterrole", func() {
+			cfg.Namespace = tenantANamespace
+			cfg.ExternalElastic = true
+			cfg.BindingNamespaces = []string{tenantANamespace}
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tenantA",
+					Namespace: tenantANamespace,
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-a-id",
+				},
+			}
+			tenantACompliance, err := render.Compliance(cfg)
+			Expect(err).NotTo(HaveOccurred())
+
+			tenantAResources, _ := tenantACompliance.Objects()
+
+			expectedClusterRoleBindings := []string{
+				render.ComplianceBenchmarkerServiceAccount,
+				render.ComplianceControllerServiceAccount,
+				render.ComplianceReporterServiceAccount,
+				render.ComplianceServerServiceAccount,
+				render.ComplianceSnapshotterServiceAccount}
+
+			for _, name := range expectedClusterRoleBindings {
+				assertClusterRoleBindingHasSubjects(tenantAResources,
+					name,
+					name,
+					[]rbacv1.Subject{
+						{
+							Kind:      "ServiceAccount",
+							Name:      name,
+							Namespace: tenantANamespace,
+						},
+					},
+				)
+			}
+
+			cfg.Namespace = tenantBNamespace
+			cfg.BindingNamespaces = []string{tenantANamespace, tenantBNamespace}
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tenantB",
+					Namespace: tenantBNamespace,
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-b-id",
+				},
+			}
+			tenantBCompliance, err := render.Compliance(cfg)
+			Expect(err).NotTo(HaveOccurred())
+
+			tenantBResources, _ := tenantBCompliance.Objects()
+
+			for _, name := range expectedClusterRoleBindings {
+				assertClusterRoleBindingHasSubjects(tenantBResources,
+					name,
+					name,
+					[]rbacv1.Subject{
+						{
+							Kind:      "ServiceAccount",
+							Name:      name,
+							Namespace: tenantANamespace,
+						},
+						{
+							Kind:      "ServiceAccount",
+							Name:      name,
+							Namespace: tenantBNamespace,
+						},
+					},
+				)
 			}
 		})
 
@@ -1232,20 +1318,9 @@ var _ = Describe("compliance rendering tests", func() {
 			tenantACompliance, err := render.Compliance(cfg)
 			Expect(err).NotTo(HaveOccurred())
 			resources, _ := tenantACompliance.Objects()
-			cr := rtest.GetResource(resources, render.MultiTenantComplianceManagedClustersAccessClusterRoleName, "", rbacv1.GroupName, "v1", "ClusterRole").(*rbacv1.ClusterRole)
-			expectedRules := []rbacv1.PolicyRule{
-				{
-					APIGroups: []string{"projectcalico.org"},
-					Resources: []string{"managedclusters"},
-					Verbs: []string{
-						"get",
-					},
-				},
-			}
-			Expect(cr.Rules).To(ContainElements(expectedRules))
-			rb := rtest.GetResource(resources, render.MultiTenantComplianceManagedClustersAccessClusterRoleName, "", rbacv1.GroupName, "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
+			rb := rtest.GetResource(resources, render.MultiTenantComplianceManagedClustersAccessRoleBindingName, tenantANamespace, rbacv1.GroupName, "v1", "RoleBinding").(*rbacv1.RoleBinding)
 			Expect(rb.RoleRef.Kind).To(Equal("ClusterRole"))
-			Expect(rb.RoleRef.Name).To(Equal(render.MultiTenantComplianceManagedClustersAccessClusterRoleName))
+			Expect(rb.RoleRef.Name).To(Equal(render.MultiTenantManagedClustersAccessClusterRoleName))
 			Expect(rb.Subjects).To(ContainElements([]rbacv1.Subject{
 				{
 					Kind:      "ServiceAccount",
@@ -1257,6 +1332,7 @@ var _ = Describe("compliance rendering tests", func() {
 
 		It("should render linseed API permissions as part of tigera-compliance-snapshotter ClusterRole", func() {
 			cfg.Namespace = tenantANamespace
+			cfg.BindingNamespaces = []string{tenantANamespace}
 			cfg.ExternalElastic = true
 			cfg.Tenant = &operatorv1.Tenant{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1295,6 +1371,7 @@ var _ = Describe("compliance rendering tests", func() {
 
 		It("should render linseed API permissions as part of tigera-compliance-benchmarker ClusterRole", func() {
 			cfg.Namespace = tenantANamespace
+			cfg.BindingNamespaces = []string{tenantANamespace}
 			cfg.ExternalElastic = true
 			cfg.Tenant = &operatorv1.Tenant{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1333,6 +1410,7 @@ var _ = Describe("compliance rendering tests", func() {
 
 		It("should render linseed API permissions as part of tigera-compliance-controller ClusterRole", func() {
 			cfg.Namespace = tenantANamespace
+			cfg.BindingNamespaces = []string{tenantANamespace}
 			cfg.ExternalElastic = true
 			cfg.Tenant = &operatorv1.Tenant{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1371,6 +1449,7 @@ var _ = Describe("compliance rendering tests", func() {
 
 		It("should render linseed API permissions as part of tigera-compliance-reporter ClusterRole", func() {
 			cfg.Namespace = tenantANamespace
+			cfg.BindingNamespaces = []string{tenantANamespace}
 			cfg.ExternalElastic = true
 			cfg.Tenant = &operatorv1.Tenant{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1476,3 +1555,10 @@ var _ = Describe("compliance rendering tests", func() {
 		})
 	})
 })
+
+func assertClusterRoleBindingHasSubjects(tenantResources []client.Object, clusterRoleBinding string, clusterRole string, subjects []rbacv1.Subject) {
+	tenantRBAC := rtest.GetResource(tenantResources, clusterRoleBinding, "", rbacv1.GroupName, "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
+	Expect(tenantRBAC.RoleRef.Kind).To(Equal("ClusterRole"))
+	Expect(tenantRBAC.RoleRef.Name).To(Equal(clusterRole))
+	Expect(tenantRBAC.Subjects).To(ContainElements(subjects))
+}

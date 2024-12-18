@@ -24,7 +24,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -42,9 +41,9 @@ import (
 	"github.com/tigera/operator/pkg/render/common/configmap"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 	"github.com/tigera/operator/pkg/render/logstorage/esmetrics"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 	"github.com/tigera/operator/pkg/tls/certkeyusage"
@@ -56,13 +55,13 @@ const (
 	CalicoNodeMonitor      = "calico-node-monitor"
 	CalicoNodePrometheus   = "calico-node-prometheus"
 
-	CalicoPrometheusOperator = "calico-prometheus-operator"
+	CalicoPrometheusOperator       = "calico-prometheus-operator"
+	CalicoPrometheusOperatorSecret = "calico-prometheus-operator-secret"
 
-	TigeraPrometheusObjectName            = "tigera-prometheus"
-	TigeraPrometheusDPRate                = "tigera-prometheus-dp-rate"
-	TigeraPrometheusRole                  = "tigera-prometheus-role"
-	TigeraPrometheusRoleBinding           = "tigera-prometheus-role-binding"
-	TigeraPrometheusPodSecurityPolicyName = "tigera-prometheus"
+	TigeraPrometheusObjectName  = "tigera-prometheus"
+	TigeraPrometheusDPRate      = "tigera-prometheus-dp-rate"
+	TigeraPrometheusRole        = "tigera-prometheus-role"
+	TigeraPrometheusRoleBinding = "tigera-prometheus-role-binding"
 
 	// TigeraExternalPrometheus is the name of the objects created when Monitor.Spec.ExternalPrometheus is enabled.
 	TigeraExternalPrometheus = "tigera-external-prometheus"
@@ -122,18 +121,18 @@ func MonitorPolicy(cfg *Config) render.Component {
 
 // Config contains all the config information needed to render the Monitor component.
 type Config struct {
-	Monitor                  operatorv1.MonitorSpec
-	Installation             *operatorv1.InstallationSpec
-	PullSecrets              []*corev1.Secret
-	AlertmanagerConfigSecret *corev1.Secret
-	KeyValidatorConfig       authentication.KeyValidatorConfig
-	ServerTLSSecret          certificatemanagement.KeyPairInterface
-	ClientTLSSecret          certificatemanagement.KeyPairInterface
-	ClusterDomain            string
-	TrustedCertBundle        certificatemanagement.TrustedBundle
-	Openshift                bool
-	KubeControllerPort       int
-	UsePSP                   bool
+	Monitor                       operatorv1.MonitorSpec
+	Installation                  *operatorv1.InstallationSpec
+	PullSecrets                   []*corev1.Secret
+	AlertmanagerConfigSecret      *corev1.Secret
+	KeyValidatorConfig            authentication.KeyValidatorConfig
+	ServerTLSSecret               certificatemanagement.KeyPairInterface
+	ClientTLSSecret               certificatemanagement.KeyPairInterface
+	ClusterDomain                 string
+	TrustedCertBundle             certificatemanagement.TrustedBundle
+	OpenShift                     bool
+	KubeControllerPort            int
+	FelixPrometheusMetricsEnabled bool
 }
 
 type monitorComponent struct {
@@ -167,7 +166,7 @@ func (mc *monitorComponent) ResolveImages(is *operatorv1.ImageSet) error {
 	}
 
 	if len(errMsgs) != 0 {
-		return fmt.Errorf(strings.Join(errMsgs, ","))
+		return fmt.Errorf("%s", strings.Join(errMsgs, ","))
 	}
 	return nil
 }
@@ -184,15 +183,23 @@ func (mc *monitorComponent) Objects() ([]client.Object, []client.Object) {
 		// - securityContext.capabilities.drop=["ALL"]
 		// - securityContext.runAsNonRoot=true
 		// - securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost"
-		render.CreateNamespace(common.TigeraPrometheusNamespace, mc.cfg.Installation.KubernetesProvider, render.PSSBaseline),
+		render.CreateNamespace(common.TigeraPrometheusNamespace, mc.cfg.Installation.KubernetesProvider, render.PSSBaseline, mc.cfg.Installation.Azure),
 	}
+
+	toCreate = append(toCreate, render.CreateOperatorSecretsRoleBinding(common.TigeraPrometheusNamespace))
 
 	// Create role and role bindings first.
 	// Operator needs the create/update roles for Alertmanager configuration secret for example.
-	toCreate = append(toCreate,
-		mc.operatorRole(),
-		mc.operatorRoleBinding(),
-	)
+
+	roles := mc.operatorRoles()
+	for _, r := range roles {
+		toCreate = append(toCreate, r)
+	}
+
+	bindings := mc.operatorRoleBindings()
+	for _, rb := range bindings {
+		toCreate = append(toCreate, rb)
+	}
 
 	toCreate = append(toCreate, secret.ToRuntimeObjects(secret.CopyToNamespace(common.TigeraPrometheusNamespace, mc.cfg.PullSecrets...)...)...)
 	toCreate = append(toCreate, secret.ToRuntimeObjects(secret.CopyToNamespace(common.TigeraPrometheusNamespace, mc.cfg.AlertmanagerConfigSecret)...)...)
@@ -223,16 +230,13 @@ func (mc *monitorComponent) Objects() ([]client.Object, []client.Object) {
 		toCreate = append(toCreate, configmap.ToRuntimeObjects(mc.cfg.KeyValidatorConfig.RequiredConfigMaps(common.TigeraPrometheusNamespace)...)...)
 	}
 
-	if mc.cfg.UsePSP {
-		toCreate = append(toCreate, mc.prometheusOperatorPodSecurityPolicy())
-	}
-
 	if mc.cfg.Monitor.ExternalPrometheus != nil {
 		toCreate = append(toCreate, mc.externalConfigMap())
 		if mc.cfg.Monitor.ExternalPrometheus.ServiceMonitor != nil {
 			externalServiceMonitor, needsRBAC := mc.externalServiceMonitor()
 			toCreate = append(toCreate, externalServiceMonitor)
 			if needsRBAC {
+				toCreate = append(toCreate, render.CreateOperatorSecretsRoleBinding(mc.cfg.Monitor.ExternalPrometheus.Namespace))
 				toCreate = append(toCreate, mc.externalPrometheusRole(), mc.externalPrometheusRoleBinding(), mc.externalServiceAccount(), mc.externalPrometheusTokenSecret())
 			}
 		}
@@ -304,7 +308,6 @@ func (mc *monitorComponent) prometheusOperatorClusterRole() *rbacv1.ClusterRole 
 			APIGroups: []string{""},
 			Resources: []string{
 				"configmaps",
-				"secrets",
 			},
 			Verbs: []string{"*"},
 		},
@@ -348,6 +351,14 @@ func (mc *monitorComponent) prometheusOperatorClusterRole() *rbacv1.ClusterRole 
 			},
 		},
 		{
+			APIGroups: []string{""},
+			Resources: []string{"events"},
+			Verbs: []string{
+				"patch",
+				"create",
+			},
+		},
+		{
 			APIGroups: []string{"networking.k8s.io"},
 			Resources: []string{"ingresses"},
 			Verbs: []string{
@@ -365,12 +376,12 @@ func (mc *monitorComponent) prometheusOperatorClusterRole() *rbacv1.ClusterRole 
 		},
 	}
 
-	if mc.cfg.UsePSP {
+	if mc.cfg.OpenShift {
 		rules = append(rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{TigeraPrometheusPodSecurityPolicyName},
+			ResourceNames: []string{securitycontextconstraints.NonRootV2},
 		})
 	}
 
@@ -400,18 +411,18 @@ func (mc *monitorComponent) prometheusOperatorClusterRoleBinding() *rbacv1.Clust
 	}
 }
 
-func (mc *monitorComponent) prometheusOperatorPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(TigeraPrometheusPodSecurityPolicyName)
-}
-
 func (mc *monitorComponent) alertmanager() *monitoringv1.Alertmanager {
-
 	resources := corev1.ResourceRequirements{}
 
 	if mc.cfg.Monitor.AlertManager != nil {
 		if mc.cfg.Monitor.AlertManager.AlertManagerSpec != nil {
 			resources = mc.cfg.Monitor.AlertManager.AlertManagerSpec.Resources
 		}
+	}
+
+	tolerations := mc.cfg.Installation.ControlPlaneTolerations
+	if mc.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
 	}
 
 	am := &monitoringv1.Alertmanager{
@@ -428,7 +439,7 @@ func (mc *monitorComponent) alertmanager() *monitoringv1.Alertmanager {
 			Replicas:           mc.cfg.Installation.ControlPlaneReplicas,
 			SecurityContext:    securitycontext.NewNonRootPodContext(),
 			ServiceAccountName: PrometheusServiceAccountName,
-			Tolerations:        mc.cfg.Installation.ControlPlaneTolerations,
+			Tolerations:        tolerations,
 			Version:            components.ComponentCoreOSAlertmanager.Version,
 			Resources:          resources,
 		},
@@ -499,10 +510,6 @@ func (mc *monitorComponent) prometheus() *monitoringv1.Prometheus {
 			Name:  "TLS_CA_BUNDLE_HASH_ANNOTATION",
 			Value: rmeta.AnnotationHash(mc.cfg.TrustedCertBundle.HashAnnotations()),
 		},
-		{
-			Name:  "FIPS_MODE_ENABLED",
-			Value: operatorv1.IsFIPSModeEnabledString(mc.cfg.Installation.FIPSMode),
-		},
 	}
 
 	volumes := []corev1.Volume{
@@ -518,6 +525,11 @@ func (mc *monitorComponent) prometheus() *monitoringv1.Prometheus {
 
 	if mc.cfg.KeyValidatorConfig != nil {
 		env = append(env, mc.cfg.KeyValidatorConfig.RequiredEnv("")...)
+	}
+
+	tolerations := mc.cfg.Installation.ControlPlaneTolerations
+	if mc.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
 	}
 
 	prometheus := &monitoringv1.Prometheus{
@@ -579,7 +591,7 @@ func (mc *monitorComponent) prometheus() *monitoringv1.Prometheus {
 				SecurityContext:        securitycontext.NewNonRootPodContext(),
 				ServiceAccountName:     PrometheusServiceAccountName,
 				ServiceMonitorSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"team": "network-operators"}},
-				Tolerations:            mc.cfg.Installation.ControlPlaneTolerations,
+				Tolerations:            tolerations,
 				Version:                components.ComponentCoreOSPrometheus.Version,
 				VolumeMounts:           volumeMounts,
 				Volumes:                volumes,
@@ -652,12 +664,12 @@ func (mc *monitorComponent) prometheusClusterRole() *rbacv1.ClusterRole {
 		},
 	}
 
-	if mc.cfg.UsePSP {
+	if mc.cfg.OpenShift {
 		rules = append(rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{TigeraPrometheusPodSecurityPolicyName},
+			ResourceNames: []string{securitycontextconstraints.NonRootV2},
 		})
 	}
 
@@ -699,6 +711,15 @@ func (mc *monitorComponent) prometheusServiceClusterRole() client.Object {
 			Resources: []string{"subjectaccessreviews"},
 			Verbs:     []string{"create"},
 		},
+	}
+
+	if mc.cfg.OpenShift {
+		rules = append(rules, rbacv1.PolicyRule{
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
+			Verbs:         []string{"use"},
+			ResourceNames: []string{securitycontextconstraints.NonRootV2},
+		})
 	}
 
 	return &rbacv1.ClusterRole{
@@ -795,6 +816,35 @@ func (mc *monitorComponent) prometheusRule() *monitoringv1.PrometheusRule {
 }
 
 func (mc *monitorComponent) serviceMonitorCalicoNode() *monitoringv1.ServiceMonitor {
+	endpoints := []monitoringv1.Endpoint{
+		{
+			HonorLabels:   true,
+			Interval:      "5s",
+			Port:          "calico-metrics-port",
+			ScrapeTimeout: "5s",
+			Scheme:        "https",
+			TLSConfig:     mc.tlsConfig(render.CalicoNodeMetricsService),
+		},
+		{
+			HonorLabels:   true,
+			Interval:      "5s",
+			Port:          "calico-bgp-metrics-port",
+			ScrapeTimeout: "5s",
+			Scheme:        "https",
+			TLSConfig:     mc.tlsConfig(render.CalicoNodeMetricsService),
+		},
+	}
+
+	if mc.cfg.FelixPrometheusMetricsEnabled {
+		endpoints = append(endpoints, monitoringv1.Endpoint{
+			HonorLabels:   true,
+			Interval:      "5s",
+			Port:          "felix-metrics-port",
+			ScrapeTimeout: "5s",
+			Scheme:        "http",
+		})
+	}
+
 	return &monitoringv1.ServiceMonitor{
 		TypeMeta: metav1.TypeMeta{Kind: monitoringv1.ServiceMonitorsKind, APIVersion: MonitoringAPIVersion},
 		ObjectMeta: metav1.ObjectMeta{
@@ -813,24 +863,7 @@ func (mc *monitorComponent) serviceMonitorCalicoNode() *monitoringv1.ServiceMoni
 				},
 			},
 			NamespaceSelector: monitoringv1.NamespaceSelector{MatchNames: []string{"calico-system"}},
-			Endpoints: []monitoringv1.Endpoint{
-				{
-					HonorLabels:   true,
-					Interval:      "5s",
-					Port:          "calico-metrics-port",
-					ScrapeTimeout: "5s",
-					Scheme:        "https",
-					TLSConfig:     mc.tlsConfig(render.CalicoNodeMetricsService),
-				},
-				{
-					HonorLabels:   true,
-					Interval:      "5s",
-					Port:          "calico-bgp-metrics-port",
-					ScrapeTimeout: "5s",
-					Scheme:        "https",
-					TLSConfig:     mc.tlsConfig(render.CalicoNodeMetricsService),
-				},
-			},
+			Endpoints:         endpoints,
 		},
 	}
 }
@@ -841,7 +874,7 @@ func (mc *monitorComponent) tlsConfig(serverName string) *monitoringv1.TLSConfig
 		CertFile: mc.cfg.ClientTLSSecret.VolumeMountCertificateFilePath(),
 		CAFile:   mc.cfg.TrustedCertBundle.MountPath(),
 		SafeTLSConfig: monitoringv1.SafeTLSConfig{
-			ServerName: serverName,
+			ServerName: &serverName,
 		},
 	}
 }
@@ -908,6 +941,7 @@ func (mc *monitorComponent) serviceMonitorFluentd() *monitoringv1.ServiceMonitor
 }
 
 func (mc *monitorComponent) serviceMonitorQueryServer() *monitoringv1.ServiceMonitor {
+	serverName := render.ProjectCalicoAPIServerServiceName(mc.cfg.Installation.Variant)
 	return &monitoringv1.ServiceMonitor{
 		TypeMeta: metav1.TypeMeta{Kind: monitoringv1.ServiceMonitorsKind, APIVersion: MonitoringAPIVersion},
 		ObjectMeta: metav1.ObjectMeta{
@@ -929,7 +963,7 @@ func (mc *monitorComponent) serviceMonitorQueryServer() *monitoringv1.ServiceMon
 					TLSConfig: &monitoringv1.TLSConfig{
 						CAFile: mc.cfg.TrustedCertBundle.MountPath(),
 						SafeTLSConfig: monitoringv1.SafeTLSConfig{
-							ServerName: render.ProjectCalicoAPIServerServiceName(mc.cfg.Installation.Variant),
+							ServerName: &serverName,
 						},
 					},
 				},
@@ -938,56 +972,98 @@ func (mc *monitorComponent) serviceMonitorQueryServer() *monitoringv1.ServiceMon
 	}
 }
 
-func (mc *monitorComponent) operatorRole() *rbacv1.Role {
-	// list and watch have to be cluster scopes for watches to work.
-	// In controller-runtime, watches are by default non-namespaced.
-	return &rbacv1.Role{
-		TypeMeta: metav1.TypeMeta{Kind: "Role", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      TigeraPrometheusRole,
-			Namespace: common.TigeraPrometheusNamespace,
-		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{"monitoring.coreos.com"},
-				Resources: []string{
-					"alertmanagers",
-					"podmonitors",
-					"prometheuses",
-					"prometheusrules",
-					"servicemonitors",
-					"thanosrulers",
+func (mc *monitorComponent) operatorRoles() []*rbacv1.Role {
+
+	return []*rbacv1.Role{
+		// list and watch have to be cluster scopes for watches to work.
+		// In controller-runtime, watches are by default non-namespaced.
+		{
+			TypeMeta: metav1.TypeMeta{Kind: "Role", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      TigeraPrometheusRole,
+				Namespace: common.TigeraPrometheusNamespace,
+			},
+			Rules: []rbacv1.PolicyRule{
+				{
+					APIGroups: []string{"monitoring.coreos.com"},
+					Resources: []string{
+						"alertmanagers",
+						"podmonitors",
+						"prometheuses",
+						"prometheusrules",
+						"servicemonitors",
+						"thanosrulers",
+					},
+					Verbs: []string{
+						"create",
+						"delete",
+						"get",
+						"list",
+						"update",
+						"watch",
+					},
 				},
-				Verbs: []string{
-					"create",
-					"delete",
-					"get",
-					"list",
-					"update",
-					"watch",
+			},
+		},
+		{
+			TypeMeta:   metav1.TypeMeta{Kind: "Role", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: CalicoPrometheusOperatorSecret, Namespace: common.TigeraPrometheusNamespace},
+			Rules: []rbacv1.PolicyRule{
+				{
+					APIGroups: []string{""},
+					Resources: []string{
+						"secrets",
+					},
+					Verbs: []string{
+						"create",
+						"delete",
+						"get",
+						"list",
+						"update",
+						"watch",
+					},
 				},
 			},
 		},
 	}
 }
 
-func (mc *monitorComponent) operatorRoleBinding() *rbacv1.RoleBinding {
-	return &rbacv1.RoleBinding{
-		TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      TigeraPrometheusRoleBinding,
-			Namespace: common.TigeraPrometheusNamespace,
+func (mc *monitorComponent) operatorRoleBindings() []*rbacv1.RoleBinding {
+
+	return []*rbacv1.RoleBinding{
+		{
+			TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      TigeraPrometheusRoleBinding,
+				Namespace: common.TigeraPrometheusNamespace,
+			},
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: "rbac.authorization.k8s.io",
+				Kind:     "Role",
+				Name:     TigeraPrometheusRole,
+			},
+			Subjects: []rbacv1.Subject{
+				{
+					Kind:      "ServiceAccount",
+					Name:      common.OperatorServiceAccount(),
+					Namespace: common.OperatorNamespace(),
+				},
+			},
 		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "Role",
-			Name:     TigeraPrometheusRole,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      common.OperatorServiceAccount(),
-				Namespace: common.OperatorNamespace(),
+		{
+			TypeMeta:   metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: CalicoPrometheusOperatorSecret, Namespace: common.TigeraPrometheusNamespace},
+			Subjects: []rbacv1.Subject{
+				{
+					Kind:      "ServiceAccount",
+					Name:      CalicoPrometheusOperator,
+					Namespace: common.TigeraPrometheusNamespace,
+				},
+			},
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: "rbac.authorization.k8s.io",
+				Kind:     "Role",
+				Name:     CalicoPrometheusOperatorSecret,
 			},
 		},
 	}
@@ -996,7 +1072,7 @@ func (mc *monitorComponent) operatorRoleBinding() *rbacv1.RoleBinding {
 // Creates a network policy to allow traffic to Alertmanager (TCP port 9093).
 func allowTigeraAlertManagerPolicy(cfg *Config) *v3.NetworkPolicy {
 	egressRules := []v3.Rule{}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.Openshift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.OpenShift)
 	egressRules = append(egressRules, v3.Rule{
 		// Allows all egress traffic from AlertManager.
 		Action:   v3.Allow,
@@ -1048,7 +1124,7 @@ func allowTigeraAlertManagerMeshPolicy(cfg *Config) *v3.NetworkPolicy {
 			},
 		},
 	}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.Openshift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.OpenShift)
 
 	return &v3.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},
@@ -1087,7 +1163,7 @@ func allowTigeraAlertManagerMeshPolicy(cfg *Config) *v3.NetworkPolicy {
 // Creates a network policy to allow traffic to access the Prometheus (TCP port 9095).
 func allowTigeraPrometheusPolicy(cfg *Config) *v3.NetworkPolicy {
 	egressRules := []v3.Rule{}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.Openshift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.OpenShift)
 	egressRules = append(egressRules, []v3.Rule{
 		{
 			Action:      v3.Allow,
@@ -1185,7 +1261,7 @@ func allowTigeraPrometheusPolicy(cfg *Config) *v3.NetworkPolicy {
 // Creates a network policy to allow traffic to access through tigera-prometheus-api
 func allowTigeraPrometheusAPIPolicy(cfg *Config) *v3.NetworkPolicy {
 	egressRules := []v3.Rule{}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.Openshift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.OpenShift)
 	egressRules = append(egressRules, v3.Rule{
 		Action:      v3.Allow,
 		Protocol:    &networkpolicy.TCPProtocol,
@@ -1220,7 +1296,7 @@ func allowTigeraPrometheusAPIPolicy(cfg *Config) *v3.NetworkPolicy {
 // Creates a network policy to allow the prometheus-operatorto access the kube-apiserver
 func allowTigeraPrometheusOperatorPolicy(cfg *Config) *v3.NetworkPolicy {
 	egressRules := []v3.Rule{}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.Openshift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.OpenShift)
 	egressRules = append(egressRules, v3.Rule{
 		Action:      v3.Allow,
 		Protocol:    &networkpolicy.TCPProtocol,
@@ -1383,7 +1459,7 @@ func (mc *monitorComponent) externalServiceMonitor() (client.Object, bool) {
 					},
 				},
 			},
-			BearerTokenSecret:    ep.BearerTokenSecret,
+			BearerTokenSecret:    &ep.BearerTokenSecret,
 			HonorLabels:          ep.HonorLabels,
 			HonorTimestamps:      ep.HonorTimestamps,
 			MetricRelabelConfigs: ep.MetricRelabelConfigs,

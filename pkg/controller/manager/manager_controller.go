@@ -47,9 +47,11 @@ import (
 	tigerakvc "github.com/tigera/operator/pkg/render/common/authentication/tigera/key_validator_config"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
+	"github.com/tigera/operator/pkg/render/logstorage/eck"
 	rmanager "github.com/tigera/operator/pkg/render/manager"
 	"github.com/tigera/operator/pkg/render/monitor"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
+	"github.com/tigera/operator/pkg/url"
 )
 
 const ResourceName = "manager"
@@ -135,6 +137,9 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	if err = c.WatchObject(&operatorv1.ManagementClusterConnection{}, eventHandler); err != nil {
 		return fmt.Errorf("manager-controller failed to watch primary resource: %w", err)
 	}
+	if err = c.WatchObject(&operatorv1.NonClusterHost{}, eventHandler); err != nil {
+		return fmt.Errorf("manager-controller failed to watch resource: %w", err)
+	}
 	if err = c.WatchObject(&operatorv1.Authentication{}, eventHandler); err != nil {
 		return fmt.Errorf("manager-controller failed to watch resource: %w", err)
 	}
@@ -157,9 +162,9 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	}
 	for _, namespace := range namespacesToWatch {
 		for _, secretName := range []string{
-			// We need to watch for es-gateway certificate because es-proxy still creates a
+			// We need to watch for es-gateway certificate because ui-apis still creates a
 			// client to talk to elastic via es-gateway
-			render.ManagerTLSSecretName, render.ElasticsearchManagerUserSecret, relasticsearch.PublicCertSecret,
+			render.ManagerTLSSecretName, relasticsearch.PublicCertSecret,
 			render.VoltronTunnelSecretName, render.ComplianceServerCertSecret, render.PacketCaptureServerCert,
 			render.ManagerInternalTLSSecretName, monitor.PrometheusServerTLSSecretName, certificatemanagement.CASecretName,
 		} {
@@ -182,7 +187,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	}
 
 	if !opts.ElasticExternal {
-		if err = utils.AddConfigMapWatch(c, render.ECKLicenseConfigMapName, render.ECKOperatorNamespace, eventHandler); err != nil {
+		if err = utils.AddConfigMapWatch(c, eck.LicenseConfigMapName, eck.OperatorNamespace, eventHandler); err != nil {
 			return fmt.Errorf("manager-controller failed to watch the ConfigMap resource: %v", err)
 		}
 	}
@@ -200,7 +205,6 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions, licenseAPIReady
 		clusterDomain:   opts.ClusterDomain,
 		licenseAPIReady: licenseAPIReady,
 		tierWatchReady:  tierWatchReady,
-		usePSP:          opts.UsePSP,
 		multiTenant:     opts.MultiTenant,
 		elasticExternal: opts.ElasticExternal,
 	}
@@ -221,7 +225,6 @@ type ReconcileManager struct {
 	clusterDomain   string
 	licenseAPIReady *utils.ReadyFlag
 	tierWatchReady  *utils.ReadyFlag
-	usePSP          bool
 
 	// Whether or not the operator is running in multi-tenant mode.
 	multiTenant     bool
@@ -252,7 +255,7 @@ func GetManager(ctx context.Context, cli client.Client, mt bool, ns string) (*op
 func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	// Perform any common preparation that needs to be done for single-tenant and multi-tenant scenarios.
 	helper := utils.NewNamespaceHelper(r.multiTenant, render.ManagerNamespace, request.Namespace)
-	logc := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name, "installNS", helper.InstallNamespace(), "truthNS", helper.TruthNamespace())
+	logc := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name, "installNS", helper.InstallNamespace(), "truthNS", helper.TruthNamespace(), "multi-tenant", r.multiTenant)
 	logc.Info("Reconciling Manager")
 
 	// We skip requests without a namespace specified in multi-tenant setups.
@@ -363,7 +366,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		return reconcile.Result{}, err
 	}
 
-	// Get or create a certificate for clients of the manager pod es-proxy container.
+	// Get or create a certificate for clients of the manager pod ui-apis container.
 	tlsSecret, err := certificateManager.GetOrCreateKeyPair(
 		r.client,
 		render.ManagerTLSSecretName,
@@ -404,10 +407,19 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		// and the bundle will simply use the root CA for the tenant. For single-tenant systems, we need to include these in case
 		// any of them haven't been signed by the root CA.
 		trustedSecretNames = []string{
-			render.PacketCaptureServerCert,
 			render.ProjectCalicoAPIServerTLSSecretName(installation.Variant),
 			render.TigeraLinseedSecret,
 		}
+
+		packetcaptureapi, err := utils.GetPacketCaptureAPI(ctx, r.client)
+		if err != nil && !errors.IsNotFound(err) {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying PacketCapture CR", err, logc)
+			return reconcile.Result{}, err
+		}
+		if packetcaptureapi != nil {
+			trustedSecretNames = append(trustedSecretNames, render.PacketCaptureServerCert)
+		}
+
 		// This is necessary because prior to v3.13 secrets were not signed by a single CA, so we need to include each individually
 		// in the trusted bundle
 		esgwCertificate, err := certificateManager.GetCertificate(r.client, relasticsearch.PublicCertSecret, common.OperatorNamespace())
@@ -488,35 +500,6 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		log.Error(err, "Error with Pull secrets")
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error retrieving pull secrets", err, logc)
 		return reconcile.Result{}, err
-	}
-
-	var clusterConfig *relasticsearch.ClusterConfig
-	// We only require Elastic cluster configuration when Kibana is enabled.
-	if render.KibanaEnabled(tenant, installation) {
-		clusterConfig, err = utils.GetElasticsearchClusterConfig(context.Background(), r.client)
-		if err != nil {
-			if errors.IsNotFound(err) {
-				r.status.SetDegraded(operatorv1.ResourceNotFound, "Elasticsearch cluster configuration is not available, waiting for it to become available", err, logc)
-				return reconcile.Result{}, nil
-			}
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get the elasticsearch cluster configuration", err, logc)
-			return reconcile.Result{}, err
-		}
-	}
-
-	var esSecrets []*corev1.Secret
-	if !r.multiTenant {
-		// Get secrets used by the manager to authenticate with Elasticsearch. This is used for Kibana login, and isn't
-		// needed for multi-tenant installations since currently Kibana is not supported in that mode.
-		esSecrets, err = utils.ElasticsearchSecrets(ctx, []string{render.ElasticsearchManagerUserSecret}, r.client)
-		if err != nil {
-			if errors.IsNotFound(err) {
-				r.status.SetDegraded(operatorv1.ResourceNotFound, "Elasticsearch secrets are not available yet, waiting until they become available", err, logc)
-				return reconcile.Result{}, nil
-			}
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get Elasticsearch credentials", err, logc)
-			return reconcile.Result{}, err
-		}
 	}
 
 	managementCluster, err := utils.GetManagementCluster(ctx, r.client)
@@ -654,12 +637,6 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 	if err != nil {
 		return reconcile.Result{}, err
 	}
-	if tenant.MultiTenant() {
-		// In a multi-tenant environment, we need to grant access to the canonical tigera-manager:tigera-manager service account
-		// so that es-proxy passes Voltron's authorization checks when accessing managed clusters. This is because per-tenant manager instances
-		// impersonate as this serviceaccount on these flows.
-		namespaces = append(namespaces, render.ManagerNamespace)
-	}
 
 	routeConfig, err := getVoltronRouteConfig(ctx, r.client, helper.InstallNamespace())
 	if err != nil {
@@ -667,18 +644,30 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		return reconcile.Result{}, err
 	}
 
+	// Check if non-cluster host log ingestion is enabled.
+	nonclusterhost, err := utils.GetNonClusterHost(ctx, r.client)
+	if err != nil {
+		r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to query NonClusterHost resource", err, logc)
+		return reconcile.Result{}, err
+	}
+	if nonclusterhost != nil {
+		if _, _, _, err := url.ParseEndpoint(nonclusterhost.Spec.Endpoint); err != nil {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to read parse endpoint from NonClusterHost resource", err, logc)
+			return reconcile.Result{}, err
+		}
+	}
+
 	managerCfg := &render.ManagerConfiguration{
 		VoltronRouteConfig:      routeConfig,
 		KeyValidatorConfig:      keyValidatorConfig,
-		ESSecrets:               esSecrets,
 		TrustedCertBundle:       trustedBundle,
-		ClusterConfig:           clusterConfig,
 		TLSKeyPair:              tlsSecret,
 		VoltronLinseedKeyPair:   linseedVoltronServerCert,
 		PullSecrets:             pullSecrets,
-		Openshift:               r.provider == operatorv1.ProviderOpenShift,
+		OpenShift:               r.provider.IsOpenShift(),
 		Installation:            installation,
 		ManagementCluster:       managementCluster,
+		NonClusterHost:          nonclusterhost,
 		TunnelServerCert:        tunnelServerCert,
 		InternalTLSKeyPair:      internalTrafficSecret,
 		ClusterDomain:           r.clusterDomain,
@@ -687,7 +676,6 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		Compliance:              complianceCR,
 		ComplianceLicenseActive: complianceLicenseFeatureActive,
 		ComplianceNamespace:     utils.NewNamespaceHelper(r.multiTenant, render.ComplianceNamespace, request.Namespace).InstallNamespace(),
-		UsePSP:                  r.usePSP,
 		Namespace:               helper.InstallNamespace(),
 		TruthNamespace:          helper.TruthNamespace(),
 		Tenant:                  tenant,
@@ -761,12 +749,12 @@ func fillDefaults(mc *operatorv1.ManagementCluster) {
 
 func getVoltronRouteConfig(ctx context.Context, cli client.Client, managerNamespace string) (*rmanager.VoltronRouteConfig, error) {
 	terminatedRouteList := &operatorv1.TLSTerminatedRouteList{}
-	if err := cli.List(ctx, terminatedRouteList); err != nil {
+	if err := cli.List(ctx, terminatedRouteList, client.InNamespace(managerNamespace)); err != nil {
 		return nil, err
 	}
 
 	passThroughRouteList := &operatorv1.TLSPassThroughRouteList{}
-	if err := cli.List(ctx, passThroughRouteList); err != nil {
+	if err := cli.List(ctx, passThroughRouteList, client.InNamespace(managerNamespace)); err != nil {
 		return nil, err
 	}
 

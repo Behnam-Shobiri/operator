@@ -326,7 +326,7 @@ func (r *UserController) Reconcile(ctx context.Context, request reconcile.Reques
 }
 
 func (r *UserController) createUserLogin(ctx context.Context, elasticEndpoint string, secret *corev1.Secret, user *utils.User, reqLogger logr.Logger) error {
-	esClient, err := r.esClientFn(r.client, ctx, elasticEndpoint)
+	esClient, err := r.esClientFn(r.client, ctx, elasticEndpoint, r.elasticExternal)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Failed to connect to Elasticsearch - failed to create the Elasticsearch client", err, reqLogger)
 		return err
@@ -357,13 +357,16 @@ func (r *UsersCleanupController) Reconcile(ctx context.Context, request reconcil
 		request.Namespace, "Request.Name", request.Name, "installNS", helper.InstallNamespace(), "truthNS", helper.TruthNamespace())
 	reqLogger.Info("Reconciling LogStorage - Cleanup")
 
-	// Wait for Elasticsearch to be installed and available.
-	elasticsearch, err := utils.GetElasticsearch(ctx, r.client)
-	if err != nil {
-		return reconcile.Result{}, err
-	}
-	if elasticsearch == nil || elasticsearch.Status.Phase != esv1.ElasticsearchReadyPhase {
-		return reconcile.Result{}, nil
+	if !r.elasticExternal {
+		// Wait for Elasticsearch to be installed and available.
+		elasticsearch, err := utils.GetElasticsearch(ctx, r.client)
+		if err != nil {
+			return reconcile.Result{}, err
+		}
+		if elasticsearch == nil || elasticsearch.Status.Phase != esv1.ElasticsearchReadyPhase {
+			reqLogger.Info("Elasticsearch is not ready")
+			return reconcile.Result{}, nil
+		}
 	}
 
 	// Clean up any stale users that may have been left behind by a previous tenant
@@ -406,7 +409,7 @@ func (r *UsersCleanupController) cleanupStaleUsers(ctx context.Context, logger l
 		}
 
 		// This tenant is terminating - clean up its Linseed user, if it exists.
-		esClient, err := r.esClientFn(r.client, ctx, t.Spec.Elastic.URL)
+		esClient, err := r.esClientFn(r.client, ctx, t.Spec.Elastic.URL, r.elasticExternal)
 		if err != nil {
 			return fmt.Errorf("failed to connect to Elasticsearch - failed to create the Elasticsearch client")
 		}

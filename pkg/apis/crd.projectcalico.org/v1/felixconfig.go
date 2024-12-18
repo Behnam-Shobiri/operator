@@ -20,6 +20,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+type NFTablesMode string
+
+const (
+	NFTablesModeEnabled  NFTablesMode = "Enabled"
+	NFTablesModeDisabled NFTablesMode = "Disabled"
+)
+
 type IptablesBackend string
 
 const (
@@ -304,6 +311,9 @@ type FelixConfigurationSpec struct {
 	// iptables. [Default: false]
 	GenericXDPEnabled *bool `json:"genericXDPEnabled,omitempty" confignamev1:"GenericXDPEnabled"`
 
+	// NFTablesMode configures nftables support in Felix. [Default: Disabled]
+	NFTablesMode *NFTablesMode `json:"nftablesMode,omitempty"`
+
 	// BPFEnabled, if enabled Felix will use the BPF dataplane. [Default: false]
 	BPFEnabled *bool `json:"bpfEnabled,omitempty" validate:"omitempty"`
 	// BPFDisableUnprivileged, if enabled, Felix sets the kernel.unprivileged_bpf_disabled sysctl to disable
@@ -342,6 +352,9 @@ type FelixConfigurationSpec struct {
 	// BPFKubeProxyEndpointSlicesEnabled in BPF mode, controls whether Felix's
 	// embedded kube-proxy accepts EndpointSlices or not.
 	BPFKubeProxyEndpointSlicesEnabled *bool `json:"bpfKubeProxyEndpointSlicesEnabled,omitempty" validate:"omitempty"`
+	// BPFHostConntrackBypass Controls whether to bypass Linux conntrack in BPF mode for
+	// workloads and services. [Default: true - bypass Linux conntrack]
+	BPFHostConntrackBypass *bool `json:"bpfHostConntrackBypass,omitempty"`
 
 	// RouteSource configures where Felix gets its routing information.
 	// - WorkloadIPs: use workload endpoints to construct routes.

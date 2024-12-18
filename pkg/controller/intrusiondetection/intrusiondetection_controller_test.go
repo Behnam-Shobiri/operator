@@ -19,42 +19,40 @@ import (
 	"fmt"
 	"time"
 
-	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
-
-	esv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/elasticsearch/v1"
-
-	"github.com/tigera/operator/pkg/apis"
-
-	"github.com/tigera/operator/pkg/controller/certificatemanager"
-	rtest "github.com/tigera/operator/pkg/render/common/test"
-	"k8s.io/apimachinery/pkg/api/resource"
-	"k8s.io/apimachinery/pkg/types"
-
-	"github.com/tigera/operator/pkg/render/intrusiondetection/dpi"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
-	"github.com/tigera/operator/pkg/common"
-	"github.com/tigera/operator/pkg/components"
-	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
-	"github.com/tigera/operator/test"
 
-	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
-	operatorv1 "github.com/tigera/operator/api/v1"
-	"github.com/tigera/operator/pkg/controller/status"
-	"github.com/tigera/operator/pkg/controller/utils"
-	"github.com/tigera/operator/pkg/render"
+	esv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/elasticsearch/v1"
+
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
+	operatorv1 "github.com/tigera/operator/api/v1"
+	"github.com/tigera/operator/pkg/apis"
+	"github.com/tigera/operator/pkg/common"
+	"github.com/tigera/operator/pkg/components"
+	"github.com/tigera/operator/pkg/controller/certificatemanager"
+	"github.com/tigera/operator/pkg/controller/status"
+	"github.com/tigera/operator/pkg/controller/utils"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
+	"github.com/tigera/operator/pkg/render"
+	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
+	rtest "github.com/tigera/operator/pkg/render/common/test"
+	"github.com/tigera/operator/pkg/render/intrusiondetection/dpi"
+	"github.com/tigera/operator/pkg/render/logstorage/eck"
+	"github.com/tigera/operator/test"
 )
 
 var _ = Describe("IntrusionDetection controller tests", func() {
@@ -172,8 +170,8 @@ var _ = Describe("IntrusionDetection controller tests", func() {
 		Expect(c.Create(ctx, rtest.CreateCertSecret(render.ElasticsearchPerformanceHotspotsUserSecret, common.OperatorNamespace(), render.GuardianSecretName)))
 		Expect(c.Create(ctx, &corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      render.ECKLicenseConfigMapName,
-				Namespace: render.ECKOperatorNamespace,
+				Name:      eck.LicenseConfigMapName,
+				Namespace: eck.OperatorNamespace,
 			},
 			Data: map[string]string{"eck_license_level": string(render.ElasticsearchLicenseTypeEnterpriseTrial)},
 		})).NotTo(HaveOccurred())
@@ -370,6 +368,35 @@ var _ = Describe("IntrusionDetection controller tests", func() {
 	Context("Reconcile tests", func() {
 		BeforeEach(func() {
 			mockStatus.On("SetDegraded", mock.Anything, mock.Anything).Return()
+		})
+
+		It("should Reconcile intrusion detection controller deployment ", func() {
+			result, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(0 * time.Second))
+
+			namespace := corev1.Namespace{
+				TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+			}
+			Expect(c.Get(ctx, client.ObjectKey{
+				Name: render.IntrusionDetectionNamespace,
+			}, &namespace)).NotTo(HaveOccurred())
+
+			tigeraCABundle := corev1.ConfigMap{
+				TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: "v1"},
+			}
+			Expect(c.Get(ctx, client.ObjectKey{
+				Name:      "tigera-ca-bundle",
+				Namespace: render.IntrusionDetectionNamespace,
+			}, &tigeraCABundle)).NotTo(HaveOccurred())
+
+			deployment := appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{},
+			}
+			Expect(c.Get(ctx, client.ObjectKey{
+				Name:      render.IntrusionDetectionControllerName,
+				Namespace: render.IntrusionDetectionNamespace,
+			}, &deployment)).NotTo(HaveOccurred())
 		})
 
 		It("should Reconcile with default values for intrusion detection resource", func() {
@@ -646,6 +673,68 @@ var _ = Describe("IntrusionDetection controller tests", func() {
 			Expect(*ids.Spec.ComponentResources[0].ResourceRequirements.Limits.Cpu()).Should(Equal(resource.MustParse(dpi.DefaultCPULimit)))
 			Expect(*ids.Spec.ComponentResources[0].ResourceRequirements.Requests.Memory()).Should(Equal(resource.MustParse(dpi.DefaultMemoryRequest)))
 			Expect(*ids.Spec.ComponentResources[0].ResourceRequirements.Limits.Memory()).Should(Equal(resource.MustParse(dpi.DefaultMemoryLimit)))
+		})
+	})
+
+	Context("Multi-tenant mode", func() {
+		var tenantANamespace = "tenantANamespace"
+
+		BeforeEach(func() {
+			mockStatus = &status.MockStatus{}
+			mockStatus.On("OnCRFound").Return()
+			mockStatus.On("SetMetaData", mock.Anything).Return()
+
+			// Update the reconciler to run in external ES mode for these tests.
+			r.elasticExternal = true
+			r.multiTenant = true
+
+			// Create the Tenant resources for tenant-a
+			tenantA := &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "default",
+					Namespace: tenantANamespace,
+				},
+				Spec: operatorv1.TenantSpec{ID: "tenant-a"},
+			}
+			Expect(c.Create(ctx, tenantA)).NotTo(HaveOccurred())
+
+			err := c.Create(ctx, &operatorv1.IntrusionDetection{ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure", Namespace: tenantANamespace}})
+			Expect(err).NotTo(HaveOccurred())
+
+			certificateManagerTenantA, err := certificatemanager.Create(c, nil, "", tenantANamespace, certificatemanager.AllowCACreation(), certificatemanager.WithTenant(tenantA))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, certificateManagerTenantA.KeyPair().Secret(tenantANamespace)))
+			tenantABundle, err := certificateManagerTenantA.CreateMultiTenantTrustedBundleWithSystemRootCertificates()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, tenantABundle.ConfigMap(tenantANamespace))).NotTo(HaveOccurred())
+
+			linseedTLSTenantA, err := certificateManagerTenantA.GetOrCreateKeyPair(c, render.TigeraLinseedSecret, tenantANamespace, []string{render.TigeraLinseedSecret})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, linseedTLSTenantA.Secret(tenantANamespace))).NotTo(HaveOccurred())
+
+			Expect(c.Delete(ctx, &v3.DeepPacketInspection{ObjectMeta: metav1.ObjectMeta{Name: "test-dpi", Namespace: "test-dpi-ns"}})).ShouldNot(HaveOccurred())
+		})
+
+		It("should Reconcile with default values for DPI", func() {
+			clusterRole := rbacv1.ClusterRole{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: dpi.DeepPacketInspectionLinseedRBACName,
+				},
+			}
+			clusterRoleBinding := rbacv1.ClusterRoleBinding{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: dpi.DeepPacketInspectionLinseedRBACName,
+				},
+			}
+
+			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: tenantANamespace}})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			err = test.GetResource(c, &clusterRole)
+			Expect(err).ShouldNot(HaveOccurred())
+
+			err = test.GetResource(c, &clusterRoleBinding)
+			Expect(err).ShouldNot(HaveOccurred())
 		})
 	})
 })

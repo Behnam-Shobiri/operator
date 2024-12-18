@@ -17,21 +17,19 @@ package render
 import (
 	"crypto/x509"
 	"fmt"
+	"net/url"
 	"strings"
-
-	"k8s.io/apiserver/pkg/authentication/serviceaccount"
-
-	ocsv1 "github.com/openshift/api/security/v1"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apiserver/pkg/authentication/serviceaccount"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/render/common/authentication"
@@ -39,9 +37,9 @@ import (
 	"github.com/tigera/operator/pkg/render/common/configmap"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 	"github.com/tigera/operator/pkg/tls/certkeyusage"
 )
@@ -56,7 +54,7 @@ const (
 	ComplianceBenchmarkerName                                 = "compliance-benchmarker"
 	ComplianceAccessPolicyName                                = networkpolicy.TigeraComponentPolicyPrefix + "compliance-access"
 	ComplianceServerPolicyName                                = networkpolicy.TigeraComponentPolicyPrefix + ComplianceServerName
-	MultiTenantComplianceManagedClustersAccessClusterRoleName = "compliance-server-managed-cluster-access"
+	MultiTenantComplianceManagedClustersAccessRoleBindingName = "compliance-server-managed-cluster-access"
 
 	// ServiceAccount names.
 	ComplianceServerServiceAccount      = "tigera-compliance-server"
@@ -94,7 +92,7 @@ func Compliance(cfg *ComplianceConfiguration) (Component, error) {
 type ComplianceConfiguration struct {
 	Installation                *operatorv1.InstallationSpec
 	PullSecrets                 []*corev1.Secret
-	Openshift                   bool
+	OpenShift                   bool
 	ManagementCluster           *operatorv1.ManagementCluster
 	ManagementClusterConnection *operatorv1.ManagementClusterConnection
 	KeyValidatorConfig          authentication.KeyValidatorConfig
@@ -111,10 +109,8 @@ type ComplianceConfiguration struct {
 	SnapshotterKeyPair certificatemanagement.KeyPairInterface
 	ControllerKeyPair  certificatemanagement.KeyPairInterface
 
-	// Whether the cluster supports pod security policies.
-	UsePSP bool
-
-	Namespace string
+	Namespace         string
+	BindingNamespaces []string
 
 	// Whether to run the rendered components in multi-tenant, single-tenant, or zero-tenant mode
 	Tenant          *operatorv1.Tenant
@@ -164,7 +160,7 @@ func (c *complianceComponent) ResolveImages(is *operatorv1.ImageSet) error {
 	}
 
 	if len(errMsgs) != 0 {
-		return fmt.Errorf(strings.Join(errMsgs, ","))
+		return fmt.Errorf("%s", strings.Join(errMsgs, ","))
 	}
 	return nil
 }
@@ -263,23 +259,9 @@ func (c *complianceComponent) Objects() ([]client.Object, []client.Object) {
 		)
 	}
 
-	if c.cfg.Openshift {
-		complianceObjs = append(complianceObjs, c.complianceBenchmarkerSecurityContextConstraints())
-	}
-
-	if c.cfg.UsePSP {
-		complianceObjs = append(complianceObjs,
-			c.complianceBenchmarkerPodSecurityPolicy(),
-			c.complianceControllerPodSecurityPolicy(),
-			c.complianceReporterPodSecurityPolicy(),
-			c.complianceServerPodSecurityPolicy(),
-			c.complianceSnapshotterPodSecurityPolicy(),
-		)
-	}
-
 	// Need to grant cluster admin permissions in DockerEE to the controller since a pod starting pods with
 	// host path volumes requires cluster admin permissions.
-	if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderDockerEE && !c.cfg.Tenant.MultiTenant() {
+	if c.cfg.Installation.KubernetesProvider.IsDockerEE() && !c.cfg.Tenant.MultiTenant() {
 		complianceObjs = append(complianceObjs, c.complianceControllerClusterAdminClusterRoleBinding())
 	}
 
@@ -295,7 +277,6 @@ func (c *complianceComponent) Ready() bool {
 }
 
 var (
-	complianceBoolTrue       = true
 	complianceReplicas int32 = 1
 )
 
@@ -322,13 +303,12 @@ func (c *complianceComponent) complianceControllerRole() *rbacv1.Role {
 		},
 	}
 
-	if c.cfg.UsePSP {
-		// Allow access to the pod security policy in case this is enforced on the cluster
+	if c.cfg.OpenShift {
 		rules = append(rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{ComplianceControllerName},
+			ResourceNames: []string{securitycontextconstraints.NonRootV2},
 		})
 	}
 
@@ -397,22 +377,7 @@ func (c *complianceComponent) complianceControllerRoleBinding() *rbacv1.RoleBind
 }
 
 func (c *complianceComponent) complianceControllerClusterRoleBinding() *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{Name: ComplianceControllerServiceAccount},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     ComplianceControllerServiceAccount,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      ComplianceControllerServiceAccount,
-				Namespace: c.cfg.Namespace,
-			},
-		},
-	}
+	return rcomponents.ClusterRoleBinding(ComplianceControllerServiceAccount, ComplianceControllerServiceAccount, ComplianceControllerServiceAccount, c.cfg.BindingNamespaces)
 }
 
 // This clusterRoleBinding is only needed in DockerEE since a pod starting pods with host path volumes requires cluster admin permissions.
@@ -487,6 +452,12 @@ func (c *complianceComponent) complianceControllerDeployment() *appsv1.Deploymen
 	if c.cfg.ControllerKeyPair != nil && c.cfg.ControllerKeyPair.UseCertificateManagement() {
 		initContainers = append(initContainers, c.cfg.ControllerKeyPair.InitContainer(c.cfg.Namespace))
 	}
+
+	tolerations := append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateControlPlane...)
+	if c.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
+	}
+
 	podTemplate := &corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ComplianceControllerName,
@@ -494,7 +465,7 @@ func (c *complianceComponent) complianceControllerDeployment() *appsv1.Deploymen
 		},
 		Spec: corev1.PodSpec{
 			ServiceAccountName: ComplianceControllerServiceAccount,
-			Tolerations:        append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateControlPlane...),
+			Tolerations:        tolerations,
 			NodeSelector:       c.cfg.Installation.ControlPlaneNodeSelector,
 			ImagePullSecrets:   secret.GetReferenceList(c.cfg.PullSecrets),
 			InitContainers:     initContainers,
@@ -546,10 +517,6 @@ func (c *complianceComponent) complianceControllerDeployment() *appsv1.Deploymen
 	return d
 }
 
-func (c *complianceComponent) complianceControllerPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(ComplianceControllerName)
-}
-
 func (c *complianceComponent) complianceReporterServiceAccount() *corev1.ServiceAccount {
 	return &corev1.ServiceAccount{
 		TypeMeta:   metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"},
@@ -566,16 +533,6 @@ func (c *complianceComponent) complianceReporterClusterRole() *rbacv1.ClusterRol
 				APIGroups: []string{"projectcalico.org"},
 				Resources: []string{"globalreporttypes", "globalreports"},
 				Verbs:     []string{"get"},
-			},
-			{
-				APIGroups: []string{"linseed.tigera.io"},
-				Resources: []string{"snapshots", "benchmarks", "auditlogs", "flows"},
-				Verbs:     []string{"get"},
-			},
-			{
-				APIGroups: []string{"linseed.tigera.io"},
-				Resources: []string{"compliancereports"},
-				Verbs:     []string{"create"},
 			},
 		}
 	}
@@ -594,13 +551,12 @@ func (c *complianceComponent) complianceReporterClusterRole() *rbacv1.ClusterRol
 			Verbs:     []string{"create"},
 		})
 
-	if c.cfg.UsePSP {
-		// Allow access to the pod security policy in case this is enforced on the cluster
+	if c.cfg.OpenShift {
 		rules = append(rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{"compliance-reporter"},
+			ResourceNames: []string{securitycontextconstraints.HostAccess},
 		})
 	}
 	return &rbacv1.ClusterRole{
@@ -611,22 +567,7 @@ func (c *complianceComponent) complianceReporterClusterRole() *rbacv1.ClusterRol
 }
 
 func (c *complianceComponent) complianceReporterClusterRoleBinding() *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{Name: ComplianceReporterServiceAccount},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     ComplianceReporterServiceAccount,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      ComplianceReporterServiceAccount,
-				Namespace: c.cfg.Namespace,
-			},
-		},
-	}
+	return rcomponents.ClusterRoleBinding(ComplianceReporterServiceAccount, ComplianceReporterServiceAccount, ComplianceReporterServiceAccount, c.cfg.BindingNamespaces)
 }
 
 func (c *complianceComponent) complianceReporterPodTemplate() *corev1.PodTemplate {
@@ -695,6 +636,11 @@ func (c *complianceComponent) complianceReporterPodTemplate() *corev1.PodTemplat
 		initContainers = append(initContainers, c.cfg.ReporterKeyPair.InitContainer(c.cfg.Namespace))
 	}
 
+	tolerations := append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateControlPlane...)
+	if c.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
+	}
+
 	podtemplate := &corev1.PodTemplate{
 		TypeMeta: metav1.TypeMeta{Kind: "PodTemplate", APIVersion: "v1"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -714,7 +660,7 @@ func (c *complianceComponent) complianceReporterPodTemplate() *corev1.PodTemplat
 			},
 			Spec: corev1.PodSpec{
 				ServiceAccountName: ComplianceReporterServiceAccount,
-				Tolerations:        append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateControlPlane...),
+				Tolerations:        tolerations,
 				NodeSelector:       c.cfg.Installation.ControlPlaneNodeSelector,
 				ImagePullSecrets:   secret.GetReferenceList(c.cfg.PullSecrets),
 				InitContainers:     initContainers,
@@ -736,7 +682,7 @@ func (c *complianceComponent) complianceReporterPodTemplate() *corev1.PodTemplat
 						},
 
 						// On OpenShift reporter needs privileged access to write compliance reports to host path volume
-						SecurityContext: securitycontext.NewRootContext(c.cfg.Openshift),
+						SecurityContext: securitycontext.NewRootContext(c.cfg.OpenShift),
 						VolumeMounts:    volumeMounts,
 					},
 				},
@@ -752,13 +698,6 @@ func (c *complianceComponent) complianceReporterPodTemplate() *corev1.PodTemplat
 	}
 
 	return podtemplate
-}
-
-func (c *complianceComponent) complianceReporterPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	psp := podsecuritypolicy.NewBasePolicy("compliance-reporter")
-	psp.Spec.Volumes = append(psp.Spec.Volumes, policyv1beta1.HostPath)
-	psp.Spec.RunAsUser.Rule = policyv1beta1.RunAsUserStrategyRunAsAny
-	return psp
 }
 
 func (c *complianceComponent) complianceServerServiceAccount() *corev1.ServiceAccount {
@@ -821,13 +760,12 @@ func (c *complianceComponent) complianceServerClusterRole() *rbacv1.ClusterRole 
 		},
 	}
 
-	if c.cfg.UsePSP {
-		// Allow access to the pod security policy in case this is enforced on the cluster
+	if c.cfg.OpenShift {
 		clusterRole.Rules = append(clusterRole.Rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{ComplianceServerName},
+			ResourceNames: []string{securitycontextconstraints.NonRootV2},
 		})
 	}
 
@@ -878,22 +816,7 @@ func (c *complianceComponent) complianceServerManagedClusterRole() *rbacv1.Clust
 }
 
 func (c *complianceComponent) complianceServerClusterRoleBinding() *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{Name: ComplianceServerServiceAccount},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     ComplianceServerServiceAccount,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      ComplianceServerServiceAccount,
-				Namespace: c.cfg.Namespace,
-			},
-		},
-	}
+	return rcomponents.ClusterRoleBinding(ComplianceServerServiceAccount, ComplianceServerServiceAccount, ComplianceServerServiceAccount, c.cfg.BindingNamespaces)
 }
 
 func (c *complianceComponent) complianceServerService() *corev1.Service {
@@ -925,7 +848,6 @@ func (c *complianceComponent) complianceServerDeployment() *appsv1.Deployment {
 		{Name: "LOG_LEVEL", Value: "info"},
 		{Name: "TIGERA_COMPLIANCE_JOB_NAMESPACE", Value: c.cfg.Namespace},
 		{Name: "MULTI_CLUSTER_FORWARDING_CA", Value: certificatemanagement.TrustedCertBundleMountPath},
-		{Name: "FIPS_MODE_ENABLED", Value: operatorv1.IsFIPSModeEnabledString(c.cfg.Installation.FIPSMode)},
 		{Name: "LINSEED_CLIENT_CERT", Value: certPath},
 		{Name: "LINSEED_CLIENT_KEY", Value: keyPath},
 		{Name: "LINSEED_TOKEN", Value: GetLinseedTokenPath(c.cfg.ManagementClusterConnection != nil)},
@@ -951,6 +873,11 @@ func (c *complianceComponent) complianceServerDeployment() *appsv1.Deployment {
 		initContainers = append(initContainers, c.cfg.ServerKeyPair.InitContainer(c.cfg.Namespace))
 	}
 
+	tolerations := append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateControlPlane...)
+	if c.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
+	}
+
 	podTemplate := &corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        ComplianceServerName,
@@ -959,7 +886,7 @@ func (c *complianceComponent) complianceServerDeployment() *appsv1.Deployment {
 		},
 		Spec: corev1.PodSpec{
 			ServiceAccountName: ComplianceServerServiceAccount,
-			Tolerations:        append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateControlPlane...),
+			Tolerations:        tolerations,
 			NodeSelector:       c.cfg.Installation.ControlPlaneNodeSelector,
 			ImagePullSecrets:   secret.GetReferenceList(c.cfg.PullSecrets),
 			InitContainers:     initContainers,
@@ -1032,10 +959,6 @@ func (c *complianceComponent) complianceServerDeployment() *appsv1.Deployment {
 	return d
 }
 
-func (c *complianceComponent) complianceServerPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(ComplianceServerName)
-}
-
 func complianceAnnotations(c *complianceComponent) map[string]string {
 	annotations := c.cfg.TrustedBundle.HashAnnotations()
 	if c.cfg.ServerKeyPair != nil {
@@ -1088,13 +1011,12 @@ func (c *complianceComponent) complianceSnapshotterClusterRole() *rbacv1.Cluster
 		Verbs:     []string{"get", "create"},
 	})
 
-	if c.cfg.UsePSP {
-		// Allow access to the pod security policy in case this is enforced on the cluster
+	if c.cfg.OpenShift {
 		rules = append(rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{ComplianceSnapshotterName},
+			ResourceNames: []string{securitycontextconstraints.NonRootV2},
 		})
 	}
 	return &rbacv1.ClusterRole{
@@ -1105,22 +1027,7 @@ func (c *complianceComponent) complianceSnapshotterClusterRole() *rbacv1.Cluster
 }
 
 func (c *complianceComponent) complianceSnapshotterClusterRoleBinding() *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{Name: ComplianceSnapshotterServiceAccount},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     ComplianceSnapshotterServiceAccount,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      ComplianceSnapshotterServiceAccount,
-				Namespace: c.cfg.Namespace,
-			},
-		},
-	}
+	return rcomponents.ClusterRoleBinding(ComplianceSnapshotterServiceAccount, ComplianceSnapshotterServiceAccount, ComplianceSnapshotterServiceAccount, c.cfg.BindingNamespaces)
 }
 
 func (c *complianceComponent) complianceSnapshotterDeployment() *appsv1.Deployment {
@@ -1175,6 +1082,11 @@ func (c *complianceComponent) complianceSnapshotterDeployment() *appsv1.Deployme
 		initContainers = append(initContainers, c.cfg.SnapshotterKeyPair.InitContainer(c.cfg.Namespace))
 	}
 
+	tolerations := append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateControlPlane...)
+	if c.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
+	}
+
 	podTemplate := &corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ComplianceSnapshotterName,
@@ -1182,7 +1094,7 @@ func (c *complianceComponent) complianceSnapshotterDeployment() *appsv1.Deployme
 		},
 		Spec: corev1.PodSpec{
 			ServiceAccountName: ComplianceSnapshotterServiceAccount,
-			Tolerations:        append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateControlPlane...),
+			Tolerations:        tolerations,
 			NodeSelector:       c.cfg.Installation.ControlPlaneNodeSelector,
 			ImagePullSecrets:   secret.GetReferenceList(c.cfg.PullSecrets),
 			InitContainers:     initContainers,
@@ -1231,10 +1143,6 @@ func (c *complianceComponent) complianceSnapshotterDeployment() *appsv1.Deployme
 	return d
 }
 
-func (c *complianceComponent) complianceSnapshotterPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(ComplianceSnapshotterName)
-}
-
 func (c *complianceComponent) complianceBenchmarkerServiceAccount() *corev1.ServiceAccount {
 	return &corev1.ServiceAccount{
 		TypeMeta:   metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"},
@@ -1267,15 +1175,17 @@ func (c *complianceComponent) complianceBenchmarkerClusterRole() *rbacv1.Cluster
 		Resources: []string{"benchmarks"},
 		Verbs:     []string{"get", "create"}})
 
-	if c.cfg.UsePSP {
-		// Allow access to the pod security policy in case this is enforced on the cluster
-		rules = append(rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
-			Verbs:         []string{"use"},
-			ResourceNames: []string{"compliance-benchmarker"},
-		})
+	if c.cfg.OpenShift {
+		rules = append(rules,
+			rbacv1.PolicyRule{
+				APIGroups:     []string{"security.openshift.io"},
+				Resources:     []string{"securitycontextconstraints"},
+				Verbs:         []string{"use"},
+				ResourceNames: []string{securitycontextconstraints.HostAccess},
+			},
+		)
 	}
+
 	return &rbacv1.ClusterRole{
 		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{Name: ComplianceBenchmarkerServiceAccount},
@@ -1284,22 +1194,7 @@ func (c *complianceComponent) complianceBenchmarkerClusterRole() *rbacv1.Cluster
 }
 
 func (c *complianceComponent) complianceBenchmarkerClusterRoleBinding() *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{Name: ComplianceBenchmarkerServiceAccount},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     ComplianceBenchmarkerServiceAccount,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      ComplianceBenchmarkerServiceAccount,
-				Namespace: c.cfg.Namespace,
-			},
-		},
-	}
+	return rcomponents.ClusterRoleBinding(ComplianceBenchmarkerServiceAccount, ComplianceBenchmarkerServiceAccount, ComplianceBenchmarkerServiceAccount, c.cfg.BindingNamespaces)
 }
 
 func (c *complianceComponent) complianceBenchmarkerDaemonSet() *appsv1.DaemonSet {
@@ -1361,7 +1256,7 @@ func (c *complianceComponent) complianceBenchmarkerDaemonSet() *appsv1.DaemonSet
 	}
 
 	// benchmarker needs an extra host path volume mount for GKE for CIS benchmarks
-	if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderGKE {
+	if c.cfg.Installation.KubernetesProvider.IsGKE() {
 		volMounts = append(volMounts, corev1.VolumeMount{Name: "home-kubernetes", MountPath: "/home/kubernetes", ReadOnly: true})
 
 		vols = append(vols, corev1.Volume{
@@ -1446,59 +1341,6 @@ func (c *complianceComponent) complianceBenchmarkerDaemonSet() *appsv1.DaemonSet
 		}
 	}
 	return ds
-}
-
-func (c *complianceComponent) complianceBenchmarkerSecurityContextConstraints() *ocsv1.SecurityContextConstraints {
-	return &ocsv1.SecurityContextConstraints{
-		TypeMeta:                 metav1.TypeMeta{Kind: "SecurityContextConstraints", APIVersion: "security.openshift.io/v1"},
-		ObjectMeta:               metav1.ObjectMeta{Name: ComplianceBenchmarkerServiceAccount},
-		AllowHostDirVolumePlugin: true,
-		AllowHostIPC:             false,
-		AllowHostNetwork:         false,
-		AllowHostPID:             true,
-		AllowHostPorts:           false,
-		AllowPrivilegeEscalation: &complianceBoolTrue,
-		AllowPrivilegedContainer: true,
-		FSGroup:                  ocsv1.FSGroupStrategyOptions{Type: ocsv1.FSGroupStrategyRunAsAny},
-		RunAsUser:                ocsv1.RunAsUserStrategyOptions{Type: ocsv1.RunAsUserStrategyRunAsAny},
-		ReadOnlyRootFilesystem:   false,
-		SELinuxContext:           ocsv1.SELinuxContextStrategyOptions{Type: ocsv1.SELinuxStrategyMustRunAs},
-		SupplementalGroups:       ocsv1.SupplementalGroupsStrategyOptions{Type: ocsv1.SupplementalGroupsStrategyRunAsAny},
-		Users: []string{
-			fmt.Sprintf("system:serviceaccount:%s:tigera-compliance-benchmarker", c.cfg.Namespace),
-		},
-		Volumes: []ocsv1.FSType{"*"},
-	}
-}
-
-func (c *complianceComponent) complianceBenchmarkerPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	psp := podsecuritypolicy.NewBasePolicy("compliance-benchmarker")
-	psp.Spec.Volumes = append(psp.Spec.Volumes, policyv1beta1.HostPath)
-	psp.Spec.AllowedHostPaths = []policyv1beta1.AllowedHostPath{
-		{
-			PathPrefix: "/var/lib/etcd",
-			ReadOnly:   true,
-		},
-		{
-			PathPrefix: "/etc/systemd",
-			ReadOnly:   true,
-		},
-		{
-			PathPrefix: "/etc/kubernetes",
-			ReadOnly:   true,
-		},
-		{
-			PathPrefix: "/usr/bin",
-			ReadOnly:   true,
-		},
-		{
-			PathPrefix: "/var/lib/kubelet",
-			ReadOnly:   true,
-		},
-	}
-	psp.Spec.RunAsUser.Rule = policyv1beta1.RunAsUserStrategyRunAsAny
-	psp.Spec.HostPID = true
-	return psp
 }
 
 func (c *complianceComponent) complianceGlobalReportInventory() *v3.GlobalReportType {
@@ -1789,7 +1631,7 @@ func (c *complianceComponent) complianceAccessAllowTigeraNetworkPolicy() *v3.Net
 		},
 	}
 
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, c.cfg.Openshift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, c.cfg.OpenShift)
 
 	if c.cfg.ManagementClusterConnection == nil {
 		egressRules = append(egressRules, v3.Rule{
@@ -1837,7 +1679,14 @@ func (c *complianceComponent) complianceServerAllowTigeraNetworkPolicy() *v3.Net
 		},
 	}
 
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, c.cfg.Openshift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, c.cfg.OpenShift)
+
+	// add oidc egress rule
+	if c.cfg.KeyValidatorConfig != nil {
+		if parsedURL, err := url.Parse(c.cfg.KeyValidatorConfig.Issuer()); err == nil {
+			egressRules = append(egressRules, networkpolicy.GetOIDCEgressRule(parsedURL))
+		}
+	}
 
 	egressRules = append(egressRules, []v3.Rule{
 		{
@@ -1883,35 +1732,18 @@ func (c *complianceComponent) complianceServerAllowTigeraNetworkPolicy() *v3.Net
 
 func (c *complianceComponent) multiTenantManagedClustersAccess() []client.Object {
 	var objects []client.Object
-	objects = append(objects, &rbacv1.ClusterRole{
-		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{Name: MultiTenantComplianceManagedClustersAccessClusterRoleName},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{"projectcalico.org"},
-				Resources: []string{"managedclusters"},
-				Verbs: []string{
-					// The Authentication Proxy in Voltron checks if Compliance (either using impersonation
-					// headers for tigera-compliance-server service account in tigera-compliance namespace or
-					// the actual account in a single tenant setup) can get a managed clusters before sending the
-					// request down the tunnel
-					"get",
-				},
-			},
-		},
-	})
 
 	// In a single tenant setup we want to create a cluster role that binds using service account
 	// tigera-compliance-server from tigera-compliance namespace. In a multi-tenant setup
 	// Compliance server from the tenant's namespace impersonates service tigera-compliance-server
 	// from tigera-compliance namespace
-	objects = append(objects, &rbacv1.ClusterRoleBinding{
-		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{Name: MultiTenantComplianceManagedClustersAccessClusterRoleName},
+	objects = append(objects, &rbacv1.RoleBinding{
+		TypeMeta:   metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: MultiTenantComplianceManagedClustersAccessRoleBindingName, Namespace: c.cfg.Namespace},
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "ClusterRole",
-			Name:     MultiTenantComplianceManagedClustersAccessClusterRoleName,
+			Name:     MultiTenantManagedClustersAccessClusterRoleName,
 		},
 		Subjects: []rbacv1.Subject{
 			// requests for compliance to managed clusters are done using service account tigera-compliance-server

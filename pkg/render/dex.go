@@ -17,19 +17,20 @@ package render
 
 import (
 	"fmt"
+	"net"
+	"net/url"
 	"strings"
 
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+	"github.com/tigera/api/pkg/lib/numorstring"
+	"golang.org/x/net/http/httpproxy"
 	"gopkg.in/yaml.v2"
-
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
@@ -38,20 +39,19 @@ import (
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/common/podaffinity"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
 
 const (
-	DexNamespace             = "tigera-dex"
-	DexObjectName            = "tigera-dex"
-	DexPodSecurityPolicyName = "tigera-dex"
-	DexPort                  = 5556
-	DexTLSSecretName         = "tigera-dex-tls"
-	DexClientId              = "tigera-manager"
-	DexPolicyName            = networkpolicy.TigeraComponentPolicyPrefix + "allow-tigera-dex"
+	DexNamespace     = "tigera-dex"
+	DexObjectName    = "tigera-dex"
+	DexPort          = 5556
+	DexTLSSecretName = "tigera-dex-tls"
+	DexClientId      = "tigera-manager"
+	DexPolicyName    = networkpolicy.TigeraComponentPolicyPrefix + "allow-tigera-dex"
 )
 
 var DexEntityRule = networkpolicy.CreateEntityRule(DexNamespace, DexObjectName, DexPort)
@@ -66,7 +66,7 @@ func Dex(cfg *DexComponentConfiguration) Component {
 // DexComponentConfiguration contains all the config information needed to render the component.
 type DexComponentConfiguration struct {
 	PullSecrets   []*corev1.Secret
-	Openshift     bool
+	OpenShift     bool
 	Installation  *operatorv1.InstallationSpec
 	DexConfig     DexConfig
 	ClusterDomain string
@@ -74,10 +74,12 @@ type DexComponentConfiguration struct {
 	TLSKeyPair    certificatemanagement.KeyPairInterface
 	TrustedBundle certificatemanagement.TrustedBundle
 
-	// Whether the cluster supports pod security policies.
-	UsePSP bool
-
 	Authentication *operatorv1.Authentication
+
+	// PodProxies represents the resolved proxy configuration for each Dex pod.
+	// If this slice is empty, then resolution has not yet occurred. Pods with no proxy
+	// configured are represented with a nil value.
+	PodProxies []*httpproxy.Config
 }
 
 type dexComponent struct {
@@ -107,7 +109,7 @@ func (c *dexComponent) ResolveImages(is *operatorv1.ImageSet) error {
 	}
 
 	if len(errMsgs) != 0 {
-		return fmt.Errorf(strings.Join(errMsgs, ","))
+		return fmt.Errorf("%s", strings.Join(errMsgs, ","))
 	}
 	return nil
 }
@@ -117,9 +119,12 @@ func (*dexComponent) SupportedOSType() rmeta.OSType {
 }
 
 func (c *dexComponent) Objects() ([]client.Object, []client.Object) {
+
 	objs := []client.Object{
-		c.allowTigeraNetworkPolicy(),
+		CreateNamespace(DexObjectName, c.cfg.Installation.KubernetesProvider, PSSRestricted, c.cfg.Installation.Azure),
+		c.allowTigeraNetworkPolicy(c.cfg.Installation.Variant),
 		networkpolicy.AllowTigeraDefaultDeny(DexNamespace),
+		CreateOperatorSecretsRoleBinding(DexNamespace),
 		c.serviceAccount(),
 		c.deployment(),
 		c.service(),
@@ -140,10 +145,6 @@ func (c *dexComponent) Objects() ([]client.Object, []client.Object) {
 
 	if c.cfg.Installation.CertificateManagement != nil {
 		objs = append(objs, certificatemanagement.CSRClusterRoleBinding(DexObjectName, DexNamespace))
-	}
-
-	if c.cfg.UsePSP {
-		objs = append(objs, c.podSecurityPolicy())
 	}
 
 	if c.cfg.DeleteDex {
@@ -178,12 +179,12 @@ func (c *dexComponent) clusterRole() client.Object {
 		},
 	}
 
-	if c.cfg.UsePSP {
+	if c.cfg.OpenShift {
 		rules = append(rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{DexPodSecurityPolicyName},
+			ResourceNames: []string{securitycontextconstraints.NonRootV2},
 		})
 	}
 
@@ -217,10 +218,6 @@ func (c *dexComponent) clusterRoleBinding() client.Object {
 	}
 }
 
-func (c *dexComponent) podSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(DexPodSecurityPolicyName)
-}
-
 func (c *dexComponent) deployment() client.Object {
 	var initContainers []corev1.Container
 	if c.cfg.TLSKeyPair.UseCertificateManagement() {
@@ -236,6 +233,14 @@ func (c *dexComponent) deployment() client.Object {
 	mounts := c.cfg.DexConfig.RequiredVolumeMounts()
 	mounts = append(mounts, c.cfg.TLSKeyPair.VolumeMount(c.SupportedOSType()))
 	mounts = append(mounts, c.cfg.TrustedBundle.VolumeMounts(c.SupportedOSType())...)
+
+	tolerations := append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateControlPlane...)
+	if c.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
+	}
+
+	envVars := c.cfg.DexConfig.RequiredEnv("")
+	envVars = append(envVars, c.cfg.Installation.Proxy.EnvVars()...)
 
 	d := &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
@@ -257,7 +262,7 @@ func (c *dexComponent) deployment() client.Object {
 				Spec: corev1.PodSpec{
 					NodeSelector:       c.cfg.Installation.ControlPlaneNodeSelector,
 					ServiceAccountName: DexObjectName,
-					Tolerations:        append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateControlPlane...),
+					Tolerations:        tolerations,
 					ImagePullSecrets:   secret.GetReferenceList(c.cfg.PullSecrets),
 					InitContainers:     initContainers,
 					Containers: []corev1.Container{
@@ -265,15 +270,11 @@ func (c *dexComponent) deployment() client.Object {
 							Name:            DexObjectName,
 							Image:           c.image,
 							ImagePullPolicy: ImagePullPolicy(),
-							Env: append(
-								[]corev1.EnvVar{
-									{Name: "FIPS_MODE_ENABLED", Value: operatorv1.IsFIPSModeEnabledString(c.cfg.Installation.FIPSMode)},
-								},
-								c.cfg.DexConfig.RequiredEnv("")...),
+							Env:             envVars,
 							LivenessProbe:   c.probe(),
 							SecurityContext: securitycontext.NewNonRootContext(),
 
-							Command: []string{"/dex", "serve", "/etc/dex/baseCfg/config.yaml"},
+							Command: []string{"/usr/bin/dex", "serve", "/etc/dex/baseCfg/config.yaml"},
 
 							Ports: []corev1.ContainerPort{
 								{
@@ -399,34 +400,19 @@ func (c *dexComponent) configMap() *corev1.ConfigMap {
 	}
 }
 
-func (c *dexComponent) allowTigeraNetworkPolicy() *v3.NetworkPolicy {
+func (c *dexComponent) allowTigeraNetworkPolicy(installationVariant operatorv1.ProductVariant) *v3.NetworkPolicy {
 	egressRules := []v3.Rule{}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, c.cfg.Openshift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, c.cfg.OpenShift)
 	egressRules = append(egressRules, []v3.Rule{
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
 			Destination: networkpolicy.KubeAPIServerEntityRule,
 		},
-
-		// These rules allow egress between dex and identity providers.
-		{
-			Action:   v3.Allow,
-			Protocol: &networkpolicy.TCPProtocol,
-			Destination: v3.EntityRule{
-				Nets:  []string{"0.0.0.0/0"},
-				Ports: networkpolicy.Ports(443, 6443, 389, 636),
-			},
-		},
-		{
-			Action:   v3.Allow,
-			Protocol: &networkpolicy.TCPProtocol,
-			Destination: v3.EntityRule{
-				Nets:  []string{"::/0"},
-				Ports: networkpolicy.Ports(443, 6443, 389, 636),
-			},
-		},
 	}...)
+	for _, egressRule := range c.resolveEgressRulesByDestination() {
+		egressRules = append(egressRules, egressRule)
+	}
 
 	dexIngressPortDestination := v3.EntityRule{
 		Ports: networkpolicy.Ports(DexPort),
@@ -476,8 +462,168 @@ func (c *dexComponent) allowTigeraNetworkPolicy() *v3.NetworkPolicy {
 					Source:      networkpolicy.PrometheusSourceEntityRule,
 					Destination: dexIngressPortDestination,
 				},
+				{
+					Action:      v3.Allow,
+					Protocol:    &networkpolicy.TCPProtocol,
+					Source:      networkpolicy.DefaultHelper().APIServerSourceEntityRule(installationVariant),
+					Destination: dexIngressPortDestination,
+				},
 			},
 			Egress: egressRules,
 		},
+	}
+}
+
+func (c *dexComponent) resolveEgressRulesByDestination() map[string]v3.Rule {
+	egressRulesByDestination := make(map[string]v3.Rule)
+	processedPodProxies := ProcessPodProxies(c.cfg.PodProxies)
+	for i, podProxy := range processedPodProxies {
+		egressDestinations, err := resolveEgressDestinationsForPod(podProxy)
+		if err != nil {
+			log.Error(err, fmt.Sprintf("failed to resolve egress destinations for pod %d, skipping for policy rendering", i))
+			continue
+		}
+
+		for _, egressDestination := range egressDestinations {
+			egressRule, err := resolveEgressRuleForDestination(egressDestination)
+			if err != nil {
+				log.Error(err, fmt.Sprintf("failed to resolve egress rule for pod %d, skipping for policy rendering", i))
+				continue
+			}
+
+			egressRulesByDestination[egressDestination] = egressRule
+		}
+	}
+
+	return egressRulesByDestination
+}
+
+// resolveEgressDestinationsForPod collects all possible http proxy destinations and all possible IdP destinations.
+// In the future, this function may return only the specific destinations it expects Dex pods to connect to given the
+// current issuer configuration (in the Authentication CR) and the HTTP proxy configuration.
+func resolveEgressDestinationsForPod(podProxy *httpproxy.Config) ([]string, error) {
+	var egressDestinations []string
+
+	if podProxy == nil {
+		podProxy = &httpproxy.Config{}
+	}
+
+	// From here, we resolve multiple destinations by assuming any of the configured proxies could be active, and that
+	// an IdP could live at any IP.
+	// idp-resolution: In the future, we could resolve a single destination by resolving our expected IdP
+	// issuer URL and using podProxy.ProxyFunc to resolve a single expected destination URL.
+	if podProxy.HTTPProxy != "" {
+		httpProxyURL, err := url.Parse(podProxy.HTTPProxy)
+		if err != nil {
+			return nil, err
+		}
+
+		httpProxyDestination, err := parseHostPortFromURL(httpProxyURL)
+		if err != nil {
+			return nil, err
+		}
+
+		egressDestinations = append(egressDestinations, httpProxyDestination)
+	}
+
+	if podProxy.HTTPSProxy != "" {
+		httpsProxyURL, err := url.Parse(podProxy.HTTPSProxy)
+		if err != nil {
+			return nil, err
+		}
+
+		httpsProxyDestination, err := parseHostPortFromURL(httpsProxyURL)
+		if err != nil {
+			return nil, err
+		}
+
+		egressDestinations = append(egressDestinations, httpsProxyDestination)
+	}
+
+	egressDestinations = append(egressDestinations, "0.0.0.0/0")
+	egressDestinations = append(egressDestinations, "::/0")
+
+	return egressDestinations, nil
+}
+
+func resolveEgressRuleForDestination(destination string) (v3.Rule, error) {
+	// Support "any" destinations that signify any potential IdP destination IP.
+	// idp-resolution: These cases can be removed if we are able to resolve specific IdP destinations based on the Authentication config.
+	if destination == "0.0.0.0/0" {
+		return v3.Rule{
+			Action:   v3.Allow,
+			Protocol: &networkpolicy.TCPProtocol,
+			Destination: v3.EntityRule{
+				Nets:  []string{"0.0.0.0/0"},
+				Ports: networkpolicy.Ports(443, 6443, 389, 636),
+			},
+		}, nil
+	}
+	if destination == "::/0" {
+		return v3.Rule{
+			Action:   v3.Allow,
+			Protocol: &networkpolicy.TCPProtocol,
+			Destination: v3.EntityRule{
+				Nets:  []string{"::/0"},
+				Ports: networkpolicy.Ports(443, 6443, 389, 636),
+			},
+		}, nil
+	}
+
+	// Process specific destinations.
+	var egressRule v3.Rule
+	host, port, err := net.SplitHostPort(destination)
+	if err != nil {
+		return v3.Rule{}, err
+	}
+	parsedPort, err := numorstring.PortFromString(port)
+	if err != nil {
+		return v3.Rule{}, err
+	}
+	parsedIp := net.ParseIP(host)
+	if parsedIp == nil {
+		// Assume host is a valid hostname.
+		egressRule = v3.Rule{
+			Action:   v3.Allow,
+			Protocol: &networkpolicy.TCPProtocol,
+			Destination: v3.EntityRule{
+				Domains: []string{host},
+				Ports:   []numorstring.Port{parsedPort},
+			},
+		}
+	} else {
+		var netSuffix string
+		if parsedIp.To4() != nil {
+			netSuffix = "/32"
+		} else {
+			netSuffix = "/128"
+		}
+
+		egressRule = v3.Rule{
+			Action:   v3.Allow,
+			Protocol: &networkpolicy.TCPProtocol,
+			Destination: v3.EntityRule{
+				Nets:  []string{parsedIp.String() + netSuffix},
+				Ports: []numorstring.Port{parsedPort},
+			},
+		}
+	}
+
+	return egressRule, nil
+}
+
+func parseHostPortFromURL(url *url.URL) (string, error) {
+	if url.Port() != "" {
+		// Host is already in host:port form.
+		return url.Host, nil
+	}
+
+	switch url.Scheme {
+	case "http":
+		return net.JoinHostPort(url.Host, "80"), nil
+	case "https":
+		return net.JoinHostPort(url.Host, "443"), nil
+	default:
+		return "", fmt.Errorf("unexpected scheme for URL: %s", url.Scheme)
 	}
 }

@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"reflect"
 
+	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
+
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -109,7 +111,6 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions, prometheusReady
 		prometheusReady: prometheusReady,
 		tierWatchReady:  tierWatchReady,
 		clusterDomain:   opts.ClusterDomain,
-		usePSP:          opts.UsePSP,
 		multiTenant:     opts.MultiTenant,
 	}
 
@@ -142,6 +143,10 @@ func add(_ manager.Manager, c ctrlruntime.Controller) error {
 	err = c.WatchObject(&operatorv1.ManagementClusterConnection{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return fmt.Errorf("monitor-controller failed to watch ManagementClusterConnection resource: %w", err)
+	}
+
+	if err = c.WatchObject(&crdv1.FelixConfiguration{}, &handler.EnqueueRequestForObject{}); err != nil {
+		return fmt.Errorf("monitor-controller failed to watch FelixConfiguration resource: %w", err)
 	}
 
 	for _, secret := range []string{
@@ -188,7 +193,6 @@ type ReconcileMonitor struct {
 	prometheusReady *utils.ReadyFlag
 	tierWatchReady  *utils.ReadyFlag
 	clusterDomain   string
-	usePSP          bool
 	multiTenant     bool
 }
 
@@ -310,8 +314,15 @@ func (r *ReconcileMonitor) Reconcile(ctx context.Context, request reconcile.Requ
 		if err == nil {
 			trustedBundle.AddCertificates(certificate)
 		} else {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Error fetching TLS certificate", err, reqLogger)
-			return reconcile.Result{}, err
+			if certificatemanager.IsCertExtKeyUsageError(err) {
+				// This secret is missing required key usages. Another controller will need to replace this secret with a
+				// new valid secret, before this controller will read and use it. The other controller may depend on this
+				// controller completing successfully. Therefore, we skip and continue.
+				log.Info(fmt.Sprintf("skipping %s/%s secret it will be added when it is updated: %s", common.OperatorNamespace(), certificateName, err))
+			} else {
+				r.status.SetDegraded(operatorv1.ResourceReadError, "Error fetching TLS certificate", err, reqLogger)
+				return reconcile.Result{}, err
+			}
 		}
 	}
 	certificateManager.AddToStatusManager(r.status, common.TigeraPrometheusNamespace)
@@ -368,19 +379,25 @@ func (r *ReconcileMonitor) Reconcile(ctx context.Context, request reconcile.Requ
 		return reconcile.Result{}, err
 	}
 
+	felixConfiguration, err := utils.GetFelixConfiguration(ctx, r.client)
+	if err != nil {
+		r.status.SetDegraded(operatorv1.ResourceReadError, "Error retrieving Felix configuration", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+
 	monitorCfg := &monitor.Config{
-		Monitor:                  instance.Spec,
-		Installation:             install,
-		PullSecrets:              pullSecrets,
-		AlertmanagerConfigSecret: alertmanagerConfigSecret,
-		KeyValidatorConfig:       keyValidatorConfig,
-		ServerTLSSecret:          serverTLSSecret,
-		ClientTLSSecret:          clientTLSSecret,
-		ClusterDomain:            r.clusterDomain,
-		TrustedCertBundle:        trustedBundle,
-		Openshift:                r.provider == operatorv1.ProviderOpenShift,
-		KubeControllerPort:       kubeControllersMetricsPort,
-		UsePSP:                   r.usePSP,
+		Monitor:                       instance.Spec,
+		Installation:                  install,
+		PullSecrets:                   pullSecrets,
+		AlertmanagerConfigSecret:      alertmanagerConfigSecret,
+		KeyValidatorConfig:            keyValidatorConfig,
+		ServerTLSSecret:               serverTLSSecret,
+		ClientTLSSecret:               clientTLSSecret,
+		ClusterDomain:                 r.clusterDomain,
+		TrustedCertBundle:             trustedBundle,
+		OpenShift:                     r.provider.IsOpenShift(),
+		KubeControllerPort:            kubeControllersMetricsPort,
+		FelixPrometheusMetricsEnabled: utils.IsFelixPrometheusMetricsEnabled(felixConfiguration),
 	}
 
 	// Render prometheus component

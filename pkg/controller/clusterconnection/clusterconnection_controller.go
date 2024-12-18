@@ -19,6 +19,12 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/tigera/operator/pkg/url"
+	"golang.org/x/net/http/httpproxy"
+	v1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+
 	"github.com/go-logr/logr"
 
 	corev1 "k8s.io/api/core/v1"
@@ -35,6 +41,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
@@ -120,7 +127,6 @@ func newReconciler(
 		status:         statusMgr,
 		clusterDomain:  opts.ClusterDomain,
 		tierWatchReady: tierWatchReady,
-		usePSP:         opts.UsePSP,
 	}
 	c.status.Run(opts.ShutdownContext)
 	return c
@@ -166,6 +172,10 @@ func add(mgr manager.Manager, c ctrlruntime.Controller) error {
 		return fmt.Errorf("%s failed to watch ImageSet: %w", controllerName, err)
 	}
 
+	if err := utils.AddDeploymentWatch(c, render.GuardianDeploymentName, render.GuardianNamespace); err != nil {
+		return fmt.Errorf("%s failed to watch Guardian deployment: %w", controllerName, err)
+	}
+
 	// Watch for changes to TigeraStatus.
 	if err = utils.AddTigeraStatusWatch(c, ResourceName); err != nil {
 		return fmt.Errorf("clusterconnection-controller failed to watch management-cluster-connection Tigerastatus: %w", err)
@@ -179,13 +189,14 @@ var _ reconcile.Reconciler = &ReconcileConnection{}
 
 // ReconcileConnection reconciles a ManagementClusterConnection object
 type ReconcileConnection struct {
-	Client         client.Client
-	Scheme         *runtime.Scheme
-	Provider       operatorv1.Provider
-	status         status.StatusManager
-	clusterDomain  string
-	tierWatchReady *utils.ReadyFlag
-	usePSP         bool
+	Client                     client.Client
+	Scheme                     *runtime.Scheme
+	Provider                   operatorv1.Provider
+	status                     status.StatusManager
+	clusterDomain              string
+	tierWatchReady             *utils.ReadyFlag
+	resolvedPodProxies         []*httpproxy.Config
+	lastAvailabilityTransition metav1.Time
 }
 
 // Reconcile reads that state of the cluster for a ManagementClusterConnection object and makes changes based on the
@@ -288,7 +299,18 @@ func (r *ReconcileConnection) Reconcile(ctx context.Context, request reconcile.R
 		trustedCertBundle = certificateManager.CreateTrustedBundle()
 	}
 
-	secretsToTrust := []string{render.PacketCaptureServerCert, render.ProjectCalicoAPIServerTLSSecretName(instl.Variant)}
+	secretsToTrust := []string{render.ProjectCalicoAPIServerTLSSecretName(instl.Variant)}
+
+	// Add the packet capture certificate if it exists; otherwise, skip for now. The operator will reconcile the certificate once available.
+	s, err := utils.GetSecret(ctx, r.Client, render.PacketCaptureServerCert, common.OperatorNamespace())
+	if err != nil {
+		r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying secret for PacketCapture certificate", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+	if s != nil {
+		secretsToTrust = append(secretsToTrust, render.PacketCaptureServerCert)
+	}
+
 	// If external prometheus is enabled, the secret will be signed by the Calico CA and won't get rendered. We can skip
 	// adding it to the bundle, as trusting the CA will suffice.
 	monitorCR := &operatorv1.Monitor{}
@@ -313,6 +335,75 @@ func (r *ReconcileConnection) Reconcile(ctx context.Context, request reconcile.R
 		trustedCertBundle.AddCertificates(secret)
 	}
 
+	// Determine the current deployment availability.
+	var currentAvailabilityTransition metav1.Time
+	var currentlyAvailable bool
+	guardianDeployment := v1.Deployment{}
+	err = r.Client.Get(ctx, client.ObjectKey{Name: render.GuardianDeploymentName, Namespace: render.GuardianNamespace}, &guardianDeployment)
+	if err != nil && !k8serrors.IsNotFound(err) {
+		r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to read the deployment status of Guardian", err, reqLogger)
+		return reconcile.Result{}, nil
+	} else if err == nil {
+		for _, condition := range guardianDeployment.Status.Conditions {
+			if condition.Type == v1.DeploymentAvailable {
+				currentAvailabilityTransition = condition.LastTransitionTime
+				if condition.Status == corev1.ConditionTrue {
+					currentlyAvailable = true
+				}
+				break
+			}
+		}
+	}
+
+	// Resolve the proxies used by each Guardian pod. We only update the resolved proxies if the availability of the
+	// Guardian deployment has changed since our last reconcile and the deployment is currently available. We restrict
+	// the resolution of pod proxies in this way to limit the number of pod queries we make.
+	if !currentAvailabilityTransition.Equal(&r.lastAvailabilityTransition) && currentlyAvailable {
+		// Query guardian pods.
+		labelSelector := labels.SelectorFromSet(map[string]string{
+			"app.kubernetes.io/name": render.GuardianDeploymentName,
+		})
+		pods := corev1.PodList{}
+		err := r.Client.List(ctx, &pods, &client.ListOptions{
+			LabelSelector: labelSelector,
+			Namespace:     render.GuardianNamespace,
+		})
+		if err != nil {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to list the pods of the Guardian deployment", err, reqLogger)
+			return reconcile.Result{}, nil
+		}
+
+		// Resolve the proxy config for each pod. Pods without a proxy will have a nil proxy config value.
+		var podProxies []*httpproxy.Config
+		for _, pod := range pods.Items {
+			for _, container := range pod.Spec.Containers {
+				if container.Name == render.GuardianDeploymentName {
+					var podProxyConfig *httpproxy.Config
+					var httpsProxy, noProxy string
+					for _, env := range container.Env {
+						switch env.Name {
+						case "https_proxy", "HTTPS_PROXY":
+							httpsProxy = env.Value
+						case "no_proxy", "NO_PROXY":
+							noProxy = env.Value
+						}
+					}
+					if httpsProxy != "" || noProxy != "" {
+						podProxyConfig = &httpproxy.Config{
+							HTTPSProxy: httpsProxy,
+							NoProxy:    noProxy,
+						}
+					}
+
+					podProxies = append(podProxies, podProxyConfig)
+				}
+			}
+		}
+
+		r.resolvedPodProxies = podProxies
+	}
+	r.lastAvailabilityTransition = currentAvailabilityTransition
+
 	// Validate that the tier watch is ready before querying the tier to ensure we utilize the cache.
 	if !r.tierWatchReady.IsReady() {
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for Tier watch to be established", nil, reqLogger)
@@ -335,7 +426,7 @@ func (r *ReconcileConnection) Reconcile(ctx context.Context, request reconcile.R
 		// The Tier has been created, which means that this controller's reconciliation should no longer be a dependency
 		// of the License being deployed. If NetworkPolicy requires license features, it should now be safe to validate
 		// License presence and sufficiency.
-		if networkPolicyRequiresEgressAccessControl(managementClusterConnection, log) {
+		if egressAccessControlRequired(managementClusterConnection.Spec.ManagementClusterAddr, r.resolvedPodProxies, log) {
 			license, err := utils.FetchLicenseKey(ctx, r.Client)
 			if err != nil {
 				if k8serrors.IsNotFound(err) {
@@ -356,13 +447,13 @@ func (r *ReconcileConnection) Reconcile(ctx context.Context, request reconcile.R
 	ch := utils.NewComponentHandler(log, r.Client, r.Scheme, managementClusterConnection)
 	guardianCfg := &render.GuardianConfiguration{
 		URL:                         managementClusterConnection.Spec.ManagementClusterAddr,
+		PodProxies:                  r.resolvedPodProxies,
 		TunnelCAType:                managementClusterConnection.Spec.TLS.CA,
 		PullSecrets:                 pullSecrets,
-		Openshift:                   r.Provider == operatorv1.ProviderOpenShift,
+		OpenShift:                   r.Provider.IsOpenShift(),
 		Installation:                instl,
 		TunnelSecret:                tunnelSecret,
 		TrustedCertBundle:           trustedCertBundle,
-		UsePSP:                      r.usePSP,
 		ManagementClusterConnection: managementClusterConnection,
 	}
 
@@ -408,23 +499,53 @@ func fillDefaults(mcc *operatorv1.ManagementClusterConnection) {
 	}
 }
 
-func networkPolicyRequiresEgressAccessControl(connection *operatorv1.ManagementClusterConnection, log logr.Logger) bool {
-	if clusterAddrHasDomain, err := managementClusterAddrHasDomain(connection); err == nil && clusterAddrHasDomain {
-		return true
-	} else {
+func egressAccessControlRequired(target string, podProxies []*httpproxy.Config, log logr.Logger) bool {
+	processedPodProxies := render.ProcessPodProxies(podProxies)
+	for _, httpProxyConfig := range processedPodProxies {
+		if egressAccessControlRequiredByProxy(target, httpProxyConfig, log) {
+			return true
+		}
+	}
+	return false
+}
+
+func egressAccessControlRequiredByProxy(target string, httpProxyConfig *httpproxy.Config, log logr.Logger) bool {
+	var destinationHostPort string
+	if httpProxyConfig != nil && httpProxyConfig.HTTPSProxy != "" {
+		// HTTPS proxy is specified as a URL.
+		proxyHostPort, err := url.ParseHostPortFromHTTPProxyString(httpProxyConfig.HTTPSProxy)
 		if err != nil {
 			log.Error(err, fmt.Sprintf(
-				"Failed to parse ManagementClusterAddr. Assuming %s does not require license feature %s",
+				"Failed to parse HTTP Proxy URL (%s). Assuming %s does not require license feature %s",
+				httpProxyConfig.HTTPSProxy,
 				render.GuardianPolicyName,
 				common.EgressAccessControlFeature,
 			))
+			return false
 		}
+
+		destinationHostPort = proxyHostPort
+	} else {
+		// Target is already specified as host:port.
+		destinationHostPort = target
+	}
+
+	// Determine if the host in the host:port is a domain name.
+	hostPortHasDomain, err := hostPortUsesDomainName(destinationHostPort)
+	if err != nil {
+		log.Error(err, fmt.Sprintf(
+			"Failed to parse resolved host:port (%s) for remote tunnel endpoint. Assuming %s does not require license feature %s",
+			destinationHostPort,
+			render.GuardianPolicyName,
+			common.EgressAccessControlFeature,
+		))
 		return false
 	}
+	return hostPortHasDomain
 }
 
-func managementClusterAddrHasDomain(connection *operatorv1.ManagementClusterConnection) (bool, error) {
-	host, _, err := net.SplitHostPort(connection.Spec.ManagementClusterAddr)
+func hostPortUsesDomainName(hostPort string) (bool, error) {
+	host, _, err := net.SplitHostPort(hostPort)
 	if err != nil {
 		return false, err
 	}

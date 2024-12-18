@@ -20,11 +20,12 @@ import (
 	"fmt"
 	"strings"
 
-	pcv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	pcv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
 )
 
 // InstallationSpec defines configuration for a Calico or Calico Enterprise installation.
@@ -180,6 +181,7 @@ type InstallationSpec struct {
 	CalicoNodeWindowsDaemonSet *CalicoNodeWindowsDaemonSet `json:"calicoNodeWindowsDaemonSet,omitempty"`
 
 	// FIPSMode uses images and features only that are using FIPS 140-2 validated cryptographic modules and standards.
+	// Only supported for Variant=Calico.
 	// Default: Disabled
 	// +kubebuilder:validation:Enum=Enabled;Disabled
 	// +optional
@@ -196,7 +198,35 @@ type InstallationSpec struct {
 	// Kubernetes Service CIDRs. Specifying this is required when using Calico for Windows.
 	// +optional
 	ServiceCIDRs []string `json:"serviceCIDRs,omitempty"`
+
+	// Azure is used to configure azure provider specific options.
+	// +optional
+	Azure *Azure `json:"azure,omitempty"`
+
+	// Proxy is used to configure the HTTP(S) proxy settings that will be applied to Tigera containers that connect
+	// to destinations outside the cluster. It is expected that NO_PROXY is configured such that destinations within
+	// the cluster (including the API server) are exempt from proxying.
+	// +optional
+	Proxy *Proxy `json:"proxy,omitempty"`
 }
+
+type Azure struct {
+	// PolicyMode determines whether the "control-plane" label is applied to namespaces. It offers two options: Default and Manual.
+	// The Default option adds the "control-plane" label to the required namespaces.
+	// The Manual option does not apply the "control-plane" label to any namespace.
+	// Default: Default
+	// +optional
+	// +kubebuilder:validation:Enum=Default;Manual
+	// +kubebuilder:default:=Default
+	PolicyMode *PolicyMode `json:"policyMode,omitempty"`
+}
+
+type PolicyMode string
+
+const (
+	Default PolicyMode = "Default"
+	Manual  PolicyMode = "Manual"
+)
 
 type Logging struct {
 	// Customized logging specification for calico-cni plugin
@@ -302,6 +332,38 @@ var (
 	ProviderTKG       Provider = "TKG"
 )
 
+func (p Provider) IsNone() bool {
+	return p == ProviderNone
+}
+
+func (p Provider) IsAKS() bool {
+	return p == ProviderAKS
+}
+
+func (p Provider) IsDockerEE() bool {
+	return p == ProviderDockerEE
+}
+
+func (p Provider) IsEKS() bool {
+	return p == ProviderEKS
+}
+
+func (p Provider) IsGKE() bool {
+	return p == ProviderGKE
+}
+
+func (p Provider) IsOpenShift() bool {
+	return p == ProviderOpenShift
+}
+
+func (p Provider) IsRKE2() bool {
+	return p == ProviderRKE2
+}
+
+func (p Provider) IsTKG() bool {
+	return p == ProviderTKG
+}
+
 // ProductVariant represents the variant of the product.
 //
 // One of: Calico, TigeraSecureEnterprise
@@ -388,13 +450,15 @@ const (
 
 // LinuxDataplaneOption controls which dataplane is to be used on Linux nodes.
 //
-// One of: Iptables, BPF
+// One of: Iptables, BPF, VPP, Nftables
+// +kubebuilder:validation:Enum=Iptables;BPF;VPP;Nftables;
 type LinuxDataplaneOption string
 
 const (
 	LinuxDataplaneIptables LinuxDataplaneOption = "Iptables"
 	LinuxDataplaneBPF      LinuxDataplaneOption = "BPF"
 	LinuxDataplaneVPP      LinuxDataplaneOption = "VPP"
+	LinuxDataplaneNftables LinuxDataplaneOption = "Nftables"
 )
 
 // +kubebuilder:validation:Enum=HNS;Disabled
@@ -418,7 +482,6 @@ type CalicoNetworkSpec struct {
 	// If not specified, iptables mode is used.
 	// Default: Iptables
 	// +optional
-	// +kubebuilder:validation:Enum=Iptables;BPF;VPP
 	LinuxDataplane *LinuxDataplaneOption `json:"linuxDataplane,omitempty"`
 
 	// WindowsDataplane is used to select the dataplane used for Windows nodes. In particular, it
@@ -433,8 +496,10 @@ type CalicoNetworkSpec struct {
 	// +kubebuilder:validation:Enum=Enabled;Disabled
 	BGP *BGPOption `json:"bgp,omitempty"`
 
-	// IPPools contains a list of IP pools to create if none exist. At most one IP pool of each
-	// address family may be specified. If omitted, a single pool will be configured if needed.
+	// IPPools contains a list of IP pools to manage. If nil, a single IPv4 IP pool
+	// will be created by the operator. If an empty list is provided, the operator will not create any IP pools and will instead
+	// wait for IP pools to be created out-of-band.
+	// IP pools in this list will be reconciled by the operator and should not be modified out-of-band.
 	// +optional
 	// +kubebuilder:validation:MaxItems=25
 	IPPools []IPPool `json:"ipPools,omitempty"`
@@ -631,16 +696,25 @@ type IPPool struct {
 	// +kubebuilder:default:=false
 	DisableBGPExport *bool `json:"disableBGPExport,omitempty"`
 
+	// DisableNewAllocations specifies whether or not new IP allocations are allowed from this pool.
+	// This is useful when you want to prevent new pods from receiving IP addresses from this pool, without
+	// impacting any existing pods that have already been assigned addresses from this pool.
+	DisableNewAllocations *bool `json:"disableNewAllocations,omitempty"`
+
 	// AllowedUse controls what the IP pool will be used for.  If not specified or empty, defaults to
 	// ["Tunnel", "Workload"] for back-compatibility
 	AllowedUses []IPPoolAllowedUse `json:"allowedUses,omitempty" validate:"omitempty"`
+
+	// AssignmentMode determines if IP addresses from this pool should be  assigned automatically or on request only
+	AssignmentMode pcv1.AssignmentMode `json:"assignmentMode,omitempty" validate:"omitempty,assignmentMode"`
 }
 
 type IPPoolAllowedUse string
 
 const (
-	IPPoolAllowedUseWorkload IPPoolAllowedUse = "Workload"
-	IPPoolAllowedUseTunnel   IPPoolAllowedUse = "Tunnel"
+	IPPoolAllowedUseWorkload     IPPoolAllowedUse = "Workload"
+	IPPoolAllowedUseTunnel       IPPoolAllowedUse = "Tunnel"
+	IPPoolAllowedUseLoadBalancer IPPoolAllowedUse = "LoadBalancer"
 )
 
 // ToProjectCalicoV1 converts an IPPool to a crd.projectcalico.org/v1 IPPool resource.
@@ -676,6 +750,10 @@ func (p *IPPool) ToProjectCalicoV1() (*pcv1.IPPool, error) {
 		pool.Spec.NATOutgoing = true
 	}
 
+	if p.DisableNewAllocations != nil {
+		pool.Spec.Disabled = *p.DisableNewAllocations
+	}
+
 	// Set BlockSize
 	if p.BlockSize != nil {
 		pool.Spec.BlockSize = int(*p.BlockSize)
@@ -692,6 +770,8 @@ func (p *IPPool) ToProjectCalicoV1() (*pcv1.IPPool, error) {
 	for _, use := range p.AllowedUses {
 		pool.Spec.AllowedUses = append(pool.Spec.AllowedUses, pcv1.IPPoolAllowedUse(use))
 	}
+
+	pool.Spec.AssignmentMode = p.AssignmentMode
 
 	return &pool, nil
 }
@@ -720,7 +800,16 @@ func (p *IPPool) FromProjectCalicoV1(crd pcv1.IPPool) {
 	// Set NAT
 	if crd.Spec.NATOutgoing {
 		p.NATOutgoing = NATOutgoingEnabled
+	} else {
+		p.NATOutgoing = NATOutgoingDisabled
 	}
+
+	// Configure DisableNewAllocations
+	disableAlloc := false
+	if crd.Spec.Disabled {
+		disableAlloc = true
+	}
+	p.DisableNewAllocations = &disableAlloc
 
 	// Set BlockSize
 	blockSize := int32(crd.Spec.BlockSize)
@@ -730,17 +819,17 @@ func (p *IPPool) FromProjectCalicoV1(crd pcv1.IPPool) {
 	p.NodeSelector = crd.Spec.NodeSelector
 
 	// Set BGP export.
+	disableExport := false
 	if crd.Spec.DisableBGPExport {
-		t := true
-		p.DisableBGPExport = &t
-	} else {
-		f := false
-		p.DisableBGPExport = &f
+		disableExport = true
 	}
+	p.DisableBGPExport = &disableExport
 
 	for _, use := range crd.Spec.AllowedUses {
 		p.AllowedUses = append(p.AllowedUses, IPPoolAllowedUse(use))
 	}
+
+	p.AssignmentMode = crd.Spec.AssignmentMode
 }
 
 // CNIPluginType describes the type of CNI plugin used.
@@ -972,4 +1061,69 @@ type WindowsNodeSpec struct {
 	// VXLANAdapter is the Network Adapter used for VXLAN, leave blank for primary NIC
 	// +optional
 	VXLANAdapter string `json:"vxlanAdapter,omitempty"`
+}
+
+type Proxy struct {
+	// HTTPProxy defines the value of the HTTP_PROXY environment variable that will be set on Tigera containers that connect to
+	// destinations outside the cluster.
+	// +optional
+	HTTPProxy string `json:"httpProxy,omitempty"`
+
+	// HTTPSProxy defines the value of the HTTPS_PROXY environment variable that will be set on Tigera containers that connect to
+	// destinations outside the cluster.
+	// +optional
+	HTTPSProxy string `json:"httpsProxy,omitempty"`
+
+	// NoProxy defines the value of the NO_PROXY environment variable that will be set on Tigera containers that connect to
+	// destinations outside the cluster. This value must be set such that destinations within the scope of the cluster, including
+	// the Kubernetes API server, are exempt from being proxied.
+	// +optional
+	NoProxy string `json:"noProxy,omitempty"`
+}
+
+func (p *Proxy) EnvVars() (envVars []v1.EnvVar) {
+	if p == nil {
+		return
+	}
+
+	if p.HTTPProxy != "" {
+		envVars = append(envVars, []v1.EnvVar{
+			{
+				Name:  "HTTP_PROXY",
+				Value: p.HTTPProxy,
+			},
+			{
+				Name:  "http_proxy",
+				Value: p.HTTPProxy,
+			},
+		}...)
+	}
+
+	if p.HTTPSProxy != "" {
+		envVars = append(envVars, []v1.EnvVar{
+			{
+				Name:  "HTTPS_PROXY",
+				Value: p.HTTPSProxy,
+			},
+			{
+				Name:  "https_proxy",
+				Value: p.HTTPSProxy,
+			},
+		}...)
+	}
+
+	if p.NoProxy != "" {
+		envVars = append(envVars, []v1.EnvVar{
+			{
+				Name:  "NO_PROXY",
+				Value: p.NoProxy,
+			},
+			{
+				Name:  "no_proxy",
+				Value: p.NoProxy,
+			},
+		}...)
+	}
+
+	return envVars
 }

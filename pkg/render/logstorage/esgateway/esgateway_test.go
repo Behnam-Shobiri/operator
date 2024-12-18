@@ -23,8 +23,8 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -40,11 +40,14 @@ import (
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
+	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/podaffinity"
 	rtest "github.com/tigera/operator/pkg/render/common/test"
 	"github.com/tigera/operator/pkg/render/kubecontrollers"
 	"github.com/tigera/operator/pkg/render/testutils"
+	"github.com/tigera/operator/pkg/tls"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
+	"github.com/tigera/operator/test"
 )
 
 var _ = Describe("ES Gateway rendering tests", func() {
@@ -52,18 +55,24 @@ var _ = Describe("ES Gateway rendering tests", func() {
 		var installation *operatorv1.InstallationSpec
 		var replicas int32
 		var cfg *Config
+		var cli client.Client
 		clusterDomain := "cluster.local"
 		expectedPolicy := testutils.GetExpectedPolicyFromFile("../../testutils/expected_policies/es-gateway.json")
 		expectedPolicyForOpenshift := testutils.GetExpectedPolicyFromFile("../../testutils/expected_policies/es-gateway_ocp.json")
 
 		BeforeEach(func() {
+			scheme := runtime.NewScheme()
+			Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+			cli = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
+
 			installation = &operatorv1.InstallationSpec{
 				ControlPlaneReplicas: &replicas,
 				KubernetesProvider:   operatorv1.ProviderNone,
 				Registry:             "testregistry.com/",
 			}
 			replicas = 2
-			kp, bundle := getTLS(installation)
+			kp, bundle := getTLS(cli, installation)
+
 			cfg = &Config{
 				Installation: installation,
 				PullSecrets: []*corev1.Secret{
@@ -78,7 +87,6 @@ var _ = Describe("ES Gateway rendering tests", func() {
 				},
 				ClusterDomain:   clusterDomain,
 				EsAdminUserName: "elastic",
-				UsePSP:          true,
 				Namespace:       render.ElasticsearchNamespace,
 				TruthNamespace:  common.OperatorNamespace(),
 			}
@@ -96,7 +104,6 @@ var _ = Describe("ES Gateway rendering tests", func() {
 				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: ServiceAccountName, Namespace: render.ElasticsearchNamespace}},
 				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: DeploymentName, Namespace: render.ElasticsearchNamespace}},
 				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: relasticsearch.PublicCertSecret, Namespace: common.OperatorNamespace()}},
-				&policyv1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "tigera-esgateway"}},
 			}
 			createResources, _ := EsGateway(cfg).Objects()
 			rtest.ExpectResources(createResources, expectedResources)
@@ -136,22 +143,24 @@ var _ = Describe("ES Gateway rendering tests", func() {
 				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: ServiceAccountName, Namespace: render.ElasticsearchNamespace}},
 				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: DeploymentName, Namespace: render.ElasticsearchNamespace}},
 				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: relasticsearch.PublicCertSecret, Namespace: common.OperatorNamespace()}},
-				&policyv1beta1.PodSecurityPolicy{ObjectMeta: metav1.ObjectMeta{Name: "tigera-esgateway"}},
 			}
 			createResources, _ := EsGateway(cfg).Objects()
 			rtest.ExpectResources(createResources, expectedResources)
 		})
 
-		It("should render properly when PSP is not supported by the cluster", func() {
-			cfg.UsePSP = false
+		It("should render SecurityContextConstrains properly when provider is OpenShift", func() {
+			cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
 			component := EsGateway(cfg)
 			Expect(component.ResolveImages(nil)).To(BeNil())
 			resources, _ := component.Objects()
 
-			// Should not contain any PodSecurityPolicies
-			for _, r := range resources {
-				Expect(r.GetObjectKind().GroupVersionKind().Kind).NotTo(Equal("PodSecurityPolicy"))
-			}
+			role := rtest.GetResource(resources, "tigera-secure-es-gateway", "tigera-elasticsearch", "rbac.authorization.k8s.io", "v1", "Role").(*rbacv1.Role)
+			Expect(role.Rules).To(ContainElement(rbacv1.PolicyRule{
+				APIGroups:     []string{"security.openshift.io"},
+				Resources:     []string{"securitycontextconstraints"},
+				Verbs:         []string{"use"},
+				ResourceNames: []string{"nonroot-v2"},
+			}))
 		})
 
 		It("should not render PodAffinity when ControlPlaneReplicas is 1", func() {
@@ -206,6 +215,69 @@ var _ = Describe("ES Gateway rendering tests", func() {
 			Expect(d.Spec.Template.Spec.Tolerations).To(ConsistOf(t))
 		})
 
+		It("should render deployment with resource requests and limits", func() {
+			ca, _ := tls.MakeCA(rmeta.DefaultOperatorCASignerName())
+			cert, _, _ := ca.Config.GetPEMBytes() // create a valid pem block
+			cfg.Installation.CertificateManagement = &operatorv1.CertificateManagement{CACert: cert}
+
+			certificateManager, err := certificatemanager.Create(cli, cfg.Installation, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
+			Expect(err).NotTo(HaveOccurred())
+
+			esGatewayTLS, err := certificateManager.GetOrCreateKeyPair(cli, render.TigeraElasticsearchGatewaySecret, common.OperatorNamespace(), []string{""})
+			Expect(err).NotTo(HaveOccurred())
+			cfg.ESGatewayKeyPair = esGatewayTLS
+
+			esGatewayResources := corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					"cpu":     resource.MustParse("2"),
+					"memory":  resource.MustParse("300Mi"),
+					"storage": resource.MustParse("20Gi"),
+				},
+				Requests: corev1.ResourceList{
+					"cpu":     resource.MustParse("1"),
+					"memory":  resource.MustParse("150Mi"),
+					"storage": resource.MustParse("10Gi"),
+				},
+			}
+			cfg.LogStorage = &operatorv1.LogStorage{
+				Spec: operatorv1.LogStorageSpec{
+					ESGatewayDeployment: &operatorv1.ESGatewayDeployment{
+						Spec: &operatorv1.ESGatewayDeploymentSpec{
+							Template: &operatorv1.ESGatewayDeploymentPodTemplateSpec{
+								Spec: &operatorv1.ESGatewayDeploymentPodSpec{
+									InitContainers: []operatorv1.ESGatewayDeploymentInitContainer{{
+										Name:      "tigera-secure-elasticsearch-cert-key-cert-provisioner",
+										Resources: &esGatewayResources,
+									}},
+									Containers: []operatorv1.ESGatewayDeploymentContainer{{
+										Name:      "tigera-secure-es-gateway",
+										Resources: &esGatewayResources,
+									}},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			component := EsGateway(cfg)
+			resources, _ := component.Objects()
+			d, ok := rtest.GetResource(resources, DeploymentName, render.ElasticsearchNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
+			Expect(ok).To(BeTrue(), "Deployment not found")
+
+			Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
+
+			container := test.GetContainer(d.Spec.Template.Spec.Containers, "tigera-secure-es-gateway")
+			Expect(container).NotTo(BeNil())
+			Expect(container.Resources).To(Equal(esGatewayResources))
+
+			Expect(d.Spec.Template.Spec.InitContainers).To(HaveLen(1))
+			initContainer := test.GetContainer(d.Spec.Template.Spec.InitContainers, "tigera-secure-elasticsearch-cert-key-cert-provisioner")
+			Expect(initContainer).NotTo(BeNil())
+			Expect(initContainer.Resources).To(Equal(esGatewayResources))
+
+		})
+
 		Context("allow-tigera rendering", func() {
 			policyName := types.NamespacedName{Name: "allow-tigera.es-gateway-access", Namespace: "tigera-elasticsearch"}
 
@@ -219,7 +291,7 @@ var _ = Describe("ES Gateway rendering tests", func() {
 
 			DescribeTable("should render allow-tigera policy",
 				func(scenario testutils.AllowTigeraScenario) {
-					if scenario.Openshift {
+					if scenario.OpenShift {
 						cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
 					} else {
 						cfg.Installation.KubernetesProvider = operatorv1.ProviderNone
@@ -233,44 +305,14 @@ var _ = Describe("ES Gateway rendering tests", func() {
 				},
 				// ES Gateway only renders in the presence of an LogStorage CR and absence of a ManagementClusterConnection CR, therefore
 				// does not have a config option for managed clusters.
-				Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: false}),
-				Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: true}),
+				Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false}),
+				Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true}),
 			)
-		})
-		It("should set the right env when FIPS mode is enabled", func() {
-			kp, bundle := getTLS(installation)
-			enabled := operatorv1.FIPSModeEnabled
-			installation.FIPSMode = &enabled
-			component := EsGateway(&Config{
-				Installation: installation,
-				PullSecrets: []*corev1.Secret{
-					{ObjectMeta: metav1.ObjectMeta{Name: "tigera-pull-secret"}},
-				},
-				ESGatewayKeyPair: kp,
-				TrustedBundle:    bundle,
-				KubeControllersUserSecrets: []*corev1.Secret{
-					{ObjectMeta: metav1.ObjectMeta{Name: kubecontrollers.ElasticsearchKubeControllersUserSecret, Namespace: common.OperatorNamespace()}},
-					{ObjectMeta: metav1.ObjectMeta{Name: kubecontrollers.ElasticsearchKubeControllersVerificationUserSecret, Namespace: render.ElasticsearchNamespace}},
-					{ObjectMeta: metav1.ObjectMeta{Name: kubecontrollers.ElasticsearchKubeControllersSecureUserSecret, Namespace: render.ElasticsearchNamespace}},
-				},
-				ClusterDomain:   clusterDomain,
-				EsAdminUserName: "elastic",
-				Namespace:       render.ElasticsearchNamespace,
-				TruthNamespace:  common.OperatorNamespace(),
-			})
-
-			resources, _ := component.Objects()
-			d, ok := rtest.GetResource(resources, DeploymentName, render.ElasticsearchNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
-			Expect(ok).To(BeTrue())
-			Expect(d.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "ES_GATEWAY_FIPS_MODE_ENABLED", Value: "true"}))
 		})
 	})
 })
 
-func getTLS(installation *operatorv1.InstallationSpec) (certificatemanagement.KeyPairInterface, certificatemanagement.TrustedBundle) {
-	scheme := runtime.NewScheme()
-	Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
-	cli := ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
+func getTLS(cli client.Client, installation *operatorv1.InstallationSpec) (certificatemanagement.KeyPairInterface, certificatemanagement.TrustedBundle) {
 
 	certificateManager, err := certificatemanager.Create(cli, installation, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 	Expect(err).NotTo(HaveOccurred())

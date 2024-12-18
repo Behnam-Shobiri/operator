@@ -141,8 +141,8 @@ var _ = Describe("Egress Gateway rendering tests", func() {
 			IptablesBackend: "nft",
 		})
 		resources, resToBeDeleted := component.Objects()
-		Expect(len(resources)).To(Equal(len(expectedResources)))
-		Expect(len(resToBeDeleted)).To(Equal(len(expectedResToBeDeleted)))
+		Expect(resources).To(HaveLen(len(expectedResources)))
+		Expect(resToBeDeleted).To(HaveLen(len(expectedResToBeDeleted)))
 		for i, expectedRes := range expectedResources {
 			rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 		}
@@ -273,14 +273,14 @@ var _ = Describe("Egress Gateway rendering tests", func() {
 			VXLANPort:    4790,
 		})
 		resources, _ := component.Objects()
-		Expect(len(resources)).To(Equal(2))
+		Expect(resources).To(HaveLen(2))
 		dep := rtest.GetResource(resources, "egress-test", "test-ns", "apps", "v1", "Deployment").(*appsv1.Deployment)
 		Expect(dep.Spec.Template.Spec.Containers[0].Resources).To(Equal(expectedResource))
 		elasticIPAnnotation := dep.Spec.Template.ObjectMeta.Annotations["cni.projectcalico.org/awsElasticIPs"]
 		Expect(elasticIPAnnotation).To(Equal("[\"1.2.3.4\",\"5.6.7.8\"]"))
 	})
 
-	It("should create service account, role, rolebinding if platform uses psp", func() {
+	It("should create SecurityContextConstraints if platform is OpenShift", func() {
 		expectedResources := []struct {
 			name    string
 			ns      string
@@ -289,37 +289,8 @@ var _ = Describe("Egress Gateway rendering tests", func() {
 			kind    string
 		}{
 			{"egress-test", "test-ns", "", "v1", "ServiceAccount"},
-			{"tigera-egressgateway", "", "policy", "v1beta1", "PodSecurityPolicy"},
 			{"egress-test", "test-ns", rbac, "v1", "Role"},
 			{"egress-test", "test-ns", rbac, "v1", "RoleBinding"},
-			{"egress-test", "test-ns", "apps", "v1", "Deployment"},
-		}
-
-		component := egressgateway.EgressGateway(&egressgateway.Config{
-			PullSecrets:  nil,
-			Installation: installation,
-			OSType:       rmeta.OSTypeLinux,
-			EgressGW:     egw,
-			VXLANVNI:     4097,
-			VXLANPort:    4790,
-			UsePSP:       true,
-		})
-		resources, _ := component.Objects()
-		Expect(len(resources)).To(Equal(len(expectedResources)))
-		for i, expectedRes := range expectedResources {
-			rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
-		}
-	})
-
-	It("should create security context if platform is openshift", func() {
-		expectedResources := []struct {
-			name    string
-			ns      string
-			group   string
-			version string
-			kind    string
-		}{
-			{"egress-test", "test-ns", "", "v1", "ServiceAccount"},
 			{"tigera-egressgateway", "", "security.openshift.io", "v1", "SecurityContextConstraints"},
 			{"egress-test", "test-ns", "apps", "v1", "Deployment"},
 		}
@@ -334,9 +305,32 @@ var _ = Describe("Egress Gateway rendering tests", func() {
 			OpenShift:    true,
 		})
 		resources, _ := component.Objects()
-		Expect(len(resources)).To(Equal(len(expectedResources)))
+		Expect(resources).To(HaveLen(len(expectedResources)))
 		for i, expectedRes := range expectedResources {
 			rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
 		}
+	})
+
+	It("should render toleration on GKE", func() {
+		installation.KubernetesProvider = operatorv1.ProviderGKE
+
+		component := egressgateway.EgressGateway(&egressgateway.Config{
+			PullSecrets:  nil,
+			Installation: installation,
+			OSType:       rmeta.OSTypeLinux,
+			EgressGW:     egw,
+			VXLANVNI:     4097,
+			VXLANPort:    4790,
+			OpenShift:    true,
+		})
+		resources, _ := component.Objects()
+		deploy := rtest.GetResource(resources, "egress-test", "test-ns", "apps", "v1", "Deployment").(*appsv1.Deployment)
+		Expect(deploy).NotTo(BeNil())
+		Expect(deploy.Spec.Template.Spec.Tolerations).To(ContainElements(corev1.Toleration{
+			Key:      "kubernetes.io/arch",
+			Operator: corev1.TolerationOpEqual,
+			Value:    "arm64",
+			Effect:   corev1.TaintEffectNoSchedule,
+		}))
 	})
 })

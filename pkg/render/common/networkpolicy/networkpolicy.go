@@ -16,12 +16,15 @@ package networkpolicy
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	"github.com/tigera/api/pkg/lib/numorstring"
+	operatorv1 "github.com/tigera/operator/api/v1"
+	"github.com/tigera/operator/pkg/render/common/meta"
 )
 
 const (
@@ -89,6 +92,22 @@ func CreateSourceEntityRule(namespace string, deploymentName string) v3.EntityRu
 	return v3.EntityRule{
 		Selector:          fmt.Sprintf("k8s-app == '%s'", deploymentName),
 		NamespaceSelector: fmt.Sprintf("projectcalico.org/name == '%s'", namespace),
+	}
+}
+
+// GetOIDCEgressRule creates egress rule for oidc connection.
+// the result will include an egress rules with the urlString passed in:
+//  1. egress rule: egress rule assuming the oidc is external to the cluster
+func GetOIDCEgressRule(parsedURL *url.URL) v3.Rule {
+	hostname := parsedURL.Hostname()
+	OIDCEntityRuleExternal := v3.EntityRule{
+		Domains: []string{hostname},
+	}
+
+	return v3.Rule{
+		Action:      v3.Allow,
+		Protocol:    &TCPProtocol,
+		Destination: OIDCEntityRuleExternal,
 	}
 }
 
@@ -262,6 +281,10 @@ func (h *NetworkPolicyHelper) ManagerSourceEntityRule() v3.EntityRule {
 	return CreateSourceEntityRule(h.namespace("tigera-manager"), "tigera-manager")
 }
 
+func (h *NetworkPolicyHelper) APIServerSourceEntityRule(v operatorv1.ProductVariant) v3.EntityRule {
+	return CreateSourceEntityRule(h.namespace(meta.APIServerNamespace(v)), meta.APIServerDeploymentName(v))
+}
+
 func (h *NetworkPolicyHelper) PolicyRecommendationSourceEntityRule() v3.EntityRule {
 	return CreateSourceEntityRule(h.namespace("tigera-policy-recommendation"), "tigera-policy-recommendation")
 }
@@ -288,6 +311,10 @@ func (h *NetworkPolicyHelper) ComplianceSnapshotterSourceEntityRule() v3.EntityR
 
 func (h *NetworkPolicyHelper) ComplianceReporterSourceEntityRule() v3.EntityRule {
 	return CreateSourceEntityRule(h.namespace("tigera-compliance"), "compliance-reporter")
+}
+
+func (h *NetworkPolicyHelper) IntrusionDetectionSourceEntityRule() v3.EntityRule {
+	return CreateSourceEntityRule(h.namespace("tigera-intrusion-detection"), "intrusion-detection-controller")
 }
 
 const PrometheusSelector = "k8s-app == 'tigera-prometheus'"

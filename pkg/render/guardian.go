@@ -18,25 +18,30 @@ package render
 
 import (
 	"net"
+	"net/url"
+
+	operatorurl "github.com/tigera/operator/pkg/url"
+	"golang.org/x/net/http/httpproxy"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	"github.com/tigera/api/pkg/lib/numorstring"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/components"
 	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
 
@@ -48,7 +53,6 @@ const (
 	GuardianClusterRoleName        = GuardianName
 	GuardianClusterRoleBindingName = GuardianName
 	GuardianDeploymentName         = GuardianName
-	GuardianPodSecurityPolicyName  = GuardianName
 	GuardianServiceName            = "tigera-guardian"
 	GuardianVolumeName             = "tigera-guardian-certs"
 	GuardianSecretName             = "tigera-managed-cluster-connection"
@@ -82,17 +86,19 @@ func GuardianPolicy(cfg *GuardianConfiguration) (Component, error) {
 
 // GuardianConfiguration contains all the config information needed to render the component.
 type GuardianConfiguration struct {
-	URL               string
-	PullSecrets       []*corev1.Secret
-	Openshift         bool
-	Installation      *operatorv1.InstallationSpec
-	TunnelSecret      *corev1.Secret
-	TrustedCertBundle certificatemanagement.TrustedBundle
-	TunnelCAType      operatorv1.CAType
-
-	// Whether the cluster supports pod security policies.
-	UsePSP                      bool
+	URL                         string
+	PullSecrets                 []*corev1.Secret
+	OpenShift                   bool
+	Installation                *operatorv1.InstallationSpec
+	TunnelSecret                *corev1.Secret
+	TrustedCertBundle           certificatemanagement.TrustedBundle
+	TunnelCAType                operatorv1.CAType
 	ManagementClusterConnection *operatorv1.ManagementClusterConnection
+
+	// PodProxies represents the resolved proxy configuration for each Guardian pod.
+	// If this slice is empty, then resolution has not yet occurred. Pods with no proxy
+	// configured are represented with a nil value.
+	PodProxies []*httpproxy.Config
 }
 
 type GuardianComponent struct {
@@ -115,9 +121,10 @@ func (c *GuardianComponent) SupportedOSType() rmeta.OSType {
 
 func (c *GuardianComponent) Objects() ([]client.Object, []client.Object) {
 	objs := []client.Object{
-		CreateNamespace(GuardianNamespace, c.cfg.Installation.KubernetesProvider, PSSRestricted),
+		CreateNamespace(GuardianNamespace, c.cfg.Installation.KubernetesProvider, PSSRestricted, c.cfg.Installation.Azure),
 	}
 
+	objs = append(objs, CreateOperatorSecretsRoleBinding(GuardianNamespace))
 	objs = append(objs, secret.ToRuntimeObjects(secret.CopyToNamespace(GuardianNamespace, c.cfg.PullSecrets...)...)...)
 	objs = append(objs,
 		c.serviceAccount(),
@@ -130,9 +137,9 @@ func (c *GuardianComponent) Objects() ([]client.Object, []client.Object) {
 
 		// Add tigera-manager service account for impersonation. In managed clusters, the tigera-manager
 		// service account is always within the tigera-manager namespace - regardless of (multi)tenancy mode.
-		CreateNamespace(ManagerNamespace, c.cfg.Installation.KubernetesProvider, PSSRestricted),
+		CreateNamespace(ManagerNamespace, c.cfg.Installation.KubernetesProvider, PSSRestricted, c.cfg.Installation.Azure),
 		managerServiceAccount(ManagerNamespace),
-		managerClusterRole(false, true, c.cfg.UsePSP, c.cfg.Installation.KubernetesProvider),
+		managerClusterRole(true, c.cfg.Installation.KubernetesProvider, nil),
 		managerClusterRoleBinding([]string{ManagerNamespace}),
 
 		// Install default UI settings for this managed cluster.
@@ -142,9 +149,6 @@ func (c *GuardianComponent) Objects() ([]client.Object, []client.Object) {
 		managerClusterWideDefaultView(),
 	)
 
-	if c.cfg.UsePSP {
-		objs = append(objs, c.podSecurityPolicy())
-	}
 	return objs, nil
 }
 
@@ -202,10 +206,6 @@ func (c *GuardianComponent) serviceAccount() *corev1.ServiceAccount {
 	}
 }
 
-func (c *GuardianComponent) podSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(GuardianPodSecurityPolicyName)
-}
-
 func (c *GuardianComponent) clusterRole() *rbacv1.ClusterRole {
 	policyRules := []rbacv1.PolicyRule{
 		{
@@ -215,13 +215,12 @@ func (c *GuardianComponent) clusterRole() *rbacv1.ClusterRole {
 		},
 	}
 
-	if c.cfg.UsePSP {
-		// Allow access to the pod security policy in case this is enforced on the cluster
+	if c.cfg.OpenShift {
 		policyRules = append(policyRules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{GuardianPodSecurityPolicyName},
+			ResourceNames: []string{securitycontextconstraints.NonRootV2},
 		})
 	}
 
@@ -258,6 +257,11 @@ func (c *GuardianComponent) clusterRoleBinding() *rbacv1.ClusterRoleBinding {
 func (c *GuardianComponent) deployment() *appsv1.Deployment {
 	var replicas int32 = 1
 
+	tolerations := append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateCriticalAddonsAndControlPlane...)
+	if c.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
+	}
+
 	d := &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -278,7 +282,7 @@ func (c *GuardianComponent) deployment() *appsv1.Deployment {
 				Spec: corev1.PodSpec{
 					NodeSelector:       c.cfg.Installation.ControlPlaneNodeSelector,
 					ServiceAccountName: GuardianServiceAccountName,
-					Tolerations:        append(c.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateCriticalAddonsAndControlPlane...),
+					Tolerations:        tolerations,
 					ImagePullSecrets:   secret.GetReferenceList(c.cfg.PullSecrets),
 					Containers:         c.container(),
 					Volumes:            c.volumes(),
@@ -310,22 +314,24 @@ func (c *GuardianComponent) volumes() []corev1.Volume {
 }
 
 func (c *GuardianComponent) container() []corev1.Container {
+	envVars := []corev1.EnvVar{
+		{Name: "GUARDIAN_PORT", Value: "9443"},
+		{Name: "GUARDIAN_LOGLEVEL", Value: "INFO"},
+		{Name: "GUARDIAN_VOLTRON_URL", Value: c.cfg.URL},
+		{Name: "GUARDIAN_VOLTRON_CA_TYPE", Value: string(c.cfg.TunnelCAType)},
+		{Name: "GUARDIAN_PACKET_CAPTURE_CA_BUNDLE_PATH", Value: c.cfg.TrustedCertBundle.MountPath()},
+		{Name: "GUARDIAN_PROMETHEUS_CA_BUNDLE_PATH", Value: c.cfg.TrustedCertBundle.MountPath()},
+		{Name: "GUARDIAN_QUERYSERVER_CA_BUNDLE_PATH", Value: c.cfg.TrustedCertBundle.MountPath()},
+	}
+	envVars = append(envVars, c.cfg.Installation.Proxy.EnvVars()...)
+
 	return []corev1.Container{
 		{
 			Name:            GuardianDeploymentName,
 			Image:           c.image,
 			ImagePullPolicy: ImagePullPolicy(),
-			Env: []corev1.EnvVar{
-				{Name: "GUARDIAN_PORT", Value: "9443"},
-				{Name: "GUARDIAN_LOGLEVEL", Value: "INFO"},
-				{Name: "GUARDIAN_VOLTRON_URL", Value: c.cfg.URL},
-				{Name: "GUARDIAN_VOLTRON_CA_TYPE", Value: string(c.cfg.TunnelCAType)},
-				{Name: "GUARDIAN_PACKET_CAPTURE_CA_BUNDLE_PATH", Value: c.cfg.TrustedCertBundle.MountPath()},
-				{Name: "GUARDIAN_PROMETHEUS_CA_BUNDLE_PATH", Value: c.cfg.TrustedCertBundle.MountPath()},
-				{Name: "GUARDIAN_QUERYSERVER_CA_BUNDLE_PATH", Value: c.cfg.TrustedCertBundle.MountPath()},
-				{Name: "GUARDIAN_FIPS_MODE_ENABLED", Value: operatorv1.IsFIPSModeEnabledString(c.cfg.Installation.FIPSMode)},
-			},
-			VolumeMounts: c.volumeMounts(),
+			Env:             envVars,
+			VolumeMounts:    c.volumeMounts(),
 			LivenessProbe: &corev1.Probe{
 				ProbeHandler: corev1.ProbeHandler{
 					HTTPGet: &corev1.HTTPGetAction{
@@ -370,7 +376,7 @@ func guardianAllowTigeraPolicy(cfg *GuardianConfiguration) (*v3.NetworkPolicy, e
 			Destination: PacketCaptureEntityRule,
 		},
 	}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.Openshift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.OpenShift)
 	egressRules = append(egressRules, []v3.Rule{
 		{
 			Action:      v3.Allow,
@@ -389,42 +395,85 @@ func guardianAllowTigeraPolicy(cfg *GuardianConfiguration) (*v3.NetworkPolicy, e
 		},
 	}...)
 
-	// Assumes address has the form "host:port", required by net.Dial for TCP.
-	host, port, err := net.SplitHostPort(cfg.URL)
-	if err != nil {
-		return nil, err
-	}
-	parsedPort, err := numorstring.PortFromString(port)
-	if err != nil {
-		return nil, err
-	}
-	parsedIp := net.ParseIP(host)
-	if parsedIp == nil {
-		// Assume host is a valid hostname.
-		egressRules = append(egressRules, v3.Rule{
-			Action:   v3.Allow,
-			Protocol: &networkpolicy.TCPProtocol,
-			Destination: v3.EntityRule{
-				Domains: []string{host},
-				Ports:   []numorstring.Port{parsedPort},
-			},
-		})
-	} else {
-		var netSuffix string
-		if parsedIp.To4() != nil {
-			netSuffix = "/32"
-		} else {
-			netSuffix = "/128"
+	// The loop below creates an egress rule for each unique destination that the Guardian pods connect to. If there are
+	// multiple guardian pods and their proxy  settings differ, then there are multiple destinations that must have egress allowed.
+	allowedDestinations := map[string]bool{}
+	processedPodProxies := ProcessPodProxies(cfg.PodProxies)
+	for _, podProxyConfig := range processedPodProxies {
+		var proxyURL *url.URL
+		var err error
+		if podProxyConfig != nil && podProxyConfig.HTTPSProxy != "" {
+			targetURL := &url.URL{
+				// The scheme should be HTTPS, as we are establishing an mTLS session with the target.
+				Scheme: "https",
+
+				// We expect `target` to be of the form host:port.
+				Host: cfg.URL,
+			}
+
+			proxyURL, err = podProxyConfig.ProxyFunc()(targetURL)
+			if err != nil {
+				return nil, err
+			}
 		}
 
-		egressRules = append(egressRules, v3.Rule{
-			Action:   v3.Allow,
-			Protocol: &networkpolicy.TCPProtocol,
-			Destination: v3.EntityRule{
-				Nets:  []string{parsedIp.String() + netSuffix},
-				Ports: []numorstring.Port{parsedPort},
-			},
-		})
+		var tunnelDestinationHostPort string
+		if proxyURL != nil {
+			proxyHostPort, err := operatorurl.ParseHostPortFromHTTPProxyURL(proxyURL)
+			if err != nil {
+				return nil, err
+			}
+
+			tunnelDestinationHostPort = proxyHostPort
+		} else {
+			// cfg.URL has host:port form
+			tunnelDestinationHostPort = cfg.URL
+		}
+
+		// Check if we've already created an egress rule for this destination.
+		if allowedDestinations[tunnelDestinationHostPort] {
+			continue
+		}
+
+		host, port, err := net.SplitHostPort(tunnelDestinationHostPort)
+		if err != nil {
+			return nil, err
+		}
+		parsedPort, err := numorstring.PortFromString(port)
+		if err != nil {
+			return nil, err
+		}
+		parsedIp := net.ParseIP(host)
+		if parsedIp == nil {
+			// Assume host is a valid hostname.
+			egressRules = append(egressRules, v3.Rule{
+				Action:   v3.Allow,
+				Protocol: &networkpolicy.TCPProtocol,
+				Destination: v3.EntityRule{
+					Domains: []string{host},
+					Ports:   []numorstring.Port{parsedPort},
+				},
+			})
+			allowedDestinations[tunnelDestinationHostPort] = true
+
+		} else {
+			var netSuffix string
+			if parsedIp.To4() != nil {
+				netSuffix = "/32"
+			} else {
+				netSuffix = "/128"
+			}
+
+			egressRules = append(egressRules, v3.Rule{
+				Action:   v3.Allow,
+				Protocol: &networkpolicy.TCPProtocol,
+				Destination: v3.EntityRule{
+					Nets:  []string{parsedIp.String() + netSuffix},
+					Ports: []numorstring.Port{parsedPort},
+				},
+			})
+			allowedDestinations[tunnelDestinationHostPort] = true
+		}
 	}
 
 	egressRules = append(egressRules, v3.Rule{Action: v3.Pass})
@@ -498,4 +547,14 @@ func guardianAllowTigeraPolicy(cfg *GuardianConfiguration) (*v3.NetworkPolicy, e
 	}
 
 	return policy, nil
+}
+
+func ProcessPodProxies(podProxies []*httpproxy.Config) []*httpproxy.Config {
+	// If pod proxies are empty, then pod proxy resolution has not yet occurred.
+	// Assume that a single Guardian pod is running without a proxy.
+	if len(podProxies) == 0 {
+		return []*httpproxy.Config{nil}
+	}
+
+	return podProxies
 }

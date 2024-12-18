@@ -22,7 +22,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -36,9 +35,9 @@ import (
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 	"github.com/tigera/operator/pkg/tls/certkeyusage"
 )
@@ -47,13 +46,12 @@ import (
 const (
 	ElasticsearchPolicyRecommendationUserSecret = "tigera-ee-policy-recommendation-elasticsearch-access"
 
-	PolicyRecommendationName                  = "tigera-policy-recommendation"
-	PolicyRecommendationNamespace             = PolicyRecommendationName
-	PolicyRecommendationPodSecurityPolicyName = PolicyRecommendationName
-	PolicyRecommendationPolicyName            = networkpolicy.TigeraComponentPolicyPrefix + PolicyRecommendationName
+	PolicyRecommendationName       = "tigera-policy-recommendation"
+	PolicyRecommendationNamespace  = PolicyRecommendationName
+	PolicyRecommendationPolicyName = networkpolicy.TigeraComponentPolicyPrefix + PolicyRecommendationName
 
 	PolicyRecommendationTLSSecretName                                   = "policy-recommendation-tls"
-	PolicyRecommendationMultiTenantManagedClustersAccessClusterRoleName = "tigera-policy-recommendation-managed-cluster-access"
+	PolicyRecommendationMultiTenantManagedClustersAccessRoleBindingName = "tigera-policy-recommendation-managed-cluster-access"
 )
 
 // Register secret/certs that need Server and Client Key usage
@@ -66,13 +64,11 @@ type PolicyRecommendationConfiguration struct {
 	ClusterDomain                  string
 	Installation                   *operatorv1.InstallationSpec
 	ManagedCluster                 bool
-	Openshift                      bool
+	OpenShift                      bool
 	PullSecrets                    []*corev1.Secret
 	TrustedBundle                  certificatemanagement.TrustedBundleRO
 	PolicyRecommendationCertSecret certificatemanagement.KeyPairInterface
 
-	// Whether the cluster supports pod security policies.
-	UsePSP            bool
 	Namespace         string
 	BindingNamespaces []string
 
@@ -115,7 +111,9 @@ func (pr *policyRecommendationComponent) Objects() ([]client.Object, []client.Ob
 	// Management and managed clusters need API access to the resources defined in the policy
 	// recommendation cluster role
 	objs := []client.Object{
-		CreateNamespace(pr.cfg.Namespace, pr.cfg.Installation.KubernetesProvider, PSSRestricted),
+		CreateNamespace(pr.cfg.Namespace, pr.cfg.Installation.KubernetesProvider, PSSRestricted, pr.cfg.Installation.Azure),
+		CreateOperatorSecretsRoleBinding(pr.cfg.Namespace),
+
 		pr.serviceAccount(),
 		pr.clusterRole(),
 		pr.clusterRoleBinding(),
@@ -137,10 +135,6 @@ func (pr *policyRecommendationComponent) Objects() ([]client.Object, []client.Ob
 		pr.allowTigeraPolicyForPolicyRecommendation(),
 		pr.deployment(),
 	)
-
-	if pr.cfg.UsePSP {
-		objs = append(objs, pr.podSecurityPolicy())
-	}
 
 	return objs, nil
 }
@@ -195,12 +189,12 @@ func (pr *policyRecommendationComponent) clusterRole() client.Object {
 		}...)
 	}
 
-	if pr.cfg.UsePSP {
+	if pr.cfg.OpenShift {
 		rules = append(rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{PolicyRecommendationPodSecurityPolicyName},
+			ResourceNames: []string{securitycontextconstraints.HostNetworkV2},
 		})
 	}
 
@@ -243,35 +237,18 @@ func (pr *policyRecommendationComponent) clusterRoleBinding() client.Object {
 
 func (pr *policyRecommendationComponent) multiTenantManagedClustersAccess() []client.Object {
 	var objects []client.Object
-	objects = append(objects, &rbacv1.ClusterRole{
-		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{Name: PolicyRecommendationMultiTenantManagedClustersAccessClusterRoleName},
-		Rules: []rbacv1.PolicyRule{
-			{
-				APIGroups: []string{"projectcalico.org"},
-				Resources: []string{"managedclusters"},
-				Verbs: []string{
-					// The Authentication Proxy in Voltron checks if PolicyRecommendation (either using impersonation
-					// headers for tigera-policy-recommendation service in tigera-policy-recommendation namespace or
-					// the actual account in a single tenant setup) can get a managed clusters before sending the
-					// request down the tunnel
-					"get",
-				},
-			},
-		},
-	})
 
 	// In a single tenant setup we want to create a cluster role that binds using service account
 	// tigera-policy-recommendation from tigera-policy-recommendation namespace. In a multi-tenant setup
 	// PolicyRecommendation Controller from the tenant's namespace impersonates service tigera-policy-recommendation
 	// from tigera-policy-recommendation namespace
-	objects = append(objects, &rbacv1.ClusterRoleBinding{
-		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{Name: PolicyRecommendationMultiTenantManagedClustersAccessClusterRoleName},
+	objects = append(objects, &rbacv1.RoleBinding{
+		TypeMeta:   metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: PolicyRecommendationMultiTenantManagedClustersAccessRoleBindingName, Namespace: pr.cfg.Namespace},
 		RoleRef: rbacv1.RoleRef{
 			APIGroup: "rbac.authorization.k8s.io",
 			Kind:     "ClusterRole",
-			Name:     PolicyRecommendationMultiTenantManagedClustersAccessClusterRoleName,
+			Name:     MultiTenantManagedClustersAccessClusterRoleName,
 		},
 		Subjects: []rbacv1.Subject{
 			// requests for policy recommendation to managed clusters are done using service account tigera-policy-recommendation
@@ -285,9 +262,6 @@ func (pr *policyRecommendationComponent) multiTenantManagedClustersAccess() []cl
 	})
 
 	return objects
-}
-func (pr *policyRecommendationComponent) podSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(PolicyRecommendationPodSecurityPolicyName)
 }
 
 // deployment returns the policy recommendation deployments. It assumes that this is defined for
@@ -359,6 +333,11 @@ func (pr *policyRecommendationComponent) deployment() *appsv1.Deployment {
 		initContainers = append(initContainers, pr.cfg.PolicyRecommendationCertSecret.InitContainer(PolicyRecommendationNamespace))
 	}
 
+	tolerations := pr.cfg.Installation.ControlPlaneTolerations
+	if pr.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
+	}
+
 	podTemplateSpec := &corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        PolicyRecommendationName,
@@ -366,7 +345,7 @@ func (pr *policyRecommendationComponent) deployment() *appsv1.Deployment {
 			Annotations: pr.policyRecommendationAnnotations(),
 		},
 		Spec: corev1.PodSpec{
-			Tolerations:        pr.cfg.Installation.ControlPlaneTolerations,
+			Tolerations:        tolerations,
 			NodeSelector:       pr.cfg.Installation.ControlPlaneNodeSelector,
 			ServiceAccountName: PolicyRecommendationName,
 			ImagePullSecrets:   secret.GetReferenceList(pr.cfg.PullSecrets),
@@ -431,7 +410,7 @@ func (pr *policyRecommendationComponent) allowTigeraPolicyForPolicyRecommendatio
 		})
 	}
 
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, pr.cfg.Openshift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, pr.cfg.OpenShift)
 
 	return &v3.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},

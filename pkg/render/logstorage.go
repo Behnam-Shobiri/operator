@@ -19,24 +19,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
-	"net/url"
 	"strings"
-
-	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 
 	cmnv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/common/v1"
 	esv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/elasticsearch/v1"
-	kbv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/kibana/v1"
-
 	"gopkg.in/inf.v0"
-	appsv1 "k8s.io/api/apps/v1"
+
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -47,26 +40,18 @@ import (
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/dns"
-	"github.com/tigera/operator/pkg/ptr"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
-	"github.com/tigera/operator/pkg/render/common/podaffinity"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
 
 type ElasticsearchLicenseType string
 
 const (
-	ECKOperatorName         = "elastic-operator"
-	ECKOperatorNamespace    = "tigera-eck-operator"
-	ECKLicenseConfigMapName = "elastic-licensing"
-	ECKOperatorPolicyName   = networkpolicy.TigeraComponentPolicyPrefix + "elastic-operator-access"
-	ECKEnterpriseTrial      = "eck-trial-license"
-
 	ElasticsearchObjectName = "tigera-elasticsearch"
 	ElasticsearchNamespace  = ElasticsearchObjectName
 
@@ -87,9 +72,6 @@ const (
 	// TigeraElasticsearchInternalCertSecret is the TLS key pair that is mounted by the Elasticsearch pods.
 	TigeraElasticsearchInternalCertSecret = "tigera-secure-internal-elasticsearch-cert"
 
-	// TigeraKibanaCertSecret is the TLS key pair that is mounted by the Kibana pods.
-	TigeraKibanaCertSecret = "tigera-secure-kibana-cert"
-
 	// Linseed vars.
 	LinseedServiceName = "tigera-linseed"
 
@@ -103,14 +85,7 @@ const (
 	ElasticsearchPolicyName         = networkpolicy.TigeraComponentPolicyPrefix + "elasticsearch-access"
 	ElasticsearchInternalPolicyName = networkpolicy.TigeraComponentPolicyPrefix + "elasticsearch-internal"
 
-	KibanaName         = "tigera-secure"
-	KibanaObjectName   = "tigera-kibana"
-	KibanaNamespace    = KibanaObjectName
-	KibanaBasePath     = KibanaObjectName
-	KibanaServiceName  = "tigera-secure-kb-http"
-	KibanaDefaultRoute = "/app/kibana#/dashboards?%s&title=%s"
-	KibanaPolicyName   = networkpolicy.TigeraComponentPolicyPrefix + "kibana-access"
-	KibanaPort         = 5601
+	KibanaBasePath = "tigera-kibana"
 
 	DefaultElasticsearchClusterName = "cluster"
 	DefaultElasticsearchReplicas    = 0
@@ -131,31 +106,23 @@ const (
 	EsManagerRole        = "es-manager"
 	EsManagerRoleBinding = "es-manager"
 
-	KibanaTLSAnnotationHash        = "hash.operator.tigera.io/kb-secrets"
-	ElasticsearchTLSHashAnnotation = "hash.operator.tigera.io/es-secrets"
+	CalicoKubeControllerSecret = "calico-kube-controller-secrets"
 
-	TimeFilter         = "_g=(time:(from:now-24h,to:now))"
-	FlowsDashboardName = "Calico Enterprise Flow Logs"
+	ElasticsearchTLSHashAnnotation = "hash.operator.tigera.io/es-secrets"
 )
 
 const (
-	// ElasticsearchKeystoreSecret Currently only used when FIPS mode is enabled, we need to initialize the keystore with a password.
-	ElasticsearchKeystoreSecret         = "tigera-secure-elasticsearch-keystore"
-	ElasticsearchKeystoreEnvName        = "KEYSTORE_PASSWORD"
-	ElasticsearchKeystoreHashAnnotation = "hash.operator.tigera.io/keystore-password"
-
-	keystoreInitContainerName = "elastic-internal-init-keystore"
-	csrRootCAConfigMapName    = "elasticsearch-config"
+	csrRootCAConfigMapName = "elasticsearch-config"
 )
 
 // Certificate management constants.
 const (
 	// Volume that is added by ECK and is overridden if certificate management is used.
-	csrVolumeNameHTTP = "elastic-internal-http-certificates"
+	CSRVolumeNameHTTP = "elastic-internal-http-certificates"
 	// Volume that is added by ECK and is overridden if certificate management is used.
-	csrVolumeNameTransport = "elastic-internal-transport-certificates"
+	CSRVolumeNameTransport = "elastic-internal-transport-certificates"
 	// Volume name that is added by ECK for the purpose of mounting certs.
-	caVolumeName = "elasticsearch-certs"
+	CAVolumeName = "elasticsearch-certs"
 )
 
 var (
@@ -174,20 +141,14 @@ var InternalElasticsearchEntityRule = v3.EntityRule{
 }
 
 var (
-	KibanaEntityRule            = networkpolicy.CreateEntityRule(KibanaNamespace, KibanaName, KibanaPort)
-	KibanaSourceEntityRule      = networkpolicy.CreateSourceEntityRule(KibanaNamespace, KibanaName)
-	ECKOperatorSourceEntityRule = networkpolicy.CreateSourceEntityRule(ECKOperatorNamespace, ECKOperatorName)
+	SourceKibanaEntityRule      = networkpolicy.CreateSourceEntityRule("tigera-kibana", "tigera-secure")
+	ECKOperatorSourceEntityRule = networkpolicy.CreateSourceEntityRule("tigera-eck-operator", "elastic-operator")
 )
 
 var log = logf.Log.WithName("render")
 
 // LogStorage renders the components necessary for kibana and elasticsearch
 func LogStorage(cfg *ElasticsearchConfiguration) Component {
-	if cfg.KibanaEnabled && operatorv1.IsFIPSModeEnabled(cfg.Installation.FIPSMode) {
-		// This branch should only be hit if there is a coding bug in the controller, as KibanaEnabled
-		// should already take into account FIPS.
-		panic("BUG: Kibana is not supported in FIPS mode")
-	}
 	return &elasticsearchComponent{
 		cfg: cfg,
 	}
@@ -199,59 +160,34 @@ type ElasticsearchConfiguration struct {
 	Installation            *operatorv1.InstallationSpec
 	ManagementCluster       *operatorv1.ManagementCluster
 	Elasticsearch           *esv1.Elasticsearch
-	Kibana                  *kbv1.Kibana
 	ClusterConfig           *relasticsearch.ClusterConfig
 	ElasticsearchUserSecret *corev1.Secret
 	ElasticsearchKeyPair    certificatemanagement.KeyPairInterface
-	KibanaKeyPair           certificatemanagement.KeyPairInterface
 	PullSecrets             []*corev1.Secret
 	Provider                operatorv1.Provider
 	CuratorSecrets          []*corev1.Secret
 	ESService               *corev1.Service
-	KbService               *corev1.Service
 	ClusterDomain           string
-	BaseURL                 string // BaseUrl is where the manager is reachable, for setting Kibana publicBaseUrl
 	ElasticLicenseType      ElasticsearchLicenseType
 	TrustedBundle           certificatemanagement.TrustedBundleRO
 	UnusedTLSSecret         *corev1.Secret
-	ApplyTrial              bool
-	KeyStoreSecret          *corev1.Secret
-	KibanaEnabled           bool
-
-	// Whether the cluster supports pod security policies.
-	UsePSP bool
 }
 
 type elasticsearchComponent struct {
-	cfg             *ElasticsearchConfiguration
-	kibanaSecrets   []*corev1.Secret
-	esImage         string
-	esOperatorImage string
-	kibanaImage     string
-	csrImage        string
+	cfg      *ElasticsearchConfiguration
+	esImage  string
+	csrImage string
 }
 
 func (es *elasticsearchComponent) ResolveImages(is *operatorv1.ImageSet) error {
 	reg := es.cfg.Installation.Registry
 	path := es.cfg.Installation.ImagePath
 	prefix := es.cfg.Installation.ImagePrefix
+
 	var err error
-	if operatorv1.IsFIPSModeEnabled(es.cfg.Installation.FIPSMode) {
-		es.esImage, err = components.GetReference(components.ComponentElasticsearchFIPS, reg, path, prefix, is)
-	} else {
-		es.esImage, err = components.GetReference(components.ComponentElasticsearch, reg, path, prefix, is)
-	}
+	es.esImage, err = components.GetReference(components.ComponentElasticsearch, reg, path, prefix, is)
+
 	errMsgs := make([]string, 0)
-	if err != nil {
-		errMsgs = append(errMsgs, err.Error())
-	}
-
-	es.esOperatorImage, err = components.GetReference(components.ComponentElasticsearchOperator, reg, path, prefix, is)
-	if err != nil {
-		errMsgs = append(errMsgs, err.Error())
-	}
-
-	es.kibanaImage, err = components.GetReference(components.ComponentKibana, reg, path, prefix, is)
 	if err != nil {
 		errMsgs = append(errMsgs, err.Error())
 	}
@@ -264,7 +200,7 @@ func (es *elasticsearchComponent) ResolveImages(is *operatorv1.ImageSet) error {
 	}
 
 	if len(errMsgs) != 0 {
-		return fmt.Errorf(strings.Join(errMsgs, ","))
+		return fmt.Errorf("%s", strings.Join(errMsgs, ","))
 	}
 	return nil
 }
@@ -286,60 +222,16 @@ func (es *elasticsearchComponent) Objects() ([]client.Object, []client.Object) {
 			}
 		}
 
-		if es.cfg.Kibana != nil {
-			if es.cfg.Kibana.DeletionTimestamp == nil {
-				toDelete = append(toDelete, es.cfg.Kibana)
-			}
-		}
-
 		return toCreate, toDelete
 	}
 
-	// ECK operator
-	toCreate = append(toCreate,
-		CreateNamespace(ECKOperatorNamespace, es.cfg.Installation.KubernetesProvider, PSSRestricted),
-		es.eckOperatorAllowTigeraPolicy(),
-	)
-
-	toCreate = append(toCreate, secret.ToRuntimeObjects(secret.CopyToNamespace(ECKOperatorNamespace, es.cfg.PullSecrets...)...)...)
-
-	toCreate = append(toCreate,
-		es.eckOperatorClusterRole(),
-		es.eckOperatorClusterRoleBinding(),
-		es.eckOperatorServiceAccount(),
-	)
-	// This is needed for the operator to be able to set privileged mode for pods.
-	// https://docs.docker.com/ee/ucp/authorization/#secure-kubernetes-defaults
-	if es.cfg.Provider == operatorv1.ProviderDockerEE {
-		toCreate = append(toCreate, es.eckOperatorClusterAdminClusterRoleBinding())
-	}
-
-	if es.cfg.UsePSP {
-		toCreate = append(toCreate,
-			es.elasticsearchClusterRoleBinding(),
-			es.elasticsearchClusterRole(),
-			es.eckOperatorPodSecurityPolicy(),
-			es.elasticsearchPodSecurityPolicy(),
-		)
-		if es.cfg.KibanaEnabled {
-			toCreate = append(toCreate,
-				es.kibanaClusterRoleBinding(),
-				es.kibanaClusterRole(),
-				es.kibanaPodSecurityPolicy(),
-			)
-		}
-	}
-
-	if es.cfg.ApplyTrial {
-		toCreate = append(toCreate, es.elasticEnterpriseTrial())
-	}
-	toCreate = append(toCreate, es.eckOperatorStatefulSet())
-
 	// Elasticsearch CRs
-	toCreate = append(toCreate, CreateNamespace(ElasticsearchNamespace, es.cfg.Installation.KubernetesProvider, PSSPrivileged))
+	toCreate = append(toCreate, CreateNamespace(ElasticsearchNamespace, es.cfg.Installation.KubernetesProvider, PSSPrivileged, es.cfg.Installation.Azure))
 	toCreate = append(toCreate, es.elasticsearchAllowTigeraPolicy())
 	toCreate = append(toCreate, es.elasticsearchInternalAllowTigeraPolicy())
 	toCreate = append(toCreate, networkpolicy.AllowTigeraDefaultDeny(ElasticsearchNamespace))
+
+	toCreate = append(toCreate, CreateOperatorSecretsRoleBinding(ElasticsearchNamespace))
 
 	if len(es.cfg.PullSecrets) > 0 {
 		toCreate = append(toCreate, secret.ToRuntimeObjects(secret.CopyToNamespace(ElasticsearchNamespace, es.cfg.PullSecrets...)...)...)
@@ -354,37 +246,16 @@ func (es *elasticsearchComponent) Objects() ([]client.Object, []client.Object) {
 
 	toCreate = append(toCreate, es.elasticsearchCluster())
 
-	if es.cfg.KibanaEnabled {
-		// Kibana CRs
-		// In order to use restricted, we need to change elastic-internal-init-config:
-		// - securityContext.allowPrivilegeEscalation=false
-		// - securityContext.capabilities.drop=["ALL"]
-		// - securityContext.runAsNonRoot=true
-		// - securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost"
-		toCreate = append(toCreate, CreateNamespace(KibanaNamespace, es.cfg.Installation.KubernetesProvider, PSSBaseline))
-		toCreate = append(toCreate, es.kibanaAllowTigeraPolicy())
-		toCreate = append(toCreate, networkpolicy.AllowTigeraDefaultDeny(KibanaNamespace))
-		toCreate = append(toCreate, es.kibanaServiceAccount())
+	if es.cfg.Installation.KubernetesProvider.IsOpenShift() {
+		toCreate = append(toCreate, es.elasticsearchClusterRole(), es.elasticsearchClusterRoleBinding())
+	}
 
-		if len(es.cfg.PullSecrets) > 0 {
-			toCreate = append(toCreate, secret.ToRuntimeObjects(secret.CopyToNamespace(KibanaNamespace, es.cfg.PullSecrets...)...)...)
-		}
-
-		if len(es.kibanaSecrets) > 0 {
-			toCreate = append(toCreate, secret.ToRuntimeObjects(es.kibanaSecrets...)...)
-		}
-
-		toCreate = append(toCreate, es.kibanaCR())
-	} else {
-		if es.cfg.KeyStoreSecret != nil {
-			if operatorv1.IsFIPSModeEnabled(es.cfg.Installation.FIPSMode) {
-				es.cfg.KeyStoreSecret.Data["ES_JAVA_OPTS"] = []byte(es.javaOpts())
-			}
-
-			toCreate = append(toCreate, es.cfg.KeyStoreSecret)
-			toCreate = append(toCreate, secret.ToRuntimeObjects(secret.CopyToNamespace(ElasticsearchNamespace, es.cfg.KeyStoreSecret)...)...)
-		}
-		toDelete = append(toDelete, es.kibanaCR())
+	roles, bindings := es.elasticsearchRolesAndBindings()
+	for _, r := range roles {
+		toCreate = append(toCreate, r)
+	}
+	for _, b := range bindings {
+		toCreate = append(toCreate, b)
 	}
 
 	// Curator is no longer supported in ElasticSearch beyond version 8 so remove its resources here unconditionally so
@@ -400,23 +271,12 @@ func (es *elasticsearchComponent) Objects() ([]client.Object, []client.Object) {
 		toDelete = append(toDelete, es.cfg.ESService)
 	}
 
-	if es.cfg.KbService != nil && es.cfg.KbService.Spec.Type == corev1.ServiceTypeExternalName {
-		toDelete = append(toDelete, es.cfg.KbService)
-	}
-
 	if es.cfg.Installation.CertificateManagement != nil {
 		toCreate = append(toCreate, es.cfg.UnusedTLSSecret)
 		if es.cfg.ElasticsearchKeyPair.UseCertificateManagement() {
 			// We need to render a secret. It won't ever be used by Elasticsearch for TLS, but is needed to pass ECK's checks.
 			// If the secret changes / gets reconciled, it will not trigger a re-render of Kibana.
 			unusedSecret := es.cfg.ElasticsearchKeyPair.Secret(ElasticsearchNamespace)
-			unusedSecret.Data = es.cfg.UnusedTLSSecret.Data
-			toCreate = append(toCreate, unusedSecret)
-		}
-		if es.cfg.KibanaKeyPair != nil && es.cfg.KibanaKeyPair.UseCertificateManagement() {
-			// We need to render a secret. It won't ever be used by Kibana for TLS, but is needed to pass ECK's checks.
-			// If the secret changes / gets reconciled, it will not trigger a re-render of Kibana.
-			unusedSecret := es.cfg.KibanaKeyPair.Secret(KibanaNamespace)
 			unusedSecret.Data = es.cfg.UnusedTLSSecret.Data
 			toCreate = append(toCreate, unusedSecret)
 		}
@@ -431,7 +291,7 @@ func (es *elasticsearchComponent) Ready() bool {
 	return true
 }
 
-func (es elasticsearchComponent) elasticsearchServiceAccount() *corev1.ServiceAccount {
+func (es *elasticsearchComponent) elasticsearchServiceAccount() *corev1.ServiceAccount {
 	return &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ElasticsearchObjectName,
@@ -441,14 +301,14 @@ func (es elasticsearchComponent) elasticsearchServiceAccount() *corev1.ServiceAc
 }
 
 // generate the PVC required for the Elasticsearch nodes
-func (es elasticsearchComponent) pvcTemplate() corev1.PersistentVolumeClaim {
+func (es *elasticsearchComponent) pvcTemplate() corev1.PersistentVolumeClaim {
 	pvcTemplate := corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "elasticsearch-data", // ECK requires this name
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
 			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-			Resources: corev1.ResourceRequirements{
+			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
 					"storage": resource.MustParse(fmt.Sprintf("%dGi", DefaultElasticStorageGi)),
 				},
@@ -466,7 +326,7 @@ func (es elasticsearchComponent) pvcTemplate() corev1.PersistentVolumeClaim {
 	return pvcTemplate
 }
 
-func (es elasticsearchComponent) resourceRequirements() corev1.ResourceRequirements {
+func (es *elasticsearchComponent) resourceRequirements() corev1.ResourceRequirements {
 	resources := corev1.ResourceRequirements{
 		Limits: corev1.ResourceList{
 			"cpu":    resource.MustParse("1"),
@@ -484,7 +344,7 @@ func (es elasticsearchComponent) resourceRequirements() corev1.ResourceRequireme
 	return resources
 }
 
-func (es elasticsearchComponent) javaOpts() string {
+func (es *elasticsearchComponent) javaOpts() string {
 	var javaOpts string
 	resources := es.resourceRequirements()
 	if es.cfg.LogStorage.Spec.Nodes != nil && es.cfg.LogStorage.Spec.Nodes.ResourceRequirements != nil {
@@ -494,61 +354,23 @@ func (es elasticsearchComponent) javaOpts() string {
 	} else {
 		javaOpts = "-Xms2G -Xmx2G"
 	}
-	if operatorv1.IsFIPSModeEnabled(es.cfg.Installation.FIPSMode) {
-		javaOpts = fmt.Sprintf("%s --module-path /usr/share/bc-fips/ "+
-			"-Djavax.net.ssl.trustStore=/usr/share/elasticsearch/config/cacerts.bcfks "+
-			"-Djavax.net.ssl.trustStoreType=BCFKS "+
-			"-Djavax.net.ssl.trustStorePassword=%s "+
-			"-Dorg.bouncycastle.fips.approved_only=true", javaOpts, es.cfg.KeyStoreSecret.Data[ElasticsearchKeystoreEnvName])
-	}
 	return javaOpts
 }
 
 // Generate the pod template required for the ElasticSearch nodes (controls the ElasticSearch container)
-func (es elasticsearchComponent) podTemplate() corev1.PodTemplateSpec {
+func (es *elasticsearchComponent) podTemplate() corev1.PodTemplateSpec {
 	// Setup default configuration for ES container. For more information on managing resources, see:
 	// https://www.elastic.co/guide/en/cloud-on-k8s/current/k8s-managing-compute-resources.html and
 	// https://www.elastic.co/guide/en/cloud-on-k8s/current/k8s-jvm-heap-size.html#k8s-jvm-heap-size
 
-	var env []corev1.EnvVar
-
-	if operatorv1.IsFIPSModeEnabled(es.cfg.Installation.FIPSMode) {
-		// We mount it from a secret, as it contains sensitive information.
-		env = append(env,
-			corev1.EnvVar{
-				Name: ElasticsearchKeystoreEnvName,
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: ElasticsearchKeystoreSecret},
-						Key:                  ElasticsearchKeystoreEnvName,
-					},
-				},
-			},
-			corev1.EnvVar{
-				Name: "ES_JAVA_OPTS",
-				ValueFrom: &corev1.EnvVarSource{
-					SecretKeyRef: &corev1.SecretKeySelector{
-						LocalObjectReference: corev1.LocalObjectReference{Name: ElasticsearchKeystoreSecret},
-						Key:                  "ES_JAVA_OPTS",
-					},
-				},
-			})
-	} else {
-		env = append(env, corev1.EnvVar{
+	env := []corev1.EnvVar{
+		{
 			Name:  "ES_JAVA_OPTS",
 			Value: es.javaOpts(),
-		})
+		},
 	}
 
-	sc := securitycontext.NewRootContext(false)
-	// These capabilities are required for docker-entrypoint.sh.
-	// See: https://github.com/elastic/elasticsearch/blob/7.17/distribution/docker/src/docker/bin/docker-entrypoint.sh.
-	// TODO Consider removing for Elasticsearch v8+.
-	sc.Capabilities.Add = []corev1.Capability{
-		"SETGID",
-		"SETUID",
-		"SYS_CHROOT",
-	}
+	sc := securitycontext.NewNonRootContext()
 
 	esContainer := corev1.Container{
 		Name: "elasticsearch",
@@ -589,41 +411,6 @@ func (es elasticsearchComponent) podTemplate() corev1.PodTemplateSpec {
 	annotations[ElasticsearchTLSHashAnnotation] = rmeta.SecretsAnnotationHash(es.cfg.ElasticsearchUserSecret)
 	annotations[es.cfg.ElasticsearchKeyPair.HashAnnotationKey()] = es.cfg.ElasticsearchKeyPair.HashAnnotationValue()
 
-	if operatorv1.IsFIPSModeEnabled(es.cfg.Installation.FIPSMode) {
-		sc := securitycontext.NewRootContext(false)
-		// keystore init container converts jdk jks to bcfks and chown the new file to
-		// elasticsearch user and group for the main container to consume.
-		sc.Capabilities.Add = []corev1.Capability{"CHOWN"}
-
-		initKeystore := corev1.Container{
-			Name:            keystoreInitContainerName,
-			Image:           es.esImage,
-			ImagePullPolicy: ImagePullPolicy(),
-			Env: []corev1.EnvVar{
-				{
-					Name: ElasticsearchKeystoreEnvName,
-					ValueFrom: &corev1.EnvVarSource{
-						SecretKeyRef: &corev1.SecretKeySelector{
-							LocalObjectReference: corev1.LocalObjectReference{Name: ElasticsearchKeystoreSecret},
-							Key:                  ElasticsearchKeystoreEnvName,
-						},
-					},
-				},
-				{
-					Name:  "ES_JAVA_OPTS",
-					Value: "--module-path /usr/share/bc-fips/",
-				},
-			},
-			// This is a script made by Tigera in our docker image to initialize the JVM keystore and the ES keystore
-			// using the password from env var KEYSTORE_PASSWORD.
-			Command:         []string{"/bin/sh"},
-			Args:            []string{"-c", "/usr/bin/initialize_keystore.sh"},
-			SecurityContext: sc,
-		}
-		initContainers = append(initContainers, initKeystore)
-		annotations[ElasticsearchKeystoreHashAnnotation] = rmeta.SecretsAnnotationHash(es.cfg.KeyStoreSecret)
-	}
-
 	var volumes []corev1.Volume
 
 	var autoMountToken bool
@@ -650,7 +437,7 @@ func (es elasticsearchComponent) podTemplate() corev1.PodTemplateSpec {
 			VolumeMounts: []corev1.VolumeMount{
 				// Create transport mount, such that ECK will not auto-fill this with a secret volume.
 				{
-					Name:      csrVolumeNameTransport,
+					Name:      CSRVolumeNameTransport,
 					MountPath: "/csr",
 					ReadOnly:  false,
 				},
@@ -659,16 +446,16 @@ func (es elasticsearchComponent) podTemplate() corev1.PodTemplateSpec {
 
 		csrInitContainerHTTP := es.cfg.ElasticsearchKeyPair.InitContainer(ElasticsearchNamespace)
 		csrInitContainerHTTP.Name = "key-cert-elastic"
-		csrInitContainerHTTP.VolumeMounts[0].Name = csrVolumeNameHTTP
+		csrInitContainerHTTP.VolumeMounts[0].Name = CSRVolumeNameHTTP
 		httpVolumemount := es.cfg.ElasticsearchKeyPair.VolumeMount(es.SupportedOSType())
-		httpVolumemount.Name = csrVolumeNameHTTP
+		httpVolumemount.Name = CSRVolumeNameHTTP
 
 		// Add the init container that will issue a CSR for transport and mount it in an emptyDir.
 		csrInitContainerTransport := certificatemanagement.CreateCSRInitContainer(
 			es.cfg.Installation.CertificateManagement,
-			csrVolumeNameTransport,
+			CSRVolumeNameTransport,
 			es.csrImage,
-			csrVolumeNameTransport,
+			CSRVolumeNameTransport,
 			ElasticsearchServiceName,
 			"transport.tls.key",
 			"transport.tls.crt",
@@ -684,13 +471,13 @@ func (es elasticsearchComponent) podTemplate() corev1.PodTemplateSpec {
 
 		volumes = append(volumes,
 			corev1.Volume{
-				Name: csrVolumeNameHTTP,
+				Name: CSRVolumeNameHTTP,
 				VolumeSource: corev1.VolumeSource{
 					EmptyDir: &corev1.EmptyDirVolumeSource{},
 				},
 			},
 			corev1.Volume{
-				Name: csrVolumeNameTransport,
+				Name: CSRVolumeNameTransport,
 				VolumeSource: corev1.VolumeSource{
 					EmptyDir: &corev1.EmptyDirVolumeSource{},
 				},
@@ -708,9 +495,9 @@ func (es elasticsearchComponent) podTemplate() corev1.PodTemplateSpec {
 		})
 		esContainer.VolumeMounts = append(esContainer.VolumeMounts,
 			httpVolumemount,
-			corev1.VolumeMount{MountPath: "/usr/share/elasticsearch/config/http-certs", Name: csrVolumeNameHTTP, ReadOnly: false},
-			corev1.VolumeMount{MountPath: "/usr/share/elasticsearch/config/transport-certs", Name: csrVolumeNameTransport, ReadOnly: false},
-			corev1.VolumeMount{MountPath: "/usr/share/elasticsearch/config/node-transport-cert", Name: csrVolumeNameTransport, ReadOnly: false},
+			corev1.VolumeMount{MountPath: "/usr/share/elasticsearch/config/http-certs", Name: CSRVolumeNameHTTP, ReadOnly: false},
+			corev1.VolumeMount{MountPath: "/usr/share/elasticsearch/config/transport-certs", Name: CSRVolumeNameTransport, ReadOnly: false},
+			corev1.VolumeMount{MountPath: "/usr/share/elasticsearch/config/node-transport-cert", Name: CSRVolumeNameTransport, ReadOnly: false},
 		)
 	}
 
@@ -718,6 +505,11 @@ func (es elasticsearchComponent) podTemplate() corev1.PodTemplateSpec {
 	nodeSels := es.cfg.Installation.ControlPlaneNodeSelector
 	if es.cfg.LogStorage.Spec.DataNodeSelector != nil {
 		nodeSels = es.cfg.LogStorage.Spec.DataNodeSelector
+	}
+
+	tolerations := es.cfg.Installation.ControlPlaneTolerations
+	if es.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
 	}
 
 	podTemplate := corev1.PodTemplateSpec{
@@ -729,7 +521,7 @@ func (es elasticsearchComponent) podTemplate() corev1.PodTemplateSpec {
 			Containers:                   []corev1.Container{esContainer},
 			ImagePullSecrets:             secret.GetReferenceList(es.cfg.PullSecrets),
 			NodeSelector:                 nodeSels,
-			Tolerations:                  es.cfg.Installation.ControlPlaneTolerations,
+			Tolerations:                  tolerations,
 			ServiceAccountName:           ElasticsearchObjectName,
 			Volumes:                      volumes,
 			AutomountServiceAccountToken: &autoMountToken,
@@ -740,7 +532,7 @@ func (es elasticsearchComponent) podTemplate() corev1.PodTemplateSpec {
 }
 
 // render the Elasticsearch CR that the ECK operator uses to create elasticsearch cluster
-func (es elasticsearchComponent) elasticsearchCluster() *esv1.Elasticsearch {
+func (es *elasticsearchComponent) elasticsearchCluster() *esv1.Elasticsearch {
 	elasticsearch := &esv1.Elasticsearch{
 		TypeMeta: metav1.TypeMeta{Kind: "Elasticsearch", APIVersion: "elasticsearch.k8s.elastic.co/v1"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -833,7 +625,7 @@ func memoryQuantityToJVMHeapSize(q *resource.Quantity) string {
 // nodeSets calculates the number of NodeSets needed for the Elasticsearch cluster. Multiple NodeSets are returned only
 // if the "nodeSets" field has been set in the LogStorage CR. The number of Nodes for the cluster will be distributed as
 // evenly as possible between the NodeSets.
-func (es elasticsearchComponent) nodeSets() []esv1.NodeSet {
+func (es *elasticsearchComponent) nodeSets() []esv1.NodeSet {
 	nodeConfig := es.cfg.LogStorage.Spec.Nodes
 	pvcTemplate := es.pvcTemplate()
 
@@ -927,11 +719,14 @@ func (es elasticsearchComponent) nodeSets() []esv1.NodeSet {
 //
 // Note that this does not return a complete NodeSet, fields like Name and Count will at least need to be set on the returned
 // NodeSet
-func (es elasticsearchComponent) nodeSetTemplate(pvcTemplate corev1.PersistentVolumeClaim) esv1.NodeSet {
+func (es *elasticsearchComponent) nodeSetTemplate(pvcTemplate corev1.PersistentVolumeClaim) esv1.NodeSet {
 	config := map[string]interface{}{
-		"node.master":                 "true",
-		"node.data":                   "true",
-		"node.ingest":                 "true",
+		"node.roles": []string{
+			"data",
+			"ingest",
+			"master",
+			"remote_cluster_client",
+		},
 		"cluster.max_shards_per_node": 10000,
 		// Disable geoip downloader. This removes an error from the startup logs, because our network policy blocks it.
 		"ingest.geoip.downloader.enabled": false,
@@ -939,10 +734,6 @@ func (es elasticsearchComponent) nodeSetTemplate(pvcTemplate corev1.PersistentVo
 
 	if es.cfg.Installation.CertificateManagement != nil {
 		config["xpack.security.http.ssl.certificate_authorities"] = []string{"/usr/share/elasticsearch/config/http-certs/ca.crt"}
-	}
-	if operatorv1.IsFIPSModeEnabled(es.cfg.Installation.FIPSMode) {
-		config["xpack.security.fips_mode.enabled"] = "true"
-		config["xpack.security.authc.password_hashing.algorithm"] = "pbkdf2_stretch"
 	}
 
 	return esv1.NodeSet{
@@ -974,436 +765,9 @@ func nodeSetName(pvcTemplate corev1.PersistentVolumeClaim) string {
 	return hex.EncodeToString(pvcTemplateHash.Sum(nil))
 }
 
-func (es elasticsearchComponent) eckOperatorClusterRole() *rbacv1.ClusterRole {
-	rules := []rbacv1.PolicyRule{
-		{
-			APIGroups: []string{"authorization.k8s.io"},
-			Resources: []string{"subjectaccessreviews"},
-			Verbs:     []string{"create"},
-		},
-		{
-			APIGroups: []string{"coordination.k8s.io"},
-			Resources: []string{"leases"},
-			Verbs:     []string{"create"},
-		},
-		{
-			APIGroups:     []string{"coordination.k8s.io"},
-			Resources:     []string{"leases"},
-			ResourceNames: []string{"elastic-operator-leader"},
-			Verbs:         []string{"get", "watch", "update"},
-		},
-		{
-			APIGroups: []string{""},
-			Resources: []string{"pods", "endpoints", "events", "persistentvolumeclaims", "secrets", "services", "configmaps", "serviceaccounts"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"apps"},
-			Resources: []string{"deployments", "statefulsets", "daemonsets"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"batch"},
-			Resources: []string{"cronjobs"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"policy"},
-			Resources: []string{"poddisruptionbudgets"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"elasticsearch.k8s.elastic.co"},
-			Resources: []string{"elasticsearches", "elasticsearches/status", "elasticsearches/finalizers", "enterpriselicenses", "enterpriselicenses/status"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"autoscaling.k8s.elastic.co"},
-			Resources: []string{"elasticsearchautoscalers", "elasticsearchautoscalers/status", "elasticsearchautoscalers/finalizers"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"kibana.k8s.elastic.co"},
-			Resources: []string{"kibanas", "kibanas/status", "kibanas/finalizers"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"apm.k8s.elastic.co"},
-			Resources: []string{"apmservers", "apmservers/status", "apmservers/finalizers"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"enterprisesearch.k8s.elastic.co"},
-			Resources: []string{"enterprisesearches", "enterprisesearches/status", "enterprisesearches/finalizers"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"beat.k8s.elastic.co"},
-			Resources: []string{"beats", "beats/status", "beats/finalizers"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"agent.k8s.elastic.co"},
-			Resources: []string{"agents", "agents/status", "agents/finalizers"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"maps.k8s.elastic.co"},
-			Resources: []string{"elasticmapsservers", "elasticmapsservers/status", "elasticmapsservers/finalizers"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"stackconfigpolicy.k8s.elastic.co"},
-			Resources: []string{"stackconfigpolicies", "stackconfigpolicies/status", "stackconfigpolicies/finalizers"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"associations.k8s.elastic.co"},
-			Resources: []string{"apmserverelasticsearchassociations", "apmserverelasticsearchassociations/status"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-		{
-			APIGroups: []string{"autoscaling.k8s.elastic.co"},
-			Resources: []string{"elasticsearchautoscalers", "elasticsearchautoscalers/status", "elasticsearchautoscalers/finalizers"},
-			Verbs:     []string{"get", "list", "watch", "create", "update", "patch", "delete"},
-		},
-	}
-
-	if es.cfg.UsePSP {
-		// Allow access to the pod security policy in case this is enforced on the cluster
-		rules = append(rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
-			Verbs:         []string{"use"},
-			ResourceNames: []string{ECKOperatorName},
-		})
-	}
-
-	return &rbacv1.ClusterRole{
-		TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "elastic-operator",
-		},
-		Rules: rules,
-	}
-}
-
-func (es elasticsearchComponent) eckOperatorClusterRoleBinding() *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: ECKOperatorName,
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     ECKOperatorName,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      "elastic-operator",
-				Namespace: ECKOperatorNamespace,
-			},
-		},
-	}
-}
-
-func (es elasticsearchComponent) eckOperatorClusterAdminClusterRoleBinding() *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "elastic-operator-docker-enterprise",
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     "cluster-admin",
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      "elastic-operator",
-				Namespace: ECKOperatorNamespace,
-			},
-		},
-	}
-}
-
-func (es elasticsearchComponent) eckOperatorServiceAccount() *corev1.ServiceAccount {
-	return &corev1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ECKOperatorName,
-			Namespace: ECKOperatorNamespace,
-		},
-	}
-}
-
-func (es elasticsearchComponent) eckOperatorStatefulSet() *appsv1.StatefulSet {
-	gracePeriod := int64(10)
-	memoryLimit := resource.Quantity{}
-	memoryRequest := resource.Quantity{}
-	for _, c := range es.cfg.LogStorage.Spec.ComponentResources {
-		if c.ComponentName == operatorv1.ComponentNameECKOperator {
-			memoryLimit = c.ResourceRequirements.Limits[corev1.ResourceMemory]
-			memoryRequest = c.ResourceRequirements.Requests[corev1.ResourceMemory]
-		}
-	}
-	s := &appsv1.StatefulSet{
-		TypeMeta: metav1.TypeMeta{Kind: "StatefulSet", APIVersion: "apps/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ECKOperatorName,
-			Namespace: ECKOperatorNamespace,
-			Labels: map[string]string{
-				"control-plane": "elastic-operator",
-				"k8s-app":       "elastic-operator",
-			},
-		},
-		Spec: appsv1.StatefulSetSpec{
-			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{
-					"control-plane": "elastic-operator",
-					"k8s-app":       "elastic-operator",
-				},
-			},
-			ServiceName: ECKOperatorName,
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"control-plane": "elastic-operator",
-						"k8s-app":       "elastic-operator",
-					},
-					Annotations: map[string]string{
-						// Rename the fields "error" to "error.message" and "source" to "event.source"
-						// This is to avoid a conflict with the ECS "error" and "source" documents.
-						"co.elastic.logs/raw": "[{\"type\":\"container\",\"json.keys_under_root\":true,\"paths\":[\"/var/log/containers/*${data.kubernetes.container.id}.log\"],\"processors\":[{\"convert\":{\"mode\":\"rename\",\"ignore_missing\":true,\"fields\":[{\"from\":\"error\",\"to\":\"_error\"}]}},{\"convert\":{\"mode\":\"rename\",\"ignore_missing\":true,\"fields\":[{\"from\":\"_error\",\"to\":\"error.message\"}]}},{\"convert\":{\"mode\":\"rename\",\"ignore_missing\":true,\"fields\":[{\"from\":\"source\",\"to\":\"_source\"}]}},{\"convert\":{\"mode\":\"rename\",\"ignore_missing\":true,\"fields\":[{\"from\":\"_source\",\"to\":\"event.source\"}]}}]}]",
-					},
-				},
-				Spec: corev1.PodSpec{
-					DNSPolicy:          corev1.DNSClusterFirst,
-					ServiceAccountName: "elastic-operator",
-					ImagePullSecrets:   secret.GetReferenceList(es.cfg.PullSecrets),
-					HostNetwork:        false,
-					NodeSelector:       es.cfg.Installation.ControlPlaneNodeSelector,
-					Tolerations:        es.cfg.Installation.ControlPlaneTolerations,
-					Containers: []corev1.Container{{
-						Image:           es.esOperatorImage,
-						ImagePullPolicy: ImagePullPolicy(),
-						Name:            "manager",
-						// Verbosity level of logs. -2=Error, -1=Warn, 0=Info, 0 and above=Debug
-						Args: []string{
-							"manager",
-							"--namespaces=tigera-elasticsearch,tigera-kibana",
-							"--log-verbosity=0",
-							"--metrics-port=0",
-							"--container-registry=" + es.cfg.Installation.Registry,
-							"--max-concurrent-reconciles=3",
-							"--ca-cert-validity=8760h",
-							"--ca-cert-rotate-before=24h",
-							"--cert-validity=8760h",
-							"--cert-rotate-before=24h",
-							"--enable-webhook=false",
-							"--manage-webhook-certs=false",
-						},
-						Env: []corev1.EnvVar{
-							{
-								Name: "OPERATOR_NAMESPACE",
-								ValueFrom: &corev1.EnvVarSource{
-									FieldRef: &corev1.ObjectFieldSelector{
-										FieldPath: "metadata.namespace",
-									},
-								},
-							},
-							{Name: "OPERATOR_IMAGE", Value: es.esOperatorImage},
-						},
-						Resources: corev1.ResourceRequirements{
-							Limits: corev1.ResourceList{
-								"cpu":    resource.MustParse("1"),
-								"memory": memoryLimit,
-							},
-							Requests: corev1.ResourceList{
-								"cpu":    resource.MustParse("100m"),
-								"memory": memoryRequest,
-							},
-						},
-						SecurityContext: securitycontext.NewNonRootContext(),
-					}},
-					TerminationGracePeriodSeconds: &gracePeriod,
-				},
-			},
-		},
-	}
-	if es.cfg.LogStorage != nil {
-		if overrides := es.cfg.LogStorage.Spec.ECKOperatorStatefulSet; overrides != nil {
-			rcomponents.ApplyStatefulSetOverrides(s, overrides)
-		}
-	}
-	return s
-}
-
-func (es elasticsearchComponent) eckOperatorPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(ECKOperatorName)
-}
-
-func (es elasticsearchComponent) kibanaServiceAccount() *corev1.ServiceAccount {
-	return &corev1.ServiceAccount{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      KibanaObjectName,
-			Namespace: KibanaNamespace,
-		},
-	}
-}
-
-func (es elasticsearchComponent) kibanaCR() *kbv1.Kibana {
-	server := map[string]interface{}{
-		"basePath":        fmt.Sprintf("/%s", KibanaBasePath),
-		"rewriteBasePath": true,
-		"defaultRoute":    fmt.Sprintf(KibanaDefaultRoute, TimeFilter, url.PathEscape(FlowsDashboardName)),
-	}
-
-	if es.cfg.BaseURL != "" {
-		server["publicBaseUrl"] = fmt.Sprintf("%s/%s", es.cfg.BaseURL, KibanaBasePath)
-	}
-
-	config := map[string]interface{}{
-		"elasticsearch.ssl.certificateAuthorities": []string{"/usr/share/kibana/config/elasticsearch-certs/tls.crt"},
-		"server":                             server,
-		"xpack.security.session.lifespan":    "8h",
-		"xpack.security.session.idleTimeout": "30m",
-		"tigera": map[string]interface{}{
-			"enabled":        true,
-			"licenseEdition": "enterpriseEdition",
-		},
-		// Telemetry is unwanted for the majority of our customers and if enabled can cause blocked flows. This flag
-		// can still be overwritten in the Kibana Settings if the user desires it.
-		"telemetry.optIn": false,
-	}
-
-	var initContainers []corev1.Container
-	var volumes []corev1.Volume
-	var automountToken bool
-	var volumeMounts []corev1.VolumeMount
-	if es.cfg.Installation.CertificateManagement != nil {
-		config["elasticsearch.ssl.certificateAuthorities"] = []string{"/mnt/elastic-internal/http-certs/ca.crt"}
-		automountToken = true
-		csrInitContainer := certificatemanagement.CreateCSRInitContainer(
-			es.cfg.Installation.CertificateManagement,
-			csrVolumeNameHTTP,
-			es.csrImage,
-			csrVolumeNameHTTP,
-			ElasticsearchServiceName,
-			corev1.TLSPrivateKeyKey,
-			corev1.TLSCertKey,
-			dns.GetServiceDNSNames(KibanaServiceName, KibanaNamespace, es.cfg.ClusterDomain),
-			KibanaNamespace)
-
-		initContainers = append(initContainers, csrInitContainer)
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      csrVolumeNameHTTP,
-			MountPath: "/mnt/elastic-internal/http-certs/",
-		})
-		volumes = append(volumes,
-			corev1.Volume{
-				Name: csrVolumeNameHTTP,
-				VolumeSource: corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
-				},
-			},
-			// Volume where we place the ca cert.
-			corev1.Volume{
-				Name: caVolumeName,
-				VolumeSource: corev1.VolumeSource{
-					EmptyDir: &corev1.EmptyDirVolumeSource{},
-				},
-			})
-	}
-
-	count := int32(1)
-	if es.cfg.Installation.ControlPlaneReplicas != nil {
-		count = *es.cfg.Installation.ControlPlaneReplicas
-	}
-
-	kibana := &kbv1.Kibana{
-		TypeMeta: metav1.TypeMeta{Kind: "Kibana", APIVersion: "kibana.k8s.elastic.co/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      KibanaName,
-			Namespace: KibanaNamespace,
-			Labels: map[string]string{
-				"k8s-app": KibanaName,
-			},
-		},
-		Spec: kbv1.KibanaSpec{
-			Version: components.ComponentEckKibana.Version,
-			Image:   es.kibanaImage,
-			Config: &cmnv1.Config{
-				Data: config,
-			},
-			Count: count,
-			HTTP: cmnv1.HTTPConfig{
-				TLS: cmnv1.TLSOptions{
-					Certificate: cmnv1.SecretRef{
-						SecretName: TigeraKibanaCertSecret,
-					},
-				},
-			},
-			ElasticsearchRef: cmnv1.ObjectSelector{
-				Name:      ElasticsearchName,
-				Namespace: ElasticsearchNamespace,
-			},
-			PodTemplate: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: KibanaNamespace,
-					Annotations: map[string]string{
-						KibanaTLSAnnotationHash: rmeta.SecretsAnnotationHash(es.kibanaSecrets...),
-					},
-					Labels: map[string]string{
-						"name":    KibanaName,
-						"k8s-app": KibanaName,
-					},
-				},
-				Spec: corev1.PodSpec{
-					ImagePullSecrets:             secret.GetReferenceList(es.cfg.PullSecrets),
-					ServiceAccountName:           KibanaObjectName,
-					NodeSelector:                 es.cfg.Installation.ControlPlaneNodeSelector,
-					Tolerations:                  es.cfg.Installation.ControlPlaneTolerations,
-					InitContainers:               initContainers,
-					AutomountServiceAccountToken: &automountToken,
-					Containers: []corev1.Container{{
-						Name: "kibana",
-						ReadinessProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{
-								HTTPGet: &corev1.HTTPGetAction{
-									Path: fmt.Sprintf("/%s/login", KibanaBasePath),
-									Port: intstr.IntOrString{
-										IntVal: KibanaPort,
-									},
-									Scheme: corev1.URISchemeHTTPS,
-								},
-							},
-						},
-						SecurityContext: securitycontext.NewNonRootContext(),
-						VolumeMounts:    volumeMounts,
-					}},
-					Volumes: volumes,
-				},
-			},
-		},
-	}
-
-	if es.cfg.Installation.ControlPlaneReplicas != nil && *es.cfg.Installation.ControlPlaneReplicas > 1 {
-		kibana.Spec.PodTemplate.Spec.Affinity = podaffinity.NewPodAntiAffinity(KibanaName, KibanaNamespace)
-	}
-
-	if es.cfg.LogStorage != nil {
-		if overrides := es.cfg.LogStorage.Spec.Kibana; overrides != nil {
-			rcomponents.ApplyKibanaOverrides(kibana, overrides)
-		}
-	}
-
-	return kibana
-}
-
 // This is a list of components that belong to Curator which has been decommissioned since it is no longer supported
 // in Elasticsearch beyond version 8. We want to be able to clean up these resources if they exist in the cluster on upgrade.
-func (es elasticsearchComponent) curatorDecommissionedResources() []client.Object {
+func (es *elasticsearchComponent) curatorDecommissionedResources() []client.Object {
 	resources := []client.Object{
 		&batchv1.CronJob{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1441,52 +805,27 @@ func (es elasticsearchComponent) curatorDecommissionedResources() []client.Objec
 		},
 	}
 
-	if es.cfg.UsePSP {
-		resources = append(resources, &policyv1beta1.PodSecurityPolicy{
-			ObjectMeta: metav1.ObjectMeta{
-				Name: ESCuratorName,
-			},
-		})
-
-	}
-
 	return resources
 }
 
-// Applying this in the eck namespace will start a trial license for enterprise features.
-func (es elasticsearchComponent) elasticEnterpriseTrial() *corev1.Secret {
-	return &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ECKEnterpriseTrial,
-			Namespace: ECKOperatorNamespace,
-			Labels: map[string]string{
-				"license.k8s.elastic.co/type": "enterprise-trial",
-			},
-			Annotations: map[string]string{
-				"elastic.co/eula": "accepted",
-			},
-		},
-	}
-}
-
-func (es elasticsearchComponent) elasticsearchClusterRole() *rbacv1.ClusterRole {
+func (es *elasticsearchComponent) elasticsearchClusterRole() *rbacv1.ClusterRole {
 	return &rbacv1.ClusterRole{
+		TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name: ElasticsearchObjectName,
 		},
 		Rules: []rbacv1.PolicyRule{
 			{
-				// Allow access to the pod security policy in case this is enforced on the cluster
-				APIGroups:     []string{"policy"},
-				Resources:     []string{"podsecuritypolicies"},
+				APIGroups:     []string{"security.openshift.io"},
+				Resources:     []string{"securitycontextconstraints"},
 				Verbs:         []string{"use"},
-				ResourceNames: []string{ElasticsearchObjectName},
+				ResourceNames: []string{securitycontextconstraints.Privileged},
 			},
 		},
 	}
 }
 
-func (es elasticsearchComponent) elasticsearchClusterRoleBinding() *rbacv1.ClusterRoleBinding {
+func (es *elasticsearchComponent) elasticsearchClusterRoleBinding() *rbacv1.ClusterRoleBinding {
 	return &rbacv1.ClusterRoleBinding{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: ElasticsearchObjectName,
@@ -1506,62 +845,7 @@ func (es elasticsearchComponent) elasticsearchClusterRoleBinding() *rbacv1.Clust
 	}
 }
 
-func (es elasticsearchComponent) elasticsearchPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	psp := podsecuritypolicy.NewBasePolicy(ElasticsearchObjectName)
-	psp.Spec.Privileged = true
-	psp.Spec.AllowPrivilegeEscalation = ptr.BoolToPtr(true)
-	psp.Spec.RequiredDropCapabilities = nil
-	psp.Spec.AllowedCapabilities = []corev1.Capability{
-		"SETGID",
-		"SETUID",
-		"SYS_CHROOT",
-	}
-	psp.Spec.RunAsUser.Rule = policyv1beta1.RunAsUserStrategyRunAsAny
-	return psp
-}
-
-func (es elasticsearchComponent) kibanaClusterRole() *rbacv1.ClusterRole {
-	return &rbacv1.ClusterRole{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: KibanaObjectName,
-		},
-		Rules: []rbacv1.PolicyRule{
-			{
-				// Allow access to the pod security policy in case this is enforced on the cluster
-				APIGroups:     []string{"policy"},
-				Resources:     []string{"podsecuritypolicies"},
-				Verbs:         []string{"use"},
-				ResourceNames: []string{KibanaObjectName},
-			},
-		},
-	}
-}
-
-func (es elasticsearchComponent) kibanaClusterRoleBinding() *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: KibanaObjectName,
-		},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: "rbac.authorization.k8s.io",
-			Kind:     "ClusterRole",
-			Name:     KibanaObjectName,
-		},
-		Subjects: []rbacv1.Subject{
-			{
-				Kind:      "ServiceAccount",
-				Name:      KibanaObjectName,
-				Namespace: KibanaNamespace,
-			},
-		},
-	}
-}
-
-func (es elasticsearchComponent) kibanaPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(KibanaObjectName)
-}
-
-func (es elasticsearchComponent) oidcUserRole() client.Object {
+func (es *elasticsearchComponent) oidcUserRole() client.Object {
 	return &rbacv1.Role{
 		TypeMeta: metav1.TypeMeta{Kind: "Role", APIVersion: "rbac.authorization.k8s.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -1585,7 +869,7 @@ func (es elasticsearchComponent) oidcUserRole() client.Object {
 	}
 }
 
-func (es elasticsearchComponent) oidcUserRoleBinding() client.Object {
+func (es *elasticsearchComponent) oidcUserRoleBinding() client.Object {
 	return &rbacv1.RoleBinding{
 		TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -1607,43 +891,10 @@ func (es elasticsearchComponent) oidcUserRoleBinding() client.Object {
 	}
 }
 
-// Allow the elastic-operator to communicate with API server, DNS and elastic search.
-func (es *elasticsearchComponent) eckOperatorAllowTigeraPolicy() *v3.NetworkPolicy {
-	egressRules := []v3.Rule{}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, es.cfg.Provider == operatorv1.ProviderOpenShift)
-	egressRules = append(egressRules, []v3.Rule{
-		{
-			Action:      v3.Allow,
-			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.KubeAPIServerEntityRule,
-		},
-		{
-			Action:      v3.Allow,
-			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: ElasticsearchEntityRule,
-		},
-	}...)
-
-	return &v3.NetworkPolicy{
-		TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      ECKOperatorPolicyName,
-			Namespace: ECKOperatorNamespace,
-		},
-		Spec: v3.NetworkPolicySpec{
-			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
-			Selector: networkpolicy.KubernetesAppSelector(ECKOperatorName),
-			Types:    []v3.PolicyType{v3.PolicyTypeEgress},
-			Egress:   egressRules,
-		},
-	}
-}
-
 // Allow access to Elasticsearch client nodes from Kibana, ECK Operator and ES Gateway.
 func (es *elasticsearchComponent) elasticsearchAllowTigeraPolicy() *v3.NetworkPolicy {
 	egressRules := []v3.Rule{}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, es.cfg.Provider == operatorv1.ProviderOpenShift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, es.cfg.Provider.IsOpenShift())
 	egressRules = append(egressRules, []v3.Rule{
 		{
 			Action:      v3.Allow,
@@ -1685,7 +936,7 @@ func (es *elasticsearchComponent) elasticsearchAllowTigeraPolicy() *v3.NetworkPo
 				{
 					Action:      v3.Allow,
 					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      KibanaSourceEntityRule,
+					Source:      SourceKibanaEntityRule,
 					Destination: elasticSearchIngressDestinationEntityRule,
 				},
 				{
@@ -1754,85 +1005,77 @@ func (es *elasticsearchComponent) elasticsearchInternalAllowTigeraPolicy() *v3.N
 	}
 }
 
-// Allow access to Kibana
-func (es *elasticsearchComponent) kibanaAllowTigeraPolicy() *v3.NetworkPolicy {
-	egressRules := []v3.Rule{
-		{
-			Action:      v3.Allow,
-			Protocol:    &networkpolicy.TCPProtocol,
-			Source:      v3.EntityRule{},
-			Destination: ElasticsearchEntityRule,
-		},
-	}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, es.cfg.Provider == operatorv1.ProviderOpenShift)
-	egressRules = append(egressRules, []v3.Rule{
-		{
-			Action:      v3.Allow,
-			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.KubeAPIServerServiceSelectorEntityRule,
-		},
-		{
-			Action:      v3.Allow,
-			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.DefaultHelper().ESGatewayEntityRule(),
-		},
-	}...)
+func (es *elasticsearchComponent) elasticsearchRolesAndBindings() ([]*rbacv1.Role, []*rbacv1.RoleBinding) {
 
-	kibanaPortIngressDestination := v3.EntityRule{
-		Ports: networkpolicy.Ports(KibanaPort),
-	}
-	return &v3.NetworkPolicy{
-		TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},
+	secretsRole := &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      KibanaPolicyName,
-			Namespace: KibanaNamespace,
+			Name:      CalicoKubeControllerSecret,
+			Namespace: ElasticsearchNamespace,
 		},
-		Spec: v3.NetworkPolicySpec{
-			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
-			Selector: networkpolicy.KubernetesAppSelector(KibanaName),
-			Types:    []v3.PolicyType{v3.PolicyTypeIngress, v3.PolicyTypeEgress},
-			Ingress: []v3.Rule{
-				{
-					Action:   v3.Allow,
-					Protocol: &networkpolicy.TCPProtocol,
-					Source: v3.EntityRule{
-						// This policy allows access to Kibana from anywhere.
-						Nets: []string{"0.0.0.0/0"},
-					},
-					Destination: kibanaPortIngressDestination,
-				},
-				{
-					Action:   v3.Allow,
-					Protocol: &networkpolicy.TCPProtocol,
-					Source: v3.EntityRule{
-						// This policy allows access to Kibana from anywhere.
-						Nets: []string{"::/0"},
-					},
-					Destination: kibanaPortIngressDestination,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      networkpolicy.DefaultHelper().ESGatewaySourceEntityRule(),
-					Destination: kibanaPortIngressDestination,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      networkpolicy.DefaultHelper().DashboardInstallerSourceEntityRule(),
-					Destination: kibanaPortIngressDestination,
-				},
-				{
-					Action:      v3.Allow,
-					Protocol:    &networkpolicy.TCPProtocol,
-					Source:      ECKOperatorSourceEntityRule,
-					Destination: kibanaPortIngressDestination,
-				},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"secrets"},
+				Verbs:     []string{"create", "delete", "deletecollection", "get", "list", "update", "watch"},
 			},
-			Egress: egressRules,
 		},
 	}
+
+	operatorSecretsRole := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      CalicoKubeControllerSecret,
+			Namespace: common.OperatorNamespace(),
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"secrets"},
+				Verbs:     []string{"create", "delete", "deletecollection", "get", "list", "update", "watch"},
+			},
+		},
+	}
+
+	secretBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      CalicoKubeControllerSecret,
+			Namespace: ElasticsearchNamespace,
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     CalicoKubeControllerSecret,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      "calico-kube-controllers",
+				Namespace: common.CalicoNamespace,
+			},
+		},
+	}
+
+	// Bind the secrets permission to the operator namespace. This binding now adds permissions for kube controllers to manipulate
+	// secrets in the tigera-operator namespace
+	operatorSecretBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      CalicoKubeControllerSecret,
+			Namespace: common.OperatorNamespace(),
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     CalicoKubeControllerSecret,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      "calico-kube-controllers",
+				Namespace: common.CalicoNamespace,
+			},
+		},
+	}
+
+	return []*rbacv1.Role{secretsRole, operatorSecretsRole}, []*rbacv1.RoleBinding{secretBinding, operatorSecretBinding}
 }
 
 // overrideResourceRequirements replaces individual ResourceRequirements field's default value with user's value.
@@ -1872,7 +1115,7 @@ func overrideResourceRequirements(defaultReq corev1.ResourceRequirements, userOv
 // - If user provided both Limits and Requests, use them
 // - If user has provided just Limits, and Limits is <= default Requests, set Requests value as user's Limits value.
 // We don not set default Limits for storage, so don't have to handle case where user has set only Requests.
-func overridePvcRequirements(defaultReq corev1.ResourceRequirements, userOverrides corev1.ResourceRequirements) corev1.ResourceRequirements {
+func overridePvcRequirements(defaultReq corev1.VolumeResourceRequirements, userOverrides corev1.ResourceRequirements) corev1.VolumeResourceRequirements {
 	updatedReq := defaultReq
 	if _, ok := userOverrides.Limits["storage"]; ok {
 		updatedReq.Limits = corev1.ResourceList{
@@ -1931,18 +1174,33 @@ func (m *managedClusterLogStorage) Objects() (objsToCreate []client.Object, objs
 	// ManagedClusters simply need the namespace, role, and binding created so that Linseed in the management cluster has permissions
 	// to create token secrets in the managed cluster.
 	toCreate := []client.Object{}
-	roles, bindings := m.linseedExternalRolesAndBindings()
+	roles, bindings, clusterRB := m.linseedExternalRolesAndBindings()
 	toCreate = append(toCreate,
-		CreateNamespace(ElasticsearchNamespace, m.cfg.Installation.KubernetesProvider, PSSPrivileged),
+		CreateNamespace(ElasticsearchNamespace, m.cfg.Installation.KubernetesProvider, PSSPrivileged, m.cfg.Installation.Azure),
 		m.elasticsearchExternalService(),
 		m.linseedExternalService(),
+		CreateOperatorSecretsRoleBinding(ElasticsearchNamespace),
 	)
+
 	for _, r := range roles {
 		toCreate = append(toCreate, r)
 	}
 	for _, b := range bindings {
 		toCreate = append(toCreate, b)
 	}
+
+	for _, crb := range clusterRB {
+		toCreate = append(toCreate, crb)
+	}
+
+	kcRoles, kcBindings := m.kubeControllersRolesAndBindings()
+	for _, role := range kcRoles {
+		toCreate = append(toCreate, role)
+	}
+	for _, binding := range kcBindings {
+		toCreate = append(toCreate, binding)
+	}
+
 	return toCreate, nil
 }
 
@@ -1984,7 +1242,7 @@ func (m *managedClusterLogStorage) elasticsearchExternalService() *corev1.Servic
 
 // In managed clusters we need to provision roles and bindings for linseed to provide permissions
 // to get configmaps and manipulate secrets
-func (m managedClusterLogStorage) linseedExternalRolesAndBindings() ([]*rbacv1.ClusterRole, []*rbacv1.RoleBinding) {
+func (m managedClusterLogStorage) linseedExternalRolesAndBindings() ([]*rbacv1.ClusterRole, []*rbacv1.RoleBinding, []*rbacv1.ClusterRoleBinding) {
 	// Create separate ClusterRoles for necessary configmap and secret operations, then bind them to the namespaces
 	// where they are required so that we're only granting exactly which permissions we need in the namespaces in which
 	// they're required. Other controllers may also bind this cluster role to their own namespace if they require
@@ -1998,6 +1256,21 @@ func (m managedClusterLogStorage) linseedExternalRolesAndBindings() ([]*rbacv1.C
 				APIGroups: []string{""},
 				Resources: []string{"secrets"},
 				Verbs:     []string{"create", "update", "get", "list"},
+			},
+		},
+	}
+
+	// This permission allows Linseed to watch for namespace creation and existence in the managed cluster
+	// before attempting to copy the Linseed token into those namespaces.
+	namespacesRole := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "tigera-linseed-namespaces",
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"namespaces"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 		},
 	}
@@ -2058,5 +1331,67 @@ func (m managedClusterLogStorage) linseedExternalRolesAndBindings() ([]*rbacv1.C
 		},
 	}
 
-	return []*rbacv1.ClusterRole{secretsRole, configMapsRole}, []*rbacv1.RoleBinding{configMapBinding, secretBinding}
+	namespacesBinding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "tigera-linseed",
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     "tigera-linseed-namespaces",
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      "tigera-linseed",
+				Namespace: ElasticsearchNamespace,
+			},
+		},
+	}
+
+	return []*rbacv1.ClusterRole{secretsRole, configMapsRole, namespacesRole}, []*rbacv1.RoleBinding{configMapBinding, secretBinding}, []*rbacv1.ClusterRoleBinding{namespacesBinding}
+}
+
+// In managed clusters we need to provision roles and bindings for kubecontrollers to provide permissions
+// to manipulate secrets
+func (m managedClusterLogStorage) kubeControllersRolesAndBindings() ([]*rbacv1.Role, []*rbacv1.RoleBinding) {
+
+	// Create Role and Binding to the operator namespace for kubecontroller to manipulate the needed secrets.
+	operatorSecretsRole := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      CalicoKubeControllerSecret,
+			Namespace: common.OperatorNamespace(),
+		},
+		Rules: []rbacv1.PolicyRule{
+			{
+				APIGroups: []string{""},
+				Resources: []string{"secrets"},
+				Verbs:     []string{"create", "delete", "deletecollection", "get", "list", "update", "watch"},
+			},
+		},
+	}
+
+	// Bind the secrets permission to the operator namespace. This binding now adds permissions for kube controllers to create
+	// its public cert secret in the tigera-operator namespace
+	operatorSecretBinding := &rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      CalicoKubeControllerSecret,
+			Namespace: common.OperatorNamespace(),
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "Role",
+			Name:     CalicoKubeControllerSecret,
+		},
+		Subjects: []rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      "calico-kube-controllers",
+				Namespace: common.CalicoNamespace,
+			},
+		},
+	}
+
+	return []*rbacv1.Role{operatorSecretsRole}, []*rbacv1.RoleBinding{operatorSecretBinding}
+
 }

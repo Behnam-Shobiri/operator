@@ -17,8 +17,6 @@ package dpi
 import (
 	"fmt"
 
-	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
-	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -27,25 +25,31 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/render"
+	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	"github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
+	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
 
 const (
-	DeepPacketInspectionNamespace       = "tigera-dpi"
-	DeepPacketInspectionName            = "tigera-dpi"
-	DeepPacketInspectionPolicyName      = networkpolicy.TigeraComponentPolicyPrefix + DeepPacketInspectionName
-	DefaultMemoryLimit                  = "1Gi"
-	DefaultMemoryRequest                = "100Mi"
-	DefaultCPULimit                     = "1"
-	DefaultCPURequest                   = "100m"
-	DeepPacketInspectionLinseedRBACName = "tigera-dpi-linseed-permissions"
+	DeepPacketInspectionNamespace            = "tigera-dpi"
+	DeepPacketInspectionName                 = "tigera-dpi"
+	DeepPacketInspectionPolicyName           = networkpolicy.TigeraComponentPolicyPrefix + DeepPacketInspectionName
+	DefaultMemoryLimit                       = "1Gi"
+	DefaultMemoryRequest                     = "100Mi"
+	DefaultCPULimit                          = "1"
+	DefaultCPURequest                        = "100m"
+	DeepPacketInspectionLinseedRBACName      = "tigera-dpi-linseed-permissions"
+	DeepPacketInspectionSnortRulesVolumeName = "snort-cache"
+	DeepPacketInspectionSnortRulesVolumePath = "/usr/etc/snort/rules"
 )
 
 type DPIConfig struct {
@@ -53,13 +57,15 @@ type DPIConfig struct {
 	Installation       *operatorv1.InstallationSpec
 	TyphaNodeTLS       *render.TyphaNodeTLS
 	PullSecrets        []*corev1.Secret
-	Openshift          bool
+	OpenShift          bool
 	ManagedCluster     bool
 	ManagementCluster  bool
 	HasNoLicense       bool
 	HasNoDPIResource   bool
 	ClusterDomain      string
 	DPICertSecret      certificatemanagement.KeyPairInterface
+
+	Tenant *operatorv1.Tenant
 }
 
 func DPI(cfg *DPIConfig) render.Component {
@@ -87,10 +93,22 @@ func (d *dpiComponent) ResolveImages(is *operatorv1.ImageSet) error {
 
 func (d *dpiComponent) Objects() (objsToCreate, objsToDelete []client.Object) {
 	var toCreate, toDelete []client.Object
+	if d.cfg.Tenant.MultiTenant() {
+		// We need to create the RBAC needed to allow managed cluster
+		// to push data via Linseed. Since DPI does not get deployed in the
+		// multi-tenant management cluster, Linseed token is created to match
+		// the canonical namespace. The ClusterRoleBinding will use the
+		// canonical service account.
+		toCreate = append(toCreate, d.dpiLinseedAccessClusterRole())
+		toCreate = append(toCreate, d.dpiLinseedAccessClusterRoleBinding())
+		return toCreate, toDelete
+	}
+
 	if d.cfg.HasNoLicense {
-		toDelete = append(toDelete, render.CreateNamespace(DeepPacketInspectionNamespace, d.cfg.Installation.KubernetesProvider, render.PSSPrivileged))
+		toDelete = append(toDelete, render.CreateNamespace(DeepPacketInspectionNamespace, d.cfg.Installation.KubernetesProvider, render.PSSPrivileged, d.cfg.Installation.Azure))
 	} else {
-		toCreate = append(toCreate, render.CreateNamespace(DeepPacketInspectionNamespace, d.cfg.Installation.KubernetesProvider, render.PSSPrivileged))
+		toCreate = append(toCreate, render.CreateNamespace(DeepPacketInspectionNamespace, d.cfg.Installation.KubernetesProvider, render.PSSPrivileged, d.cfg.Installation.Azure))
+		toCreate = append(toCreate, render.CreateOperatorSecretsRoleBinding(DeepPacketInspectionNamespace))
 	}
 
 	// This secret is deprecated in this namespace and should be removed in upgrade scenarios
@@ -165,6 +183,25 @@ func (d *dpiComponent) dpiDaemonset() *appsv1.DaemonSet {
 	if d.cfg.TyphaNodeTLS.NodeSecret.UseCertificateManagement() {
 		initContainers = append(initContainers, d.cfg.TyphaNodeTLS.NodeSecret.InitContainer(DeepPacketInspectionNamespace))
 	}
+	if d.dpiInitContainers() {
+		for _, initContainer := range d.cfg.IntrusionDetection.Spec.DeepPacketInspectionDaemonset.Spec.Template.Spec.InitContainers {
+			container := corev1.Container{
+				Name:            initContainer.Name,
+				Image:           initContainer.Image,
+				ImagePullPolicy: render.ImagePullPolicy(),
+				VolumeMounts: []corev1.VolumeMount{
+					{
+						Name:      DeepPacketInspectionSnortRulesVolumeName,
+						MountPath: DeepPacketInspectionSnortRulesVolumePath,
+					},
+				},
+			}
+			if initContainer.Resources != nil {
+				container.Resources = *initContainer.Resources
+			}
+			initContainers = append(initContainers, container)
+		}
+	}
 
 	podTemplate := &corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
@@ -196,7 +233,7 @@ func (d *dpiComponent) dpiDaemonset() *appsv1.DaemonSet {
 }
 
 func (d *dpiComponent) dpiContainer() corev1.Container {
-	sc := securitycontext.NewRootContext(d.cfg.Openshift)
+	sc := securitycontext.NewRootContext(d.cfg.OpenShift)
 	sc.Capabilities.Add = []corev1.Capability{
 		"NET_ADMIN",
 		"NET_RAW",
@@ -247,6 +284,19 @@ func (d *dpiComponent) dpiVolumes() []corev1.Volume {
 			})
 	}
 
+	if d.dpiInitContainers() {
+		// if DPI init container is present we must include the empty dir volume
+		// the volume is used to store customer's Snort rule files.
+		volumes = append(volumes,
+			corev1.Volume{
+				Name: DeepPacketInspectionSnortRulesVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			},
+		)
+	}
+
 	return volumes
 }
 
@@ -266,7 +316,6 @@ func (d *dpiComponent) dpiEnvVars() []corev1.EnvVar {
 		{Name: "LINSEED_CLIENT_CERT", Value: d.cfg.DPICertSecret.VolumeMountCertificateFilePath()},
 		{Name: "LINSEED_CLIENT_KEY", Value: d.cfg.DPICertSecret.VolumeMountKeyFilePath()},
 		{Name: "LINSEED_TOKEN", Value: render.GetLinseedTokenPath(d.cfg.ManagedCluster)},
-		{Name: "FIPS_MODE_ENABLED", Value: operatorv1.IsFIPSModeEnabledString(d.cfg.Installation.FIPSMode)},
 	}
 
 	// We need at least the CN or URISAN set, we depend on the validation
@@ -294,6 +343,18 @@ func (d *dpiComponent) dpiVolumeMounts() []corev1.VolumeMount {
 				MountPath: render.LinseedVolumeMountPath,
 			})
 	}
+	if d.dpiInitContainers() {
+		// if DPI init container is present we must include the empty dir volume
+		// the volume is used to store customer's Snort rule files.
+		// the contents of the volume is controlled by the DPI init container.
+		volumeMounts = append(volumeMounts,
+			corev1.VolumeMount{
+				Name:      DeepPacketInspectionSnortRulesVolumeName,
+				MountPath: DeepPacketInspectionSnortRulesVolumePath,
+				ReadOnly:  true,
+			},
+		)
+	}
 	return volumeMounts
 }
 
@@ -308,7 +369,7 @@ func (d *dpiComponent) dpiReadinessProbes() *corev1.Probe {
 			},
 		},
 		TimeoutSeconds:      10,
-		InitialDelaySeconds: 90,
+		InitialDelaySeconds: 10,
 	}
 }
 
@@ -397,13 +458,12 @@ func (d *dpiComponent) dpiClusterRole() *rbacv1.ClusterRole {
 			},
 		},
 	}
-	if d.cfg.Installation.KubernetesProvider != operatorv1.ProviderOpenShift {
-		// Allow access to the pod security policy in case this is enforced on the cluster
+	if d.cfg.OpenShift {
 		role.Rules = append(role.Rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{DeepPacketInspectionName},
+			ResourceNames: []string{securitycontextconstraints.Privileged},
 		})
 	}
 	return role
@@ -471,7 +531,7 @@ func (d *dpiComponent) dpiAllowTigeraPolicy() *v3.NetworkPolicy {
 			Destination: networkpolicy.KubeAPIServerServiceSelectorEntityRule,
 		},
 	}
-	egressRules = networkpolicy.AppendServiceSelectorDNSEgressRules(egressRules, d.cfg.Openshift)
+	egressRules = networkpolicy.AppendServiceSelectorDNSEgressRules(egressRules, d.cfg.OpenShift)
 
 	if d.cfg.ManagedCluster {
 		egressRules = append(egressRules, v3.Rule{
@@ -501,4 +561,18 @@ func (d *dpiComponent) dpiAllowTigeraPolicy() *v3.NetworkPolicy {
 			Egress:   egressRules,
 		},
 	}
+}
+
+func (d *dpiComponent) dpiInitContainers() bool {
+	switch {
+	case d.cfg.IntrusionDetection.Spec.DeepPacketInspectionDaemonset == nil:
+		return false
+	case d.cfg.IntrusionDetection.Spec.DeepPacketInspectionDaemonset.Spec == nil:
+		return false
+	case d.cfg.IntrusionDetection.Spec.DeepPacketInspectionDaemonset.Spec.Template == nil:
+		return false
+	case d.cfg.IntrusionDetection.Spec.DeepPacketInspectionDaemonset.Spec.Template.Spec.InitContainers == nil:
+		return false
+	}
+	return len(d.cfg.IntrusionDetection.Spec.DeepPacketInspectionDaemonset.Spec.Template.Spec.InitContainers) > 0
 }

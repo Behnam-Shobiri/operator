@@ -15,14 +15,14 @@
 package render
 
 import (
-	rmeta "github.com/tigera/operator/pkg/render/common/meta"
-	"github.com/tigera/operator/pkg/render/common/secret"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
+	rmeta "github.com/tigera/operator/pkg/render/common/meta"
+	"github.com/tigera/operator/pkg/render/common/secret"
 )
 
 func Namespaces(cfg *NamespaceConfiguration) Component {
@@ -53,7 +53,8 @@ func (c *namespaceComponent) SupportedOSType() rmeta.OSType {
 
 func (c *namespaceComponent) Objects() ([]client.Object, []client.Object) {
 	ns := []client.Object{
-		CreateNamespace(common.CalicoNamespace, c.cfg.Installation.KubernetesProvider, PSSPrivileged),
+		CreateNamespace(common.CalicoNamespace, c.cfg.Installation.KubernetesProvider, PSSPrivileged, c.cfg.Installation.Azure),
+		CreateOperatorSecretsRoleBinding(common.CalicoNamespace),
 	}
 
 	// If we're terminating, we don't want to delete the namespace right away.
@@ -62,10 +63,6 @@ func (c *namespaceComponent) Objects() ([]client.Object, []client.Object) {
 		ns = []client.Object{}
 	}
 
-	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
-		// We need to always have ns tigera-dex even when the Authentication CR is not present, so policies can be added to this namespace.
-		ns = append(ns, CreateNamespace(DexObjectName, c.cfg.Installation.KubernetesProvider, PSSRestricted))
-	}
 	if len(c.cfg.PullSecrets) > 0 {
 		ns = append(ns, secret.ToRuntimeObjects(secret.CopyToNamespace(common.CalicoNamespace, c.cfg.PullSecrets...)...)...)
 	}
@@ -89,7 +86,7 @@ const (
 	PSSRestricted = "restricted"
 )
 
-func CreateNamespace(name string, provider operatorv1.Provider, pss PodSecurityStandard) *corev1.Namespace {
+func CreateNamespace(name string, provider operatorv1.Provider, pss PodSecurityStandard, azure *operatorv1.Azure) *corev1.Namespace {
 	ns := &corev1.Namespace{
 		TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -108,10 +105,20 @@ func CreateNamespace(name string, provider operatorv1.Provider, pss PodSecurityS
 
 	switch provider {
 	case operatorv1.ProviderOpenShift:
-		ns.Labels["openshift.io/run-level"] = "0"
 		ns.Annotations["openshift.io/node-selector"] = ""
+		ns.Annotations["security.openshift.io/scc.podSecurityLabelSync"] = "false"
+		ns.Labels["openshift.io/run-level"] = "0"
 	case operatorv1.ProviderAKS:
-		ns.Labels["control-plane"] = "true"
+		if applyAzurePolicy(azure, pss) {
+			ns.Labels["control-plane"] = "true"
+		}
 	}
 	return ns
+}
+
+func applyAzurePolicy(azure *operatorv1.Azure, pss PodSecurityStandard) bool {
+	if azure == nil || azure.PolicyMode == nil || *azure.PolicyMode == operatorv1.Default {
+		return PSSPrivileged == pss
+	}
+	return false
 }

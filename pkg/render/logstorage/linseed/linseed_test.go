@@ -24,7 +24,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -79,7 +78,6 @@ var _ = Describe("Linseed rendering tests", func() {
 			{ClusterRoleName, "", &rbacv1.ClusterRoleBinding{}, nil},
 			{ServiceAccountName, render.ElasticsearchNamespace, &corev1.ServiceAccount{}, nil},
 			{DeploymentName, render.ElasticsearchNamespace, &appsv1.Deployment{}, nil},
-			{"tigera-linseed", "", &policyv1beta1.PodSecurityPolicy{}, nil},
 		}
 
 		BeforeEach(func() {
@@ -92,21 +90,34 @@ var _ = Describe("Linseed rendering tests", func() {
 			replicas = 2
 			kp, tokenKP, bundle := getTLS(installation)
 
+			// Create the ES user secret. Generally this is created by either es-kube-controllers or the user controller in this operator.
+			userSecret := &corev1.Secret{
+				TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      render.ElasticsearchLinseedUserSecret,
+					Namespace: render.ElasticsearchNamespace,
+				},
+				Data: map[string][]byte{
+					"username": []byte("test-username"),
+					"password": []byte("test-username"),
+				},
+			}
+
 			cfg = &Config{
 				Installation: installation,
 				PullSecrets: []*corev1.Secret{
 					{ObjectMeta: metav1.ObjectMeta{Name: "tigera-pull-secret"}},
 				},
-				KeyPair:         kp,
-				TokenKeyPair:    tokenKP,
-				TrustedBundle:   bundle,
-				ClusterDomain:   clusterDomain,
-				UsePSP:          true,
-				ESClusterConfig: esClusterConfig,
-				Namespace:       render.ElasticsearchNamespace,
-				BindNamespaces:  []string{render.ElasticsearchNamespace},
-				ElasticHost:     "tigera-secure-es-http.tigera-elasticsearch.svc",
-				ElasticPort:     "9200",
+				KeyPair:                        kp,
+				TokenKeyPair:                   tokenKP,
+				TrustedBundle:                  bundle,
+				ClusterDomain:                  clusterDomain,
+				ESClusterConfig:                esClusterConfig,
+				Namespace:                      render.ElasticsearchNamespace,
+				BindNamespaces:                 []string{render.ElasticsearchNamespace},
+				ElasticHost:                    "tigera-secure-es-http.tigera-elasticsearch.svc",
+				ElasticPort:                    "9200",
+				ElasticClientCredentialsSecret: userSecret,
 			}
 		})
 
@@ -150,6 +161,7 @@ var _ = Describe("Linseed rendering tests", func() {
 
 			// The deployment should have the hash annotation set, as well as a volume and volume mount for the client secret.
 			Expect(d.Spec.Template.Annotations["hash.operator.tigera.io/elastic-client-secret"]).To(Equal("ae1a6776a81bf1fc0ee4aac936a90bd61a07aea7"))
+			Expect(d.Spec.Template.Annotations[fmt.Sprintf("hash.operator.tigera.io/%s", render.ElasticsearchLinseedUserSecret)]).To(Equal("465c25d580ea36d8e7cda470a0c34afd05eae6f7"))
 			Expect(d.Spec.Template.Spec.Volumes).To(ContainElement(corev1.Volume{
 				Name: logstorage.ExternalCertsVolumeName,
 				VolumeSource: corev1.VolumeSource{
@@ -181,16 +193,35 @@ var _ = Describe("Linseed rendering tests", func() {
 			Expect(s.Data).To(Equal(cfg.ElasticClientSecret.Data))
 		})
 
-		It("should render properly when PSP is not supported by the cluster", func() {
-			cfg.UsePSP = false
+		It("should render toleration on GKE", func() {
+			cfg.Installation.KubernetesProvider = operatorv1.ProviderGKE
 			component := Linseed(cfg)
 			Expect(component.ResolveImages(nil)).To(BeNil())
 			resources, _ := component.Objects()
 
-			// Should not contain any PodSecurityPolicies
-			for _, r := range resources {
-				Expect(r.GetObjectKind().GroupVersionKind().Kind).NotTo(Equal("PodSecurityPolicy"))
-			}
+			deploy, ok := rtest.GetResource(resources, DeploymentName, render.ElasticsearchNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
+			Expect(ok).To(BeTrue(), "Deployment not found")
+			Expect(deploy.Spec.Template.Spec.Tolerations).To(ContainElements(corev1.Toleration{
+				Key:      "kubernetes.io/arch",
+				Operator: corev1.TolerationOpEqual,
+				Value:    "arm64",
+				Effect:   corev1.TaintEffectNoSchedule,
+			}))
+		})
+
+		It("should render SecurityContextConstrains properly when provider is OpenShift", func() {
+			cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
+			component := Linseed(cfg)
+			Expect(component.ResolveImages(nil)).To(BeNil())
+			resources, _ := component.Objects()
+
+			role := rtest.GetResource(resources, "tigera-linseed", "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
+			Expect(role.Rules).To(ContainElement(rbacv1.PolicyRule{
+				APIGroups:     []string{"security.openshift.io"},
+				Resources:     []string{"securitycontextconstraints"},
+				Verbs:         []string{"use"},
+				ResourceNames: []string{"nonroot-v2"},
+			}))
 		})
 
 		It("should render a Linseed deployment and all supporting resources when CertificateManagement is enabled", func() {
@@ -207,7 +238,6 @@ var _ = Describe("Linseed rendering tests", func() {
 				TokenKeyPair:    tokenKP,
 				TrustedBundle:   bundle,
 				ClusterDomain:   clusterDomain,
-				UsePSP:          true,
 				ESClusterConfig: esClusterConfig,
 				Namespace:       render.ElasticsearchNamespace,
 				BindNamespaces:  []string{render.ElasticsearchNamespace},
@@ -360,7 +390,7 @@ var _ = Describe("Linseed rendering tests", func() {
 
 			DescribeTable("should render allow-tigera policy",
 				func(scenario testutils.AllowTigeraScenario) {
-					if scenario.Openshift {
+					if scenario.OpenShift {
 						cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
 					} else {
 						cfg.Installation.KubernetesProvider = operatorv1.ProviderNone
@@ -375,37 +405,11 @@ var _ = Describe("Linseed rendering tests", func() {
 				},
 				// Linseed only renders in the presence of an LogStorage CR and absence of a ManagementClusterConnection CR, therefore
 				// does not have a config option for managed clusters.
-				Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: false}),
-				Entry("for management/standalone, kube-dns with dpi", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: false, DPIEnabled: true}),
-				Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: true}),
-				Entry("for management/standalone, openshift-dns with dpi", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: true, DPIEnabled: true}),
+				Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false}),
+				Entry("for management/standalone, kube-dns with dpi", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false, DPIEnabled: true}),
+				Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true}),
+				Entry("for management/standalone, openshift-dns with dpi", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true, DPIEnabled: true}),
 			)
-		})
-
-		It("should set the right env when FIPS mode is enabled", func() {
-			kp, tokenKP, bundle := getTLS(installation)
-			enabled := operatorv1.FIPSModeEnabled
-			installation.FIPSMode = &enabled
-			component := Linseed(&Config{
-				Installation: installation,
-				PullSecrets: []*corev1.Secret{
-					{ObjectMeta: metav1.ObjectMeta{Name: "tigera-pull-secret"}},
-				},
-				KeyPair:         kp,
-				TokenKeyPair:    tokenKP,
-				TrustedBundle:   bundle,
-				ClusterDomain:   clusterDomain,
-				ESClusterConfig: esClusterConfig,
-				Namespace:       render.ElasticsearchNamespace,
-				BindNamespaces:  []string{render.ElasticsearchNamespace},
-				ElasticHost:     "tigera-secure-es-http.tigera-elasticsearch.svc",
-				ElasticPort:     "9200",
-			})
-
-			resources, _ := component.Objects()
-			d, ok := rtest.GetResource(resources, DeploymentName, render.ElasticsearchNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
-			Expect(ok).To(BeTrue(), "Deployment not found")
-			Expect(d.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "LINSEED_FIPS_MODE_ENABLED", Value: "true"}))
 		})
 	})
 
@@ -498,7 +502,7 @@ var _ = Describe("Linseed rendering tests", func() {
 				TrustedBundle:   bundle,
 				ClusterDomain:   clusterDomain,
 				ESClusterConfig: esClusterConfig,
-				Namespace:       "tenant-test-tenant",
+				Namespace:       tenant.Namespace,
 				Tenant:          tenant,
 				ElasticHost:     "tigera-secure-es-http.tigera-elasticsearch.svc",
 				ElasticPort:     "9200",
@@ -537,20 +541,9 @@ var _ = Describe("Linseed rendering tests", func() {
 			component := Linseed(cfg)
 			Expect(component).NotTo(BeNil())
 			resources, _ := component.Objects()
-			cr := rtest.GetResource(resources, MultiTenantManagedClustersAccessClusterRoleName, "", rbacv1.GroupName, "v1", "ClusterRole").(*rbacv1.ClusterRole)
-			expectedRules := []rbacv1.PolicyRule{
-				{
-					APIGroups: []string{"projectcalico.org"},
-					Resources: []string{"managedclusters"},
-					Verbs: []string{
-						"get",
-					},
-				},
-			}
-			Expect(cr.Rules).To(ContainElements(expectedRules))
-			rb := rtest.GetResource(resources, MultiTenantManagedClustersAccessClusterRoleName, "", rbacv1.GroupName, "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
+			rb := rtest.GetResource(resources, MultiTenantManagedClustersAccessClusterRoleBindingName, tenant.Namespace, rbacv1.GroupName, "v1", "RoleBinding").(*rbacv1.RoleBinding)
 			Expect(rb.RoleRef.Kind).To(Equal("ClusterRole"))
-			Expect(rb.RoleRef.Name).To(Equal(MultiTenantManagedClustersAccessClusterRoleName))
+			Expect(rb.RoleRef.Name).To(Equal(render.MultiTenantManagedClustersAccessClusterRoleName))
 			Expect(rb.Subjects).To(ContainElements([]rbacv1.Subject{
 				{
 					Kind:      "ServiceAccount",
@@ -603,7 +596,7 @@ var _ = Describe("Linseed rendering tests", func() {
 			resources, _ := component.Objects()
 			d := rtest.GetResource(resources, DeploymentName, cfg.Namespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
 			Expect(d.Spec.Template.Spec.Affinity).NotTo(BeNil())
-			Expect(d.Spec.Template.Spec.Affinity).To(Equal(podaffinity.NewPodAntiAffinity(DeploymentName, "tenant-test-tenant")))
+			Expect(d.Spec.Template.Spec.Affinity).To(Equal(podaffinity.NewPodAntiAffinity(DeploymentName, tenant.Namespace)))
 		})
 
 		It("should override resource request with the value from TenantSpec's linseedDeployment when available", func() {
@@ -884,12 +877,6 @@ func compareResources(resources []client.Object, expectedResources []resourceTes
 			Verbs:         []string{"create"},
 		},
 		{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
-			ResourceNames: []string{"tigera-linseed"},
-			Verbs:         []string{"use"},
-		},
-		{
 			APIGroups: []string{"authentication.k8s.io"},
 			Resources: []string{"tokenreviews"},
 			Verbs:     []string{"create"},
@@ -1018,10 +1005,6 @@ func expectedContainers() []corev1.Container {
 				{
 					Name:  "LINSEED_LOG_LEVEL",
 					Value: "INFO",
-				},
-				{
-					Name:  "LINSEED_FIPS_MODE_ENABLED",
-					Value: "false",
 				},
 				{
 					Name:  "LINSEED_HTTPS_CERT",

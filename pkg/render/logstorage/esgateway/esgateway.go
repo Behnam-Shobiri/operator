@@ -18,29 +18,29 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/tigera/operator/pkg/render/common/elasticsearch"
-
-	"github.com/tigera/operator/pkg/ptr"
-
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/components"
+	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
+	rcomponents "github.com/tigera/operator/pkg/render/common/components"
+	"github.com/tigera/operator/pkg/render/common/elasticsearch"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/common/podaffinity"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 	"github.com/tigera/operator/pkg/render/logstorage/esmetrics"
+	"github.com/tigera/operator/pkg/render/logstorage/kibana"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
 
@@ -48,7 +48,6 @@ const (
 	DeploymentName        = "tigera-secure-es-gateway"
 	ServiceAccountName    = "tigera-secure-es-gateway"
 	RoleName              = "tigera-secure-es-gateway"
-	PodSecurityPolicyName = "tigera-esgateway"
 	ServiceName           = "tigera-secure-es-gateway-http"
 	PolicyName            = networkpolicy.TigeraComponentPolicyPrefix + "es-gateway-access"
 	ElasticsearchPortName = "es-gateway-elasticsearch-port"
@@ -83,9 +82,7 @@ type Config struct {
 	EsAdminUserName            string
 	Namespace                  string
 	TruthNamespace             string
-
-	// Whether the cluster supports pod security policies.
-	UsePSP bool
+	LogStorage                 *operatorv1.LogStorage
 }
 
 func (e *esGateway) ResolveImages(is *operatorv1.ImageSet) error {
@@ -106,7 +103,7 @@ func (e *esGateway) ResolveImages(is *operatorv1.ImageSet) error {
 		}
 	}
 	if len(errMsgs) != 0 {
-		return fmt.Errorf(strings.Join(errMsgs, ","))
+		return fmt.Errorf("%s", strings.Join(errMsgs, ","))
 	}
 	return nil
 }
@@ -124,9 +121,6 @@ func (e *esGateway) Objects() (toCreate, toDelete []client.Object) {
 		toCreate = append(toCreate, render.CreateCertificateSecret(e.cfg.Installation.CertificateManagement.CACert, elasticsearch.PublicCertSecret, e.cfg.TruthNamespace))
 	} else {
 		toCreate = append(toCreate, render.CreateCertificateSecret(e.cfg.ESGatewayKeyPair.GetCertificatePEM(), elasticsearch.PublicCertSecret, e.cfg.TruthNamespace))
-	}
-	if e.cfg.UsePSP {
-		toCreate = append(toCreate, e.esGatewayPodSecurityPolicy())
 	}
 	// Create the deployment last to ensure all secrets have been created
 	toCreate = append(toCreate, e.esGatewayDeployment())
@@ -151,12 +145,12 @@ func (e *esGateway) esGatewayRole() *rbacv1.Role {
 		},
 	}
 
-	if e.cfg.UsePSP {
+	if e.cfg.Installation.KubernetesProvider.IsOpenShift() {
 		rules = append(rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{PodSecurityPolicyName},
+			ResourceNames: []string{securitycontextconstraints.NonRootV2},
 		})
 	}
 
@@ -192,10 +186,6 @@ func (e *esGateway) esGatewayRoleBinding() *rbacv1.RoleBinding {
 	}
 }
 
-func (e *esGateway) esGatewayPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(PodSecurityPolicyName)
-}
-
 func (e *esGateway) esGatewayDeployment() *appsv1.Deployment {
 	envVars := []corev1.EnvVar{
 		{Name: "NAMESPACE", Value: e.cfg.Namespace},
@@ -217,7 +207,6 @@ func (e *esGateway) esGatewayDeployment() *appsv1.Deployment {
 				Key: e.cfg.EsAdminUserName,
 			},
 		}},
-		{Name: "ES_GATEWAY_FIPS_MODE_ENABLED", Value: operatorv1.IsFIPSModeEnabledString(e.cfg.Installation.FIPSMode)},
 	}
 
 	var initContainers []corev1.Container
@@ -237,6 +226,12 @@ func (e *esGateway) esGatewayDeployment() *appsv1.Deployment {
 
 	annotations := e.cfg.TrustedBundle.HashAnnotations()
 	annotations[e.cfg.ESGatewayKeyPair.HashAnnotationKey()] = e.cfg.ESGatewayKeyPair.HashAnnotationValue()
+
+	tolerations := e.cfg.Installation.ControlPlaneTolerations
+	if e.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
+	}
+
 	podTemplate := &corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        DeploymentName,
@@ -244,7 +239,7 @@ func (e *esGateway) esGatewayDeployment() *appsv1.Deployment {
 			Annotations: annotations,
 		},
 		Spec: corev1.PodSpec{
-			Tolerations:        e.cfg.Installation.ControlPlaneTolerations,
+			Tolerations:        tolerations,
 			NodeSelector:       e.cfg.Installation.ControlPlaneNodeSelector,
 			ServiceAccountName: ServiceAccountName,
 			ImagePullSecrets:   secret.GetReferenceList(e.cfg.PullSecrets),
@@ -277,7 +272,7 @@ func (e *esGateway) esGatewayDeployment() *appsv1.Deployment {
 		podTemplate.Spec.Affinity = podaffinity.NewPodAntiAffinity(DeploymentName, e.cfg.Namespace)
 	}
 
-	return &appsv1.Deployment{
+	d := appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      DeploymentName,
@@ -298,6 +293,15 @@ func (e *esGateway) esGatewayDeployment() *appsv1.Deployment {
 			Replicas: e.cfg.Installation.ControlPlaneReplicas,
 		},
 	}
+
+	if e.cfg.LogStorage != nil {
+		if overrides := e.cfg.LogStorage.Spec.ESGatewayDeployment; overrides != nil {
+			rcomponents.ApplyDeploymentOverrides(&d, overrides)
+		}
+	}
+
+	return &d
+
 }
 
 func (e *esGateway) esGatewayServiceAccount() *corev1.ServiceAccount {
@@ -328,7 +332,7 @@ func (e *esGateway) esGatewayService() *corev1.Service {
 				},
 				{
 					Name:       KibanaPortName,
-					Port:       int32(render.KibanaPort),
+					Port:       int32(kibana.Port),
 					TargetPort: intstr.FromInt(Port),
 					Protocol:   corev1.ProtocolTCP,
 				},
@@ -340,7 +344,7 @@ func (e *esGateway) esGatewayService() *corev1.Service {
 // Allow access to ES Gateway from components that need to talk to Elasticsearch or Kibana.
 func (e *esGateway) esGatewayAllowTigeraPolicy() *v3.NetworkPolicy {
 	egressRules := []v3.Rule{}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, e.cfg.Installation.KubernetesProvider == operatorv1.ProviderOpenShift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, e.cfg.Installation.KubernetesProvider.IsOpenShift())
 	egressRules = append(egressRules, []v3.Rule{
 		{
 			Action:      v3.Allow,
@@ -360,7 +364,7 @@ func (e *esGateway) esGatewayAllowTigeraPolicy() *v3.NetworkPolicy {
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: render.KibanaEntityRule,
+			Destination: kibana.EntityRule,
 		},
 	}...)
 

@@ -34,7 +34,6 @@ import (
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
-	v1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	"github.com/tigera/operator/pkg/controller/options"
@@ -73,7 +72,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	// Create a new controller
 	c, err := ctrlruntime.NewController("logcollector-controller", mgr, controller.Options{Reconciler: reconcile.Reconciler(reconciler)})
 	if err != nil {
-		return fmt.Errorf("Failed to create logcollector-controller: %v", err)
+		return fmt.Errorf("failed to create logcollector-controller: %v", err)
 	}
 
 	k8sClient, err := kubernetes.NewForConfig(mgr.GetConfig())
@@ -107,7 +106,6 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions, licenseAPIReady
 		clusterDomain:   opts.ClusterDomain,
 		licenseAPIReady: licenseAPIReady,
 		tierWatchReady:  tierWatchReady,
-		usePSP:          opts.UsePSP,
 		multiTenant:     opts.MultiTenant,
 		externalElastic: opts.ElasticExternal,
 	}
@@ -142,7 +140,7 @@ func add(mgr manager.Manager, c ctrlruntime.Controller) error {
 	for _, secretName := range []string{
 		render.ElasticsearchEksLogForwarderUserSecret,
 		render.S3FluentdSecretName, render.EksLogForwarderSecret,
-		render.SplunkFluentdTokenSecretName, render.SplunkFluentdCertificateSecretName, monitor.PrometheusClientTLSSecretName,
+		render.SplunkFluentdTokenSecretName, monitor.PrometheusClientTLSSecretName,
 		render.FluentdPrometheusTLSSecretName, render.TigeraLinseedSecret, render.VoltronLinseedPublicCert, render.EKSLogForwarderTLSSecretName,
 	} {
 		if err = utils.AddSecretsWatch(c, secretName, common.OperatorNamespace()); err != nil {
@@ -183,7 +181,6 @@ type ReconcileLogCollector struct {
 	clusterDomain   string
 	licenseAPIReady *utils.ReadyFlag
 	tierWatchReady  *utils.ReadyFlag
-	usePSP          bool
 	multiTenant     bool
 	externalElastic bool
 }
@@ -201,7 +198,7 @@ func GetLogCollector(ctx context.Context, cli client.Client) (*operatorv1.LogCol
 		if instance.Spec.AdditionalStores.Syslog != nil {
 			_, _, _, err := url.ParseEndpoint(instance.Spec.AdditionalStores.Syslog.Endpoint)
 			if err != nil {
-				return nil, fmt.Errorf("Syslog config has invalid Endpoint: %s", err)
+				return nil, fmt.Errorf("syslog config has invalid Endpoint: %s", err)
 			}
 		}
 	}
@@ -217,7 +214,7 @@ func fillDefaults(instance *operatorv1.LogCollector) []string {
 	modifiedFields := []string{}
 
 	if instance.Spec.CollectProcessPath == nil {
-		collectProcessPath := v1.CollectProcessPathEnable
+		collectProcessPath := operatorv1.CollectProcessPathEnable
 		instance.Spec.CollectProcessPath = &collectProcessPath
 		modifiedFields = append(modifiedFields, "CollectProcessPath")
 	}
@@ -227,20 +224,20 @@ func fillDefaults(instance *operatorv1.LogCollector) []string {
 			// Special case: For users that have a Syslog config and are upgrading from an older release
 			//  where logTypes field did not exist, we will auto-populate default values for
 			// them. This should only happen on upgrade, since logTypes is a required field.
-			if syslog.LogTypes == nil || len(syslog.LogTypes) == 0 {
+			if len(syslog.LogTypes) == 0 {
 				// Set default log types to everything except for v1.SyslogLogIDSEvents (since this
 				// option was not available prior to the logTypes field being introduced). This ensures
 				// existing users continue to get the same expected behavior for Syslog forwarding.
-				instance.Spec.AdditionalStores.Syslog.LogTypes = []v1.SyslogLogType{
-					v1.SyslogLogAudit,
-					v1.SyslogLogDNS,
-					v1.SyslogLogFlows,
+				instance.Spec.AdditionalStores.Syslog.LogTypes = []operatorv1.SyslogLogType{
+					operatorv1.SyslogLogAudit,
+					operatorv1.SyslogLogDNS,
+					operatorv1.SyslogLogFlows,
 				}
 				// Include the field that was modified (in case we need to display error messages)
 				modifiedFields = append(modifiedFields, "AdditionalStores.Syslog.LogTypes")
 			}
 			if len(syslog.Encryption) == 0 {
-				instance.Spec.AdditionalStores.Syslog.Encryption = v1.EncryptionNone
+				instance.Spec.AdditionalStores.Syslog.Encryption = operatorv1.EncryptionNone
 				// Include the field that was modified (in case we need to display error messages)
 				modifiedFields = append(modifiedFields, "AdditionalStores.Syslog.Encryption")
 			}
@@ -490,7 +487,7 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 
 	var useSyslogCertificate bool
 	if instance.Spec.AdditionalStores != nil {
-		if instance.Spec.AdditionalStores.Syslog != nil && instance.Spec.AdditionalStores.Syslog.Encryption == v1.EncryptionTLS {
+		if instance.Spec.AdditionalStores.Syslog != nil && instance.Spec.AdditionalStores.Syslog.Encryption == operatorv1.EncryptionTLS {
 			syslogCert, err := getSysLogCertificate(r.client)
 			if err != nil {
 				r.status.SetDegraded(operatorv1.ResourceReadError, "Error loading Syslog certificate", err, reqLogger)
@@ -515,7 +512,7 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 				if err == nil && managedCluster {
 					for _, l := range syslog.LogTypes {
 						// Set status to degraded to warn user and let them fix the issue themselves.
-						if l == v1.SyslogLogIDSEvents {
+						if l == operatorv1.SyslogLogIDSEvents {
 							r.status.SetDegraded(operatorv1.ResourceValidationError, "IDSEvents option is not supported for Syslog config in a managed cluster", nil, reqLogger)
 							return reconcile.Result{}, err
 						}
@@ -534,7 +531,7 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 	var eksConfig *render.EksCloudwatchLogConfig
 	var esClusterConfig *relasticsearch.ClusterConfig
 	var eksLogForwarderKeyPair certificatemanagement.KeyPairInterface
-	if installation.KubernetesProvider == operatorv1.ProviderEKS {
+	if installation.KubernetesProvider.IsEKS() {
 		log.Info("Managed kubernetes EKS found, getting necessary credentials and config")
 		if instance.Spec.AdditionalSources != nil {
 			if instance.Spec.AdditionalSources.EksCloudwatchLog != nil {
@@ -567,6 +564,12 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 		}
 	}
 
+	packetcaptureapi, err := utils.GetPacketCaptureAPI(ctx, r.client)
+	if err != nil && !errors.IsNotFound(err) {
+		r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying PacketCapture CR", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+
 	// Create a component handler to manage the rendered component.
 	handler := utils.NewComponentHandler(log, r.client, r.scheme, instance)
 
@@ -584,11 +587,11 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 		FluentdKeyPair:         fluentdKeyPair,
 		TrustedBundle:          trustedBundle,
 		ManagedCluster:         managedCluster,
-		UsePSP:                 r.usePSP,
 		UseSyslogCertificate:   useSyslogCertificate,
 		Tenant:                 tenant,
 		ExternalElastic:        r.externalElastic,
 		EKSLogForwarderKeyPair: eksLogForwarderKeyPair,
+		PacketCapture:          packetcaptureapi,
 	}
 	// Render the fluentd component for Linux
 	comp := render.Fluentd(fluentdCfg)
@@ -602,7 +605,7 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 		TrustedBundle: trustedBundle,
 	}
 
-	if installation.KubernetesProvider == operatorv1.ProviderEKS {
+	if installation.KubernetesProvider.IsEKS() {
 		if instance.Spec.AdditionalSources != nil {
 			if instance.Spec.AdditionalSources.EksCloudwatchLog != nil {
 				certificateComponent.ServiceAccounts = append(certificateComponent.ServiceAccounts, render.EKSLogForwarderName)
@@ -648,7 +651,6 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 			OSType:                 rmeta.OSTypeWindows,
 			TrustedBundle:          trustedBundle,
 			ManagedCluster:         managedCluster,
-			UsePSP:                 r.usePSP,
 			UseSyslogCertificate:   useSyslogCertificate,
 			FluentdKeyPair:         fluentdKeyPair,
 			EKSLogForwarderKeyPair: eksLogForwarderKeyPair,
@@ -696,20 +698,18 @@ func getS3Credential(client client.Client) (*render.S3Credential, error) {
 		if errors.IsNotFound(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("Failed to read secret %q: %s", render.S3FluentdSecretName, err)
+		return nil, fmt.Errorf("failed to read secret %q: %s", render.S3FluentdSecretName, err)
 	}
 
 	var ok bool
 	var kId []byte
 	if kId, ok = secret.Data[render.S3KeyIdName]; !ok || len(kId) == 0 {
-		return nil, fmt.Errorf(
-			"Expected secret %q to have a field named %q",
+		return nil, fmt.Errorf("expected secret %q to have a field named %q",
 			render.S3FluentdSecretName, render.S3KeyIdName)
 	}
 	var kSecret []byte
 	if kSecret, ok = secret.Data[render.S3KeySecretName]; !ok || len(kSecret) == 0 {
-		return nil, fmt.Errorf(
-			"Expected secret %q to have a field named %q",
+		return nil, fmt.Errorf("expected secret %q to have a field named %q",
 			render.S3FluentdSecretName, render.S3KeySecretName)
 	}
 
@@ -729,41 +729,17 @@ func getSplunkCredential(client client.Client) (*render.SplunkCredential, error)
 		if errors.IsNotFound(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("Failed to read secret %q: %s", render.SplunkFluentdTokenSecretName, err)
+		return nil, fmt.Errorf("failed to read secret %q: %s", render.SplunkFluentdTokenSecretName, err)
 	}
 
-	var ok bool
-	var token []byte
-	if token, ok = tokenSecret.Data[render.SplunkFluentdSecretTokenKey]; !ok || len(token) == 0 {
-		return nil, fmt.Errorf(
-			"Expected secret %q to have a field named %q",
+	token, ok := tokenSecret.Data[render.SplunkFluentdSecretTokenKey]
+	if !ok || len(token) == 0 {
+		return nil, fmt.Errorf("expected secret %q to have a field named %q",
 			render.SplunkFluentdTokenSecretName, render.SplunkFluentdSecretTokenKey)
 	}
 
-	var certificate []byte
-	certificateSecret := &corev1.Secret{}
-	certificateNamespacedName := types.NamespacedName{
-		Name:      render.SplunkFluentdCertificateSecretName,
-		Namespace: common.OperatorNamespace(),
-	}
-
-	if err := client.Get(context.Background(), certificateNamespacedName, certificateSecret); err != nil {
-		if errors.IsNotFound(err) {
-			log.Info(fmt.Sprintf("Splunk certificate secret %v not provided. Assuming http protocol or trusted CA certificate.",
-				render.SplunkFluentdCertificateSecretName))
-		} else {
-			return nil, fmt.Errorf("Failed to read secret %q: %s", render.SplunkFluentdCertificateSecretName, err)
-		}
-	} else {
-		if certificate, ok = certificateSecret.Data[render.SplunkFluentdSecretCertificateKey]; !ok || len(certificate) == 0 {
-			return nil, fmt.Errorf("Expected secret %q to have a field named %q",
-				render.SplunkFluentdCertificateSecretName, render.SplunkFluentdSecretCertificateKey)
-		}
-	}
-
 	return &render.SplunkCredential{
-		Token:       token,
-		Certificate: certificate,
+		Token: token,
 	}, nil
 }
 
@@ -777,7 +753,7 @@ func getFluentdFilters(client client.Client) (*render.FluentdFilters, error) {
 		if errors.IsNotFound(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("Failed to read ConfigMap %q: %s", render.FluentdFilterConfigMapName, err)
+		return nil, fmt.Errorf("failed to read ConfigMap %q: %s", render.FluentdFilterConfigMapName, err)
 	}
 
 	return &render.FluentdFilters{
@@ -788,11 +764,11 @@ func getFluentdFilters(client client.Client) (*render.FluentdFilters, error) {
 
 func getEksCloudwatchLogConfig(client client.Client, interval int32, region, group, prefix string) (*render.EksCloudwatchLogConfig, error) {
 	if region == "" {
-		return nil, fmt.Errorf("Missing AWS region info")
+		return nil, fmt.Errorf("missing AWS region info")
 	}
 
 	if group == "" {
-		return nil, fmt.Errorf("Missing Cloudwatch log group name")
+		return nil, fmt.Errorf("missing Cloudwatch log group name")
 	}
 
 	if prefix == "" {
@@ -812,12 +788,12 @@ func getEksCloudwatchLogConfig(client client.Client, interval int32, region, gro
 		if errors.IsNotFound(err) {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("Failed to read Secret %q: %s", render.EksLogForwarderSecret, err)
+		return nil, fmt.Errorf("failed to read Secret %q: %s", render.EksLogForwarderSecret, err)
 	}
 
 	if len(secret.Data[render.EksLogForwarderAwsId]) == 0 ||
 		len(secret.Data[render.EksLogForwarderAwsKey]) == 0 {
-		return nil, fmt.Errorf("Incomplete Cloudwatch credentials")
+		return nil, fmt.Errorf("incomplete Cloudwatch credentials")
 	}
 
 	return &render.EksCloudwatchLogConfig{
@@ -841,7 +817,7 @@ func getSysLogCertificate(client client.Client) (certificatemanagement.Certifica
 			log.Info(fmt.Sprintf("ConfigMap %q is not found, assuming syslog's certificate is signed by publicly trusted CA", render.SyslogCAConfigMapName))
 			return nil, nil
 		}
-		return nil, fmt.Errorf("Failed to read ConfigMap %q: %s", render.SyslogCAConfigMapName, err)
+		return nil, fmt.Errorf("failed to read ConfigMap %q: %s", render.SyslogCAConfigMapName, err)
 	}
 	if len(cm.Data[corev1.TLSCertKey]) == 0 {
 		log.Info(fmt.Sprintf("ConfigMap %q does not have a field named %q, assuming syslog's certificate is signed by publicly trusted CA", render.SyslogCAConfigMapName, corev1.TLSCertKey))

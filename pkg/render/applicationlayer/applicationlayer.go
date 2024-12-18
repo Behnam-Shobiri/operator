@@ -23,11 +23,8 @@ import (
 	"strings"
 	"text/template"
 
-	ocsv1 "github.com/openshift/api/security/v1"
-
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -36,21 +33,20 @@ import (
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 )
 
 const (
 	APLName                          = "application-layer"
 	RoleName                         = "application-layer"
-	PodSecurityPolicyName            = "application-layer"
 	ApplicationLayerDaemonsetName    = "l7-log-collector"
 	L7CollectorContainerName         = "l7-collector"
+	L7CollectorSocksVolumeName       = "l7-collector-socks"
 	ProxyContainerName               = "envoy-proxy"
 	EnvoyLogsVolumeName              = "envoy-logs"
 	EnvoyConfigMapName               = "envoy-config"
@@ -86,30 +82,32 @@ type Config struct {
 	OsType       rmeta.OSType
 
 	// Optional config for WAF.
-	WAFEnabled           bool
+	PerHostWAFEnabled    bool
 	ModSecurityConfigMap *corev1.ConfigMap
 
 	// Optional config for L7 logs.
-	LogsEnabled            bool
+	PerHostLogsEnabled     bool
 	LogRequestsPerInterval *int64
 	LogIntervalSeconds     *int64
 
 	// Optional config for ALP
-	ALPEnabled bool
+	PerHostALPEnabled bool
+
+	// Optional config for SidecarInjection
+	SidecarInjectionEnabled bool
 
 	// Calculated internal fields.
-	proxyImage      string
-	collectorImage  string
-	dikastesImage   string
-	dikastesEnabled bool
-	envoyConfigMap  *corev1.ConfigMap
+	proxyImage            string
+	collectorImage        string
+	dikastesImage         string
+	dikastesEnabled       bool
+	perHostEnvoyEnabled   bool
+	l7logcollectorEnabled bool
+	envoyConfigMap        *corev1.ConfigMap
 
 	// envoy user-configurable overrides
 	UseRemoteAddressXFF bool
 	NumTrustedHopsXFF   int32
-
-	// Whether the cluster supports pod security policies.
-	UsePSP bool
 
 	ApplicationLayer *operatorv1.ApplicationLayer
 }
@@ -142,7 +140,7 @@ func (c *component) ResolveImages(is *operatorv1.ImageSet) error {
 	}
 
 	if len(errMsgs) != 0 {
-		return fmt.Errorf(strings.Join(errMsgs, ","))
+		return fmt.Errorf("%s", strings.Join(errMsgs, ","))
 	}
 
 	return nil
@@ -157,39 +155,43 @@ func (c *component) Objects() ([]client.Object, []client.Object) {
 	// If l7spec is provided render the required objects.
 	objs = append(objs, c.serviceAccount())
 
-	c.config.dikastesEnabled = false
-	if c.config.WAFEnabled || c.config.ALPEnabled {
-		c.config.dikastesEnabled = true
-	}
+	c.config.dikastesEnabled = c.config.PerHostWAFEnabled ||
+		c.config.PerHostALPEnabled ||
+		c.config.SidecarInjectionEnabled
 
-	// If Web Application Firewall is enabled, we need WAF ruleset ConfigMap present.
-	if c.config.WAFEnabled {
+	c.config.l7logcollectorEnabled = c.config.PerHostLogsEnabled ||
+		c.config.SidecarInjectionEnabled
+
+	c.config.perHostEnvoyEnabled = c.config.PerHostWAFEnabled ||
+		c.config.PerHostALPEnabled ||
+		c.config.PerHostLogsEnabled
+
+	// If Web Application Firewall or Sidecar Injection is enabled, we need WAF ruleset ConfigMap present.
+	if c.config.PerHostWAFEnabled || c.config.SidecarInjectionEnabled {
 		// this ConfigMap is a copy of the provided configuration from the operator namespace into the calico-system namespace
 		objs = append(objs, c.modSecurityConfigMap())
 	}
 
 	// Envoy configuration
-	c.config.envoyConfigMap = c.envoyL7ConfigMap()
-	objs = append(objs, c.config.envoyConfigMap)
+	if c.config.perHostEnvoyEnabled {
+		c.config.envoyConfigMap = c.envoyL7ConfigMap()
+		objs = append(objs, c.config.envoyConfigMap)
+	}
 
-	// Envoy & Dikastes Daemonset
+	// Envoy, Dikastes & L7 log collector Daemonset
+	// It always installed, even with sidecars enabled, the sidecars contain
+	// only envoy proxy inside them, and if only sidcar is enabled the
+	// daemonset will contain only Dikastes and L7 log collector to be
+	// prepared to do some action depending on the envoy inside application
+	// pod configuration.
 	objs = append(objs, c.daemonset())
 
-	if c.config.Installation.KubernetesProvider == operatorv1.ProviderDockerEE {
+	if c.config.Installation.KubernetesProvider.IsDockerEE() {
 		objs = append(objs, c.clusterAdminClusterRoleBinding())
 	}
 
-	// If we're running on openshift, we need to add in an SCC.
-	if c.config.Installation.KubernetesProvider == operatorv1.ProviderOpenShift {
-		objs = append(objs, c.securityContextConstraints())
-	}
-
-	if c.config.UsePSP {
-		objs = append(objs,
-			c.role(),
-			c.roleBinding(),
-			c.podSecurityPolicy(),
-		)
+	if c.config.Installation.KubernetesProvider.IsOpenShift() {
+		objs = append(objs, c.role(), c.roleBinding())
 	}
 
 	return objs, nil
@@ -258,26 +260,28 @@ func (c *component) containers() []corev1.Container {
 	var containers []corev1.Container
 
 	// Daemonset needs root and NET_ADMIN, NET_RAW permission to be able to use netfilter tproxy option.
-	sc := securitycontext.NewRootContext(false)
-	sc.Capabilities.Add = []corev1.Capability{
-		"NET_ADMIN",
-		"NET_RAW",
-	}
-	proxy := corev1.Container{
-		Name:            ProxyContainerName,
-		Image:           c.config.proxyImage,
-		ImagePullPolicy: render.ImagePullPolicy(),
-		Command: []string{
-			"envoy", "-c", "/etc/envoy/envoy-config.yaml",
-		},
-		SecurityContext: sc,
-		Env:             c.proxyEnv(),
-		VolumeMounts:    c.proxyVolMounts(),
+	if c.config.perHostEnvoyEnabled {
+		sc := securitycontext.NewRootContext(false)
+		sc.Capabilities.Add = []corev1.Capability{
+			"NET_ADMIN",
+			"NET_RAW",
+		}
+		proxy := corev1.Container{
+			Name:            ProxyContainerName,
+			Image:           c.config.proxyImage,
+			ImagePullPolicy: render.ImagePullPolicy(),
+			Command: []string{
+				"envoy", "-c", "/etc/envoy/envoy-config.yaml",
+			},
+			SecurityContext: sc,
+			Env:             c.proxyEnv(),
+			VolumeMounts:    c.proxyVolMounts(),
+		}
+
+		containers = append(containers, proxy)
 	}
 
-	containers = append(containers, proxy)
-
-	if c.config.LogsEnabled {
+	if c.config.l7logcollectorEnabled {
 		// Log collection specific container
 		collector := corev1.Container{
 			Name:            L7CollectorContainerName,
@@ -305,13 +309,15 @@ func (c *component) containers() []corev1.Container {
 			{Name: DikastesSyncVolumeName, MountPath: "/var/run/dikastes"},
 		}
 
-		if c.config.WAFEnabled {
+		if c.config.PerHostWAFEnabled || c.config.SidecarInjectionEnabled {
 			commandArgs = append(
 				commandArgs,
-				"--waf-enabled",
 				"--waf-log-file", filepath.Join(CalicologsVolumePath, "waf", "waf.log"),
 				"--waf-ruleset-file", filepath.Join(ModSecurityRulesetVolumePath, "tigera.conf"),
 			)
+			if c.config.PerHostWAFEnabled {
+				commandArgs = append(commandArgs, "--per-host-waf-enabled")
+			}
 			volMounts = append(
 				volMounts,
 				[]corev1.VolumeMount{
@@ -326,6 +332,10 @@ func (c *component) containers() []corev1.Container {
 					},
 				}...,
 			)
+		}
+
+		if c.config.PerHostALPEnabled {
+			commandArgs = append(commandArgs, "--per-host-alp-enabled")
 		}
 
 		dikastes := corev1.Container{
@@ -351,6 +361,7 @@ func (c *component) proxyEnv() []corev1.EnvVar {
 		// envoy needs to run as root to be able to use transparent flag (for tproxy)
 		{Name: "ENVOY_UID", Value: "0"},
 		{Name: "ENVOY_GID", Value: "0"},
+		{Name: "TIGERA_TPROXY", Value: "Enabled"},
 	}
 }
 
@@ -379,33 +390,47 @@ func (c *component) collectorEnv() []corev1.EnvVar {
 }
 
 func (c *component) volumes() []corev1.Volume {
-	var volumes []corev1.Volume
-
-	// This empty directory volume will be mounted at /tmp/ which will contain the access logs file generated by envoy.
-	volumes = append(volumes, corev1.Volume{
-		Name: EnvoyLogsVolumeName,
-		VolumeSource: corev1.VolumeSource{
-			EmptyDir: &corev1.EmptyDirVolumeSource{},
-		},
-	})
-
-	volumes = append(volumes, corev1.Volume{
-		Name: EnvoyConfigMapName,
-		VolumeSource: corev1.VolumeSource{
-			ConfigMap: &corev1.ConfigMapVolumeSource{
-				LocalObjectReference: corev1.LocalObjectReference{Name: EnvoyConfigMapName},
+	hostPathDirectoryOrCreate := corev1.HostPathDirectoryOrCreate
+	volumes := []corev1.Volume{
+		{
+			Name: FelixSync,
+			VolumeSource: corev1.VolumeSource{
+				CSI: &corev1.CSIVolumeSource{
+					Driver: "csi.tigera.io",
+				},
 			},
 		},
-	})
-
-	volumes = append(volumes, corev1.Volume{
-		Name: FelixSync,
-		VolumeSource: corev1.VolumeSource{
-			CSI: &corev1.CSIVolumeSource{
-				Driver: "csi.tigera.io",
+		// This empty directory volume will be mounted at /tmp/ which will contain the access logs file generated by envoy.
+		{
+			Name: EnvoyLogsVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
 			},
 		},
-	})
+	}
+
+	if c.config.perHostEnvoyEnabled {
+		volumes = append(volumes, corev1.Volume{
+			Name: EnvoyConfigMapName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: EnvoyConfigMapName},
+				},
+			},
+		})
+	}
+
+	if c.config.l7logcollectorEnabled {
+		volumes = append(volumes, corev1.Volume{
+			Name: L7CollectorSocksVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/var/run/l7-collector",
+					Type: &hostPathDirectoryOrCreate,
+				},
+			},
+		})
+	}
 
 	if c.config.dikastesEnabled {
 		// Web Application Firewall + ApplicationLayer Policy specific volumes.
@@ -414,14 +439,16 @@ func (c *component) volumes() []corev1.Volume {
 		volumes = append(volumes, corev1.Volume{
 			Name: DikastesSyncVolumeName,
 			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: "/var/run/dikastes",
+					Type: &hostPathDirectoryOrCreate,
+				},
 			},
 		})
 
 		// Needed for ModSecurity library - contains rule set.
-		if c.config.WAFEnabled { // WAF-only
+		if c.config.PerHostWAFEnabled || c.config.SidecarInjectionEnabled {
 			// WAF logs need HostPath volume - logs to be consumed by fluentd.
-			hostPathDirectoryOrCreate := corev1.HostPathDirectoryOrCreate
 			volumes = append(volumes, corev1.Volume{
 				Name: CalicoLogsVolumeName,
 				VolumeSource: corev1.VolumeSource{
@@ -471,6 +498,7 @@ func (c *component) collectorVolMounts() []corev1.VolumeMount {
 	return []corev1.VolumeMount{
 		{Name: EnvoyLogsVolumeName, MountPath: "/tmp/"},
 		{Name: FelixSync, MountPath: "/var/run/felix"},
+		{Name: L7CollectorSocksVolumeName, MountPath: "/var/run/l7-collector"},
 	}
 }
 
@@ -556,10 +584,11 @@ func (c *component) role() *rbacv1.Role {
 		},
 		Rules: []rbacv1.PolicyRule{
 			{
-				APIGroups:     []string{"policy"},
-				Resources:     []string{"podsecuritypolicies"},
+
+				APIGroups:     []string{"security.openshift.io"},
+				Resources:     []string{"securitycontextconstraints"},
 				Verbs:         []string{"use"},
-				ResourceNames: []string{PodSecurityPolicyName},
+				ResourceNames: []string{securitycontextconstraints.Privileged},
 			},
 		},
 	}
@@ -584,44 +613,5 @@ func (c *component) roleBinding() *rbacv1.RoleBinding {
 				Namespace: common.CalicoNamespace,
 			},
 		},
-	}
-}
-
-func (c *component) podSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	psp := podsecuritypolicy.NewBasePolicy(PodSecurityPolicyName)
-	psp.Spec.Privileged = true
-	psp.Spec.AllowPrivilegeEscalation = ptr.BoolToPtr(true)
-	psp.Spec.RequiredDropCapabilities = nil
-	psp.Spec.AllowedCapabilities = []corev1.Capability{
-		"NET_ADMIN",
-		"NET_RAW",
-	}
-	psp.Spec.HostIPC = true
-	psp.Spec.HostNetwork = true
-	psp.Spec.RunAsUser.Rule = policyv1beta1.RunAsUserStrategyRunAsAny
-	psp.Spec.Volumes = append(psp.Spec.Volumes, policyv1beta1.CSI, policyv1beta1.FlexVolume)
-	return psp
-}
-
-// securityContextConstraints returns SCC needed for daemonset to run on Openshift.
-func (c *component) securityContextConstraints() *ocsv1.SecurityContextConstraints {
-	privilegeEscalation := false
-	return &ocsv1.SecurityContextConstraints{
-		TypeMeta:                 metav1.TypeMeta{Kind: "SecurityContextConstraints", APIVersion: "security.openshift.io/v1"},
-		ObjectMeta:               metav1.ObjectMeta{Name: common.CalicoNamespace},
-		AllowHostDirVolumePlugin: false,
-		AllowHostIPC:             true,
-		AllowHostNetwork:         true,
-		AllowHostPID:             false,
-		AllowHostPorts:           false,
-		AllowPrivilegeEscalation: &privilegeEscalation,
-		AllowPrivilegedContainer: false,
-		FSGroup:                  ocsv1.FSGroupStrategyOptions{Type: ocsv1.FSGroupStrategyRunAsAny},
-		RunAsUser:                ocsv1.RunAsUserStrategyOptions{Type: ocsv1.RunAsUserStrategyRunAsAny},
-		ReadOnlyRootFilesystem:   true,
-		SELinuxContext:           ocsv1.SELinuxContextStrategyOptions{Type: ocsv1.SELinuxStrategyMustRunAs},
-		SupplementalGroups:       ocsv1.SupplementalGroupsStrategyOptions{Type: ocsv1.SupplementalGroupsStrategyRunAsAny},
-		Users:                    []string{fmt.Sprintf("system:serviceaccount:%s:%s", common.CalicoNamespace, APLName)},
-		Volumes:                  []ocsv1.FSType{"*"},
 	}
 }

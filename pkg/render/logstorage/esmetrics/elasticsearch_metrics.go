@@ -17,40 +17,37 @@ package esmetrics
 import (
 	"fmt"
 
-	rcomponents "github.com/tigera/operator/pkg/render/common/components"
-
-	"github.com/tigera/operator/pkg/url"
-
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
+	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
+	"github.com/tigera/operator/pkg/url"
 )
 
 const (
-	ElasticsearchMetricsSecret                = "tigera-ee-elasticsearch-metrics-elasticsearch-access"
-	ElasticsearchMetricsServerTLSSecret       = "tigera-ee-elasticsearch-metrics-tls"
-	ElasticsearchMetricsName                  = "tigera-elasticsearch-metrics"
-	ElasticsearchMetricsRoleName              = "tigera-elasticsearch-metrics"
-	ElasticsearchMetricsPodSecurityPolicyName = "tigera-elasticsearch-metrics"
-	ElasticsearchMetricsPolicyName            = networkpolicy.TigeraComponentPolicyPrefix + "elasticsearch-metrics"
-	ElasticsearchMetricsPort                  = 9081
+	ElasticsearchMetricsSecret          = "tigera-ee-elasticsearch-metrics-elasticsearch-access"
+	ElasticsearchMetricsServerTLSSecret = "tigera-ee-elasticsearch-metrics-tls"
+	ElasticsearchMetricsName            = "tigera-elasticsearch-metrics"
+	ElasticsearchMetricsRoleName        = "tigera-elasticsearch-metrics"
+	ElasticsearchMetricsPolicyName      = networkpolicy.TigeraComponentPolicyPrefix + "elasticsearch-metrics"
+	ElasticsearchMetricsPort            = 9081
 )
 
 var ESMetricsSourceEntityRule = networkpolicy.CreateSourceEntityRule(render.ElasticsearchNamespace, ElasticsearchMetricsName)
@@ -69,9 +66,6 @@ type Config struct {
 	ClusterDomain        string
 	ServerTLS            certificatemanagement.KeyPairInterface
 	TrustedBundle        certificatemanagement.TrustedBundleRO
-
-	// Whether the cluster supports pod security policies.
-	UsePSP bool
 
 	LogStorage *operatorv1.LogStorage
 }
@@ -103,12 +97,8 @@ func (e *elasticsearchMetrics) Objects() (objsToCreate, objsToDelete []client.Ob
 	toCreate = append(toCreate, secret.ToRuntimeObjects(secret.CopyToNamespace(render.ElasticsearchNamespace, e.cfg.ESMetricsCredsSecret)...)...)
 	toCreate = append(toCreate, e.metricsService(), e.metricsDeployment(), e.serviceAccount())
 
-	if e.cfg.UsePSP {
-		toCreate = append(toCreate,
-			e.metricsRole(),
-			e.metricsRoleBinding(),
-			e.metricsPodSecurityPolicy(),
-		)
+	if e.cfg.Installation.KubernetesProvider.IsOpenShift() {
+		toCreate = append(toCreate, e.metricsRole(), e.metricsRoleBinding())
 	}
 	return toCreate, objsToDelete
 }
@@ -140,10 +130,10 @@ func (e *elasticsearchMetrics) metricsRole() *rbacv1.Role {
 		},
 		Rules: []rbacv1.PolicyRule{
 			{
-				APIGroups:     []string{"policy"},
-				Resources:     []string{"podsecuritypolicies"},
+				APIGroups:     []string{"security.openshift.io"},
+				Resources:     []string{"securitycontextconstraints"},
 				Verbs:         []string{"use"},
-				ResourceNames: []string{ElasticsearchMetricsPodSecurityPolicyName},
+				ResourceNames: []string{securitycontextconstraints.NonRootV2},
 			},
 		},
 	}
@@ -169,10 +159,6 @@ func (e *elasticsearchMetrics) metricsRoleBinding() *rbacv1.RoleBinding {
 			},
 		},
 	}
-}
-
-func (e *elasticsearchMetrics) metricsPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(ElasticsearchMetricsPodSecurityPolicyName)
 }
 
 func (e *elasticsearchMetrics) metricsService() *corev1.Service {
@@ -206,7 +192,7 @@ func (e *elasticsearchMetrics) metricsService() *corev1.Service {
 	}
 }
 
-func (e elasticsearchMetrics) metricsDeployment() *appsv1.Deployment {
+func (e *elasticsearchMetrics) metricsDeployment() *appsv1.Deployment {
 	var initContainers []corev1.Container
 	annotations := e.cfg.TrustedBundle.HashAnnotations()
 	if e.cfg.ServerTLS.UseCertificateManagement() {
@@ -216,6 +202,11 @@ func (e elasticsearchMetrics) metricsDeployment() *appsv1.Deployment {
 	}
 
 	_, esHost, esPort, _ := url.ParseEndpoint(relasticsearch.GatewayEndpoint(e.SupportedOSType(), e.cfg.ClusterDomain, render.ElasticsearchNamespace))
+
+	tolerations := e.cfg.Installation.ControlPlaneTolerations
+	if e.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
+	}
 
 	d := &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
@@ -230,7 +221,7 @@ func (e elasticsearchMetrics) metricsDeployment() *appsv1.Deployment {
 					Annotations: annotations,
 				},
 				Spec: corev1.PodSpec{
-					Tolerations:        e.cfg.Installation.ControlPlaneTolerations,
+					Tolerations:        tolerations,
 					NodeSelector:       e.cfg.Installation.ControlPlaneNodeSelector,
 					ImagePullSecrets:   secret.GetReferenceList(e.cfg.PullSecrets),
 					ServiceAccountName: ElasticsearchMetricsName,
@@ -253,7 +244,6 @@ func (e elasticsearchMetrics) metricsDeployment() *appsv1.Deployment {
 								e.cfg.ServerTLS.VolumeMount(e.SupportedOSType()),
 							),
 							Env: []corev1.EnvVar{
-								{Name: "FIPS_MODE_ENABLED", Value: operatorv1.IsFIPSModeEnabledString(e.cfg.Installation.FIPSMode)},
 								relasticsearch.ElasticUsernameEnvVar(ElasticsearchMetricsSecret),
 								relasticsearch.ElasticPasswordEnvVar(ElasticsearchMetricsSecret),
 								relasticsearch.ElasticHostEnvVar(esHost),
@@ -289,7 +279,7 @@ func (e *elasticsearchMetrics) allowTigeraPolicy() *v3.NetworkPolicy {
 			Destination: networkpolicy.DefaultHelper().ESGatewayEntityRule(),
 		},
 	}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, e.cfg.Installation.KubernetesProvider == operatorv1.ProviderOpenShift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, e.cfg.Installation.KubernetesProvider.IsOpenShift())
 	egressRules = append(egressRules,
 		v3.Rule{
 			Action:      v3.Allow,

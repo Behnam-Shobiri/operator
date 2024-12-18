@@ -18,29 +18,29 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/tigera/api/pkg/lib/numorstring"
-
-	rcomponents "github.com/tigera/operator/pkg/render/common/components"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+	"github.com/tigera/api/pkg/lib/numorstring"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
+	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 	"github.com/tigera/operator/pkg/render/logstorage"
+	"github.com/tigera/operator/pkg/render/logstorage/kibana"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
-	batchv1 "k8s.io/api/batch/v1"
-	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
-	rbacv1 "k8s.io/api/rbac/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var (
@@ -74,9 +74,6 @@ type Config struct {
 
 	// Whether this is a managed cluster
 	IsManaged bool
-
-	// Whether the cluster supports pod security policies.
-	UsePSP bool
 
 	// Namespace to install into.
 	Namespace string
@@ -117,13 +114,13 @@ func (d *dashboards) ResolveImages(is *operatorv1.ImageSet) error {
 		}
 	}
 	if len(errMsgs) != 0 {
-		return fmt.Errorf(strings.Join(errMsgs, ","))
+		return fmt.Errorf("%s", strings.Join(errMsgs, ","))
 	}
 	return nil
 }
 
 func (d *dashboards) Objects() (objsToCreate, objsToDelete []client.Object) {
-	if d.cfg.IsManaged || operatorv1.IsFIPSModeEnabled(d.cfg.Installation.FIPSMode) {
+	if d.cfg.IsManaged {
 		return nil, d.resources()
 	}
 
@@ -137,19 +134,15 @@ func (d *dashboards) resources() []client.Object {
 		d.Job(),
 	}
 
-	if d.cfg.UsePSP {
-		resources = append(resources,
-			d.PSPClusterRole(),
-			d.PSPClusterRoleBinding(),
-			d.PodSecurityPolicy(),
-		)
+	if d.cfg.Installation.KubernetesProvider.IsOpenShift() {
+		resources = append(resources, d.ClusterRole(), d.ClusterRoleBinding())
 	}
 	return resources
 }
 
 func (d *dashboards) AllowTigeraPolicy() *v3.NetworkPolicy {
 	egressRules := []v3.Rule{}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, d.cfg.Installation.KubernetesProvider == operatorv1.ProviderOpenShift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, d.cfg.Installation.KubernetesProvider.IsOpenShift())
 	if d.cfg.ExternalKibanaClientSecret != nil {
 		egressRules = append(egressRules, v3.Rule{
 			Action:   v3.Allow,
@@ -163,7 +156,7 @@ func (d *dashboards) AllowTigeraPolicy() *v3.NetworkPolicy {
 		egressRules = append(egressRules, v3.Rule{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: render.KibanaEntityRule,
+			Destination: kibana.EntityRule,
 		})
 	}
 
@@ -228,10 +221,6 @@ func (d *dashboards) Job() *batchv1.Job {
 			Name:  "KB_CA_CERT",
 			Value: d.cfg.TrustedBundle.MountPath(),
 		},
-		{
-			Name:  "FIPS_MODE_ENABLED",
-			Value: operatorv1.IsFIPSModeEnabledString(d.cfg.Installation.FIPSMode),
-		},
 		relasticsearch.ElasticUserEnvVar(ElasticCredentialsSecret),
 		relasticsearch.ElasticPasswordEnvVar(ElasticCredentialsSecret),
 	}
@@ -265,13 +254,18 @@ func (d *dashboards) Job() *batchv1.Job {
 		envVars = append(envVars, corev1.EnvVar{Name: "KIBANA_CLIENT_CERT", Value: "/certs/kibana/mtls/client.crt"})
 	}
 
+	tolerations := d.cfg.Installation.ControlPlaneTolerations
+	if d.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
+	}
+
 	podTemplate := relasticsearch.DecorateAnnotations(&corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Labels:      map[string]string{"job-name": Name, "k8s-app": Name},
 			Annotations: annotations,
 		},
 		Spec: corev1.PodSpec{
-			Tolerations:  d.cfg.Installation.ControlPlaneTolerations,
+			Tolerations:  tolerations,
 			NodeSelector: d.cfg.Installation.ControlPlaneNodeSelector,
 			// This value needs to be set to never. The PodFailurePolicy will still ensure that this job will run until completion.
 			RestartPolicy:    corev1.RestartPolicyNever,
@@ -341,7 +335,7 @@ func (d *dashboards) ServiceAccount() *corev1.ServiceAccount {
 	}
 }
 
-func (d *dashboards) PSPClusterRole() *rbacv1.ClusterRole {
+func (d *dashboards) ClusterRole() *rbacv1.ClusterRole {
 	return &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -349,17 +343,16 @@ func (d *dashboards) PSPClusterRole() *rbacv1.ClusterRole {
 		},
 		Rules: []rbacv1.PolicyRule{
 			{
-				// Allow access to the pod security policy in case this is enforced on the cluster
-				APIGroups:     []string{"policy"},
-				Resources:     []string{"podsecuritypolicies"},
+				APIGroups:     []string{"security.openshift.io"},
+				Resources:     []string{"securitycontextconstraints"},
 				Verbs:         []string{"use"},
-				ResourceNames: []string{Name},
+				ResourceNames: []string{securitycontextconstraints.NonRootV2},
 			},
 		},
 	}
 }
 
-func (d *dashboards) PSPClusterRoleBinding() *rbacv1.ClusterRoleBinding {
+func (d *dashboards) ClusterRoleBinding() *rbacv1.ClusterRoleBinding {
 	return &rbacv1.ClusterRoleBinding{
 		TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -378,10 +371,6 @@ func (d *dashboards) PSPClusterRoleBinding() *rbacv1.ClusterRoleBinding {
 			},
 		},
 	}
-}
-
-func (d *dashboards) PodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(Name)
 }
 
 func (d *dashboards) Ready() bool {

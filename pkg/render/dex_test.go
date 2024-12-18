@@ -17,15 +17,16 @@ package render_test
 import (
 	"fmt"
 
-	"github.com/tigera/operator/test"
-	"k8s.io/apimachinery/pkg/api/resource"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 
+	"gopkg.in/yaml.v2"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -48,6 +49,7 @@ import (
 	"github.com/tigera/operator/pkg/render/testutils"
 	"github.com/tigera/operator/pkg/tls"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
+	"github.com/tigera/operator/test"
 )
 
 var _ = Describe("dex rendering tests", func() {
@@ -197,7 +199,6 @@ var _ = Describe("dex rendering tests", func() {
 				ClusterDomain: clusterName,
 				TLSKeyPair:    tlsKeyPair,
 				TrustedBundle: trustedCaBundle,
-				UsePSP:        true,
 			}
 		})
 
@@ -205,33 +206,25 @@ var _ = Describe("dex rendering tests", func() {
 			component := render.Dex(cfg)
 			resources, _ := component.Objects()
 
-			expectedResources := []struct {
-				name    string
-				ns      string
-				group   string
-				version string
-				kind    string
-			}{
-				{render.DexPolicyName, render.DexNamespace, "projectcalico.org", "v3", "NetworkPolicy"},
-				{networkpolicy.TigeraComponentDefaultDenyPolicyName, render.DexNamespace, "projectcalico.org", "v3", "NetworkPolicy"},
-				{render.DexObjectName, render.DexNamespace, "", "v1", "ServiceAccount"},
-				{render.DexObjectName, render.DexNamespace, "apps", "v1", "Deployment"},
-				{render.DexObjectName, render.DexNamespace, "", "v1", "Service"},
-				{render.DexObjectName, "", rbac, "v1", "ClusterRole"},
-				{render.DexObjectName, "", rbac, "v1", "ClusterRoleBinding"},
-				{render.DexObjectName, render.DexNamespace, "", "v1", "ConfigMap"},
-				{render.DexObjectName, common.OperatorNamespace(), "", "v1", "Secret"},
-				{render.OIDCSecretName, common.OperatorNamespace(), "", "v1", "Secret"},
-				{render.DexObjectName, render.DexNamespace, "", "v1", "Secret"},
-				{render.OIDCSecretName, render.DexNamespace, "", "v1", "Secret"},
-				{pullSecretName, render.DexNamespace, "", "v1", "Secret"},
-				{"tigera-dex", "", "policy", "v1beta1", "PodSecurityPolicy"},
+			expectedResources := []client.Object{
+				&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName}, TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"}},
+				&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: render.DexPolicyName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
+				&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: networkpolicy.TigeraComponentDefaultDenyPolicyName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
+				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"}},
+				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"}},
+				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: "v1"}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName, Namespace: common.OperatorNamespace()}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.OIDCSecretName, Namespace: common.OperatorNamespace()}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.OIDCSecretName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: pullSecretName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: render.DexNamespace}},
 			}
 
-			for i, expectedRes := range expectedResources {
-				rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
-			}
-			Expect(len(resources)).To(Equal(len(expectedResources)))
+			rtest.ExpectResources(resources, expectedResources)
 
 			d := rtest.GetResource(resources, "tigera-dex", "tigera-dex", "apps", "v1", "Deployment").(*appsv1.Deployment)
 
@@ -258,7 +251,19 @@ var _ = Describe("dex rendering tests", func() {
 			Expect(d.Spec.Template.Spec.Volumes).To(BeEquivalentTo(expectedVolumes))
 			cm, ok := rtest.GetResource(resources, "tigera-dex", "tigera-dex", "", "v1", "ConfigMap").(*corev1.ConfigMap)
 			Expect(ok).To(BeTrue())
-			Expect(cm.Data["config.yaml"]).To(ContainSubstring("idTokens: 15m"))
+			var config ConfigYAML
+			// Decode the JSON string into an object into a ConfigYAML object, which allows easier introspection.
+			err := yaml.Unmarshal([]byte(cm.Data["config.yaml"]), &config)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(config.Expiry.IDTokens).To(Equal("15m"))
+			Expect(config.StaticClients).To(HaveLen(1))
+			Expect(config.StaticClients[0].RedirectURIs).To(ConsistOf(
+				"https://localhost:9443/login/oidc/callback",
+				"https://localhost:9443/login/oidc/silent-callback",
+				"https://127.0.0.1:9443/login/oidc/callback",
+				"https://127.0.0.1:9443/login/oidc/silent-callback",
+				"https://example.com/login/oidc/callback",
+				"https://example.com/login/oidc/silent-callback"))
 		})
 
 		It("should render config Map with the HSTS headers", func() {
@@ -273,10 +278,15 @@ var _ = Describe("dex rendering tests", func() {
 
 			cm, ok := rtest.GetResource(resources, "tigera-dex", "tigera-dex", "", "v1", "ConfigMap").(*corev1.ConfigMap)
 			Expect(ok).To(BeTrue())
-			Expect(cm.Data["config.yaml"]).To(ContainSubstring("X-Content-Type-Options: nosniff"))
-			Expect(cm.Data["config.yaml"]).To(ContainSubstring("X-XSS-Protection: 1; mode=block"))
-			Expect(cm.Data["config.yaml"]).To(ContainSubstring("X-Frame-Options: DENY"))
-			Expect(cm.Data["config.yaml"]).To(ContainSubstring("Strict-Transport-Security: max-age=31536000; includeSubDomains"))
+			var config ConfigYAML
+			// Decode the JSON string into an object into a ConfigYAML object, which allows easier introspection.
+			err := yaml.Unmarshal([]byte(cm.Data["config.yaml"]), &config)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(config.Web.Headers.ContentSecurityPolicy).To(Equal(""))
+			Expect(config.Web.Headers.XXSSProtection).To(Equal("1; mode=block"))
+			Expect(config.Web.Headers.XFrameOptions).To(Equal("DENY"))
+			Expect(config.Web.Headers.StrictTransportSecurity).To(Equal("max-age=31536000; includeSubDomains"))
+			Expect(config.Web.Headers.XContentTypeOptions).To(Equal("nosniff"))
 		})
 
 		DescribeTable("should render the cluster name properly in the validator", func(clusterDomain string) {
@@ -306,6 +316,21 @@ var _ = Describe("dex rendering tests", func() {
 			Expect(d.Spec.Template.Spec.Tolerations).To(ContainElements(append(rmeta.TolerateControlPlane, t)))
 		})
 
+		It("should render toleration on GKE", func() {
+			cfg.Installation.KubernetesProvider = operatorv1.ProviderGKE
+
+			component := render.Dex(cfg)
+			resources, _ := component.Objects()
+			d := rtest.GetResource(resources, render.DexObjectName, render.DexNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
+			Expect(d).NotTo(BeNil())
+			Expect(d.Spec.Template.Spec.Tolerations).To(ContainElements(corev1.Toleration{
+				Key:      "kubernetes.io/arch",
+				Operator: corev1.TolerationOpEqual,
+				Value:    "arm64",
+				Effect:   corev1.TaintEffectNoSchedule,
+			}))
+		})
+
 		It("should render all resources for a certificate management", func() {
 			cfg.Installation.CertificateManagement = &operatorv1.CertificateManagement{}
 			cfg.DexConfig = render.NewDexConfig(cfg.Installation.CertificateManagement, authentication, dexSecret, idpSecret, clusterName)
@@ -313,46 +338,42 @@ var _ = Describe("dex rendering tests", func() {
 			component := render.Dex(cfg)
 			resources, _ := component.Objects()
 
-			expectedResources := []struct {
-				name    string
-				ns      string
-				group   string
-				version string
-				kind    string
-			}{
-				{render.DexPolicyName, render.DexNamespace, "projectcalico.org", "v3", "NetworkPolicy"},
-				{networkpolicy.TigeraComponentDefaultDenyPolicyName, render.DexNamespace, "projectcalico.org", "v3", "NetworkPolicy"},
-				{render.DexObjectName, render.DexNamespace, "", "v1", "ServiceAccount"},
-				{render.DexObjectName, render.DexNamespace, "apps", "v1", "Deployment"},
-				{render.DexObjectName, render.DexNamespace, "", "v1", "Service"},
-				{render.DexObjectName, "", rbac, "v1", "ClusterRole"},
-				{render.DexObjectName, "", rbac, "v1", "ClusterRoleBinding"},
-				{render.DexObjectName, render.DexNamespace, "", "v1", "ConfigMap"},
-				{render.DexObjectName, common.OperatorNamespace(), "", "v1", "Secret"},
-				{render.OIDCSecretName, common.OperatorNamespace(), "", "v1", "Secret"},
-				{render.DexObjectName, render.DexNamespace, "", "v1", "Secret"},
-				{render.OIDCSecretName, render.DexNamespace, "", "v1", "Secret"},
-				{pullSecretName, render.DexNamespace, "", "v1", "Secret"},
-				{"tigera-dex:csr-creator", "", "rbac.authorization.k8s.io", "v1", "ClusterRoleBinding"},
-				{"tigera-dex", "", "policy", "v1beta1", "PodSecurityPolicy"},
+			expectedResources := []client.Object{
+				&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName}, TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"}},
+				&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: render.DexPolicyName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
+				&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: networkpolicy.TigeraComponentDefaultDenyPolicyName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
+				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"}},
+				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"}},
+				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: "v1"}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName, Namespace: common.OperatorNamespace()}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.OIDCSecretName, Namespace: common.OperatorNamespace()}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.DexObjectName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.OIDCSecretName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: pullSecretName, Namespace: render.DexNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-dex:csr-creator"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: render.DexNamespace}},
 			}
 
-			for i, expectedRes := range expectedResources {
-				rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
-			}
-			Expect(len(resources)).To(Equal(len(expectedResources)))
+			rtest.ExpectResources(resources, expectedResources)
 		})
 
-		It("should render properly when PSP is not supported by the cluster", func() {
-			cfg.UsePSP = false
+		It("should render SecurityContextConstrains properly when provider is OpenShift", func() {
+			cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
+			cfg.OpenShift = true
 			component := render.Dex(cfg)
 			Expect(component.ResolveImages(nil)).To(BeNil())
 			resources, _ := component.Objects()
 
-			// Should not contain any PodSecurityPolicies
-			for _, r := range resources {
-				Expect(r.GetObjectKind().GroupVersionKind().Kind).NotTo(Equal("PodSecurityPolicy"))
-			}
+			role := rtest.GetResource(resources, "tigera-dex", "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
+			Expect(role.Rules).To(ContainElement(rbacv1.PolicyRule{
+				APIGroups:     []string{"security.openshift.io"},
+				Resources:     []string{"securitycontextconstraints"},
+				Verbs:         []string{"use"},
+				ResourceNames: []string{"nonroot-v2"},
+			}))
 		})
 
 		It("should not render PodAffinity when ControlPlaneReplicas is 1", func() {
@@ -499,7 +520,7 @@ var _ = Describe("dex rendering tests", func() {
 
 			DescribeTable("should render allow-tigera policy",
 				func(scenario testutils.AllowTigeraScenario) {
-					cfg.Openshift = scenario.Openshift
+					cfg.OpenShift = scenario.OpenShift
 					component := render.Dex(cfg)
 					resources, _ := component.Objects()
 
@@ -508,9 +529,36 @@ var _ = Describe("dex rendering tests", func() {
 					Expect(policy).To(Equal(expectedPolicy))
 				},
 				// Dex only renders in the presence of an Authentication CR, therefore does not have a config option for managed clusters.
-				Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: false}),
-				Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: true}),
+				Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false}),
+				Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true}),
 			)
 		})
 	})
 })
+
+// ConfigYAML is a slimmed down version of https://github.com/dexidp/dex/blob/v2.41.1/cmd/dex/config.go
+type ConfigYAML struct {
+	Web           Web             `yaml:"web"`
+	StaticClients []StaticClients `yaml:"staticClients"`
+	Expiry        Expiry          `yaml:"expiry"`
+}
+
+type Web struct {
+	Headers Headers `json:"headers"`
+}
+
+type StaticClients struct {
+	RedirectURIs []string `yaml:"redirectURIs"`
+}
+
+type Expiry struct {
+	IDTokens string `yaml:"idTokens"`
+}
+
+type Headers struct {
+	ContentSecurityPolicy   string `yaml:"Content-Security-Policy"`
+	XFrameOptions           string `yaml:"X-Frame-Options"`
+	XContentTypeOptions     string `yaml:"X-Content-Type-Options"`
+	XXSSProtection          string `yaml:"X-XSS-Protection"`
+	StrictTransportSecurity string `yaml:"Strict-Transport-Security"`
+}

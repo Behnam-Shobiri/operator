@@ -60,6 +60,15 @@ var (
 
 	TolerateCriticalAddonsAndControlPlane = append(TolerateControlPlane, TolerateCriticalAddonsOnly)
 
+	// TolerateGKEARM64NoSchedule allows pods to be scheduled on GKE Arm64 nodes.
+	// See https://cloud.google.com/kubernetes-engine/docs/how-to/prepare-arm-workloads-for-deployment#multi-arch-schedule-any-arch
+	TolerateGKEARM64NoSchedule = corev1.Toleration{
+		Key:      "kubernetes.io/arch",
+		Operator: corev1.TolerationOpEqual,
+		Value:    "arm64",
+		Effect:   corev1.TaintEffectNoSchedule,
+	}
+
 	// TolerateAll returns tolerations to tolerate all taints. When used, it is not necessary
 	// to include the user's custom tolerations because we already tolerate everything.
 	TolerateAll = []corev1.Toleration{
@@ -108,6 +117,14 @@ func APIServerNamespace(v operatorv1.ProductVariant) string {
 		return "calico-apiserver"
 	}
 	return "tigera-system"
+}
+
+// APIServerDeploymentName returns the deployment to use for the API server component.
+func APIServerDeploymentName(v operatorv1.ProductVariant) string {
+	if v == operatorv1.Calico {
+		return "calico-apiserver"
+	}
+	return "tigera-apiserver"
 }
 
 // GetResourceRequirements retrieves the component ResourcesRequirements from the installation. If it doesn't exist, it

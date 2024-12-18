@@ -160,9 +160,7 @@ var (
 	expectedVolumeMounts = []corev1.VolumeMount{
 		{MountPath: "/etc/pki/tls/certs", Name: "tigera-ca-bundle", ReadOnly: true},
 		{MountPath: "/node-certs", Name: "node-certs", ReadOnly: true},
-		{
-			MountPath: "/var/log/calico/snort-alerts", Name: "log-snort-alters",
-		},
+		{MountPath: "/var/log/calico/snort-alerts", Name: "log-snort-alters"},
 	}
 
 	pullSecrets = []*corev1.Secret{{
@@ -220,7 +218,7 @@ var _ = Describe("DPI rendering tests", func() {
 			Installation:       installation,
 			TyphaNodeTLS:       typhaNodeTLS,
 			PullSecrets:        pullSecrets,
-			Openshift:          false,
+			OpenShift:          false,
 			HasNoLicense:       false,
 			HasNoDPIResource:   false,
 			ClusterDomain:      dns.DefaultClusterDomain,
@@ -233,29 +231,25 @@ var _ = Describe("DPI rendering tests", func() {
 
 		resources, _ := component.Objects()
 
-		expectedResources := []resourceTestObj{
-			{name: dpi.DeepPacketInspectionNamespace, ns: "", group: "", version: "v1", kind: "Namespace"},
-			{name: dpi.DeepPacketInspectionPolicyName, ns: dpi.DeepPacketInspectionNamespace, group: "projectcalico.org", version: "v3", kind: "NetworkPolicy"},
-			{name: "pull-secret", ns: dpi.DeepPacketInspectionNamespace, group: "", version: "v1", kind: "Secret"},
-			{name: dpi.DeepPacketInspectionName, ns: dpi.DeepPacketInspectionNamespace, group: "", version: "v1", kind: "ServiceAccount"},
-			{name: dpi.DeepPacketInspectionName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole"},
-			{name: dpi.DeepPacketInspectionName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
-			{name: dpi.DeepPacketInspectionName, ns: dpi.DeepPacketInspectionNamespace, group: "apps", version: "v1", kind: "DaemonSet"},
-			{name: dpi.DeepPacketInspectionLinseedRBACName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole"},
-			{name: dpi.DeepPacketInspectionLinseedRBACName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
+		expectedResources := []client.Object{
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"}},
+			&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionPolicyName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "DaemonSet", APIVersion: "apps/v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 		}
 
-		Expect(len(resources)).To(Equal(len(expectedResources)))
-
-		for i, expectedRes := range expectedResources {
-			rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
-		}
+		rtest.ExpectResources(resources, expectedResources)
 
 		ds := rtest.GetResource(resources, dpi.DeepPacketInspectionName, dpi.DeepPacketInspectionNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
 		Expect(ds.Spec.Template.Spec.Containers[0].Env).Should(ContainElements(
 			corev1.EnvVar{Name: "LINSEED_CLIENT_CERT", Value: "/deep-packet-inspection-tls/tls.crt"},
 			corev1.EnvVar{Name: "LINSEED_CLIENT_KEY", Value: "/deep-packet-inspection-tls/tls.key"},
-			corev1.EnvVar{Name: "FIPS_MODE_ENABLED", Value: "false"},
 			corev1.EnvVar{Name: "LINSEED_TOKEN", Value: "/var/run/secrets/kubernetes.io/serviceaccount/token"},
 		))
 		Expect(len(ds.Spec.Template.Spec.Containers)).Should(Equal(1))
@@ -273,7 +267,7 @@ var _ = Describe("DPI rendering tests", func() {
 			Installation:       installation,
 			TyphaNodeTLS:       typhaNodeTLS,
 			PullSecrets:        pullSecrets,
-			Openshift:          false,
+			OpenShift:          false,
 			HasNoLicense:       false,
 			HasNoDPIResource:   false,
 			ClusterDomain:      dns.DefaultClusterDomain,
@@ -294,6 +288,7 @@ var _ = Describe("DPI rendering tests", func() {
 			&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "DaemonSet", APIVersion: "apps/v1"}},
 			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}},
 			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 		}
 		rtest.ExpectResources(resources, expectedResources)
 
@@ -301,7 +296,6 @@ var _ = Describe("DPI rendering tests", func() {
 		Expect(ds.Spec.Template.Spec.Containers[0].Env).Should(ContainElements(
 			corev1.EnvVar{Name: "LINSEED_CLIENT_CERT", Value: "/deep-packet-inspection-tls/tls.crt"},
 			corev1.EnvVar{Name: "LINSEED_CLIENT_KEY", Value: "/deep-packet-inspection-tls/tls.key"},
-			corev1.EnvVar{Name: "FIPS_MODE_ENABLED", Value: "false"},
 			corev1.EnvVar{Name: "LINSEED_TOKEN", Value: "/var/run/secrets/kubernetes.io/serviceaccount/token"},
 		))
 		Expect(len(ds.Spec.Template.Spec.Containers)).Should(Equal(1))
@@ -319,7 +313,7 @@ var _ = Describe("DPI rendering tests", func() {
 			Installation:       installation,
 			TyphaNodeTLS:       typhaNodeTLS,
 			PullSecrets:        pullSecrets,
-			Openshift:          false,
+			OpenShift:          false,
 			HasNoLicense:       false,
 			HasNoDPIResource:   false,
 			ClusterDomain:      dns.DefaultClusterDomain,
@@ -339,6 +333,7 @@ var _ = Describe("DPI rendering tests", func() {
 			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionNamespace}},
 			&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "DaemonSet", APIVersion: "apps/v1"}},
 			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-linseed", Namespace: dpi.DeepPacketInspectionNamespace}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 		}
 		rtest.ExpectResources(resources, expectedResources)
 
@@ -346,7 +341,6 @@ var _ = Describe("DPI rendering tests", func() {
 		Expect(ds.Spec.Template.Spec.Containers[0].Env).Should(ContainElements(
 			corev1.EnvVar{Name: "LINSEED_CLIENT_CERT", Value: "/deep-packet-inspection-tls/tls.crt"},
 			corev1.EnvVar{Name: "LINSEED_CLIENT_KEY", Value: "/deep-packet-inspection-tls/tls.key"},
-			corev1.EnvVar{Name: "FIPS_MODE_ENABLED", Value: "false"},
 			corev1.EnvVar{Name: "LINSEED_TOKEN", Value: render.LinseedTokenPath},
 		))
 		Expect(len(ds.Spec.Template.Spec.Containers)).Should(Equal(1))
@@ -364,7 +358,7 @@ var _ = Describe("DPI rendering tests", func() {
 			Installation:       installation,
 			TyphaNodeTLS:       typhaNodeTLS,
 			PullSecrets:        pullSecrets,
-			Openshift:          false,
+			OpenShift:          false,
 			HasNoLicense:       false,
 			HasNoDPIResource:   true,
 			ManagementCluster:  true,
@@ -379,6 +373,7 @@ var _ = Describe("DPI rendering tests", func() {
 			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName}},
 			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}},
 			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 		}
 		rtest.ExpectResources(resources, expectedResources)
 
@@ -399,39 +394,38 @@ var _ = Describe("DPI rendering tests", func() {
 		ids2 := &operatorv1.IntrusionDetection{
 			TypeMeta:   metav1.TypeMeta{Kind: "IntrusionDetection", APIVersion: "v1"},
 			ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure"},
-			Spec: operatorv1.IntrusionDetectionSpec{ComponentResources: []operatorv1.IntrusionDetectionComponentResource{
-				{
-					ComponentName: "DeepPacketInspection",
-					ResourceRequirements: &corev1.ResourceRequirements{
-						Limits: corev1.ResourceList{"memory": memoryLimit, "cpu": cpuLimit},
+			Spec: operatorv1.IntrusionDetectionSpec{
+				ComponentResources: []operatorv1.IntrusionDetectionComponentResource{
+					{
+						ComponentName: "DeepPacketInspection",
+						ResourceRequirements: &corev1.ResourceRequirements{
+							Limits: corev1.ResourceList{"memory": memoryLimit, "cpu": cpuLimit},
+						},
 					},
 				},
-			}},
+			},
 		}
 
 		cfg.IntrusionDetection = ids2
-		cfg.Openshift = true
+		cfg.OpenShift = true
 		component := dpi.DPI(cfg)
 
 		resources, _ := component.Objects()
 
-		expectedResources := []resourceTestObj{
-			{name: dpi.DeepPacketInspectionNamespace, ns: "", group: "", version: "v1", kind: "Namespace"},
-			{name: dpi.DeepPacketInspectionPolicyName, ns: dpi.DeepPacketInspectionNamespace, group: "projectcalico.org", version: "v3", kind: "NetworkPolicy"},
-			{name: "pull-secret", ns: dpi.DeepPacketInspectionNamespace, group: "", version: "v1", kind: "Secret"},
-			{name: dpi.DeepPacketInspectionName, ns: dpi.DeepPacketInspectionNamespace, group: "", version: "v1", kind: "ServiceAccount"},
-			{name: dpi.DeepPacketInspectionName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole"},
-			{name: dpi.DeepPacketInspectionName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
-			{name: dpi.DeepPacketInspectionName, ns: dpi.DeepPacketInspectionNamespace, group: "apps", version: "v1", kind: "DaemonSet"},
-			{name: dpi.DeepPacketInspectionLinseedRBACName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole"},
-			{name: dpi.DeepPacketInspectionLinseedRBACName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
+		expectedResources := []client.Object{
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"}},
+			&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionPolicyName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "DaemonSet", APIVersion: "apps/v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 		}
 
-		Expect(len(resources)).To(Equal(len(expectedResources)))
-
-		for i, expectedRes := range expectedResources {
-			rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
-		}
+		rtest.ExpectResources(resources, expectedResources)
 
 		ds := rtest.GetResource(resources, dpi.DeepPacketInspectionName, dpi.DeepPacketInspectionNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
 		Expect(len(ds.Spec.Template.Spec.Containers)).Should(Equal(1))
@@ -476,7 +470,7 @@ var _ = Describe("DPI rendering tests", func() {
 			Installation:       installation,
 			TyphaNodeTLS:       typhaNodeTLS,
 			PullSecrets:        pullSecrets,
-			Openshift:          false,
+			OpenShift:          false,
 			HasNoLicense:       false,
 			HasNoDPIResource:   true,
 			ManagedCluster:     true,
@@ -502,6 +496,7 @@ var _ = Describe("DPI rendering tests", func() {
 		expectedCreateResources := []client.Object{
 			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName}},
 			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-linseed", Namespace: dpi.DeepPacketInspectionNamespace}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 		}
 		rtest.ExpectResources(createResources, expectedCreateResources)
 	})
@@ -512,7 +507,7 @@ var _ = Describe("DPI rendering tests", func() {
 			Installation:       installation,
 			TyphaNodeTLS:       typhaNodeTLS,
 			PullSecrets:        pullSecrets,
-			Openshift:          false,
+			OpenShift:          false,
 			HasNoLicense:       false,
 			HasNoDPIResource:   true,
 			ManagementCluster:  true,
@@ -538,6 +533,7 @@ var _ = Describe("DPI rendering tests", func() {
 			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName}},
 			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}},
 			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 		}
 		rtest.ExpectResources(createResources, expectedCreateResources)
 	})
@@ -546,31 +542,41 @@ var _ = Describe("DPI rendering tests", func() {
 		cfg.HasNoDPIResource = true
 		component := dpi.DPI(cfg)
 		createResources, deleteResource := component.Objects()
-		expectedResources := []resourceTestObj{
-			{name: relasticsearch.PublicCertSecret, ns: dpi.DeepPacketInspectionNamespace, group: "", version: "v1", kind: "Secret"},
-			{name: dpi.DeepPacketInspectionPolicyName, ns: dpi.DeepPacketInspectionNamespace, group: "projectcalico.org", version: "v3", kind: "NetworkPolicy"},
-			{name: "pull-secret", ns: dpi.DeepPacketInspectionNamespace, group: "", version: "v1", kind: "Secret"},
-			{name: dpi.DeepPacketInspectionName, ns: dpi.DeepPacketInspectionNamespace, group: "", version: "v1", kind: "ServiceAccount"},
-			{name: dpi.DeepPacketInspectionName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole"},
-			{name: dpi.DeepPacketInspectionName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
-			{name: dpi.DeepPacketInspectionName, ns: dpi.DeepPacketInspectionNamespace, group: "apps", version: "v1", kind: "DaemonSet"},
-			{name: dpi.DeepPacketInspectionLinseedRBACName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole"},
-			{name: dpi.DeepPacketInspectionLinseedRBACName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
-			{name: "tigera-linseed", ns: "tigera-dpi", group: "rbac.authorization.k8s.io", version: "v1", kind: "RoleBinding"},
+		expectedResources := []client.Object{
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: relasticsearch.PublicCertSecret, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+			&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionPolicyName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "DaemonSet", APIVersion: "apps/v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-linseed", Namespace: "tigera-dpi"}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 		}
 
-		expectedCreateResources := []resourceTestObj{
-			{name: dpi.DeepPacketInspectionNamespace, ns: "", group: "", version: "v1", kind: "Namespace"},
+		expectedCreateResources := []client.Object{
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 		}
-		Expect(len(deleteResource)).To(Equal(len(expectedResources)))
-		Expect(len(createResources)).To(Equal(len(expectedCreateResources)))
+		rtest.ExpectResources(deleteResource, expectedResources)
+		rtest.ExpectResources(createResources, expectedCreateResources)
+	})
 
-		for i, expectedRes := range expectedResources {
-			rtest.ExpectResourceTypeAndObjectMetadata(deleteResource[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
-		}
-		for i, expectedRes := range expectedCreateResources {
-			rtest.ExpectResourceTypeAndObjectMetadata(createResources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
-		}
+	It("should render SecurityContextConstrains properly when provider is OpenShift", func() {
+		cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
+		cfg.OpenShift = true
+		component := dpi.DPI(cfg)
+		Expect(component.ResolveImages(nil)).To(BeNil())
+		resources, _ := component.Objects()
+
+		role := rtest.GetResource(resources, "tigera-dpi", "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
+		Expect(role.Rules).To(ContainElement(rbacv1.PolicyRule{
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
+			Verbs:         []string{"use"},
+			ResourceNames: []string{"privileged"},
+		}))
 	})
 
 	Context("allow-tigera rendering", func() {
@@ -589,7 +595,7 @@ var _ = Describe("DPI rendering tests", func() {
 		DescribeTable("should render allow-tigera policy",
 			func(scenario testutils.AllowTigeraScenario) {
 				cfg.ManagedCluster = scenario.ManagedCluster
-				cfg.Openshift = scenario.Openshift
+				cfg.OpenShift = scenario.OpenShift
 				component := dpi.DPI(cfg)
 				resources, _ := component.Objects()
 
@@ -597,11 +603,166 @@ var _ = Describe("DPI rendering tests", func() {
 				expectedPolicy := getExpectedPolicy(scenario)
 				Expect(policy).To(Equal(expectedPolicy))
 			},
-			Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: false}),
-			Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: true}),
-			Entry("for managed, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: true, Openshift: false}),
-			Entry("for managed, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: true, Openshift: true}),
+			Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false}),
+			Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true}),
+			Entry("for managed, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: true, OpenShift: false}),
+			Entry("for managed, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: true, OpenShift: true}),
 		)
+	})
+
+	Context("with DPI init container configured", func() {
+		BeforeEach(func() {
+			ids.Spec.DeepPacketInspectionDaemonset = &operatorv1.DeepPacketInspectionDaemonset{
+				Spec: &operatorv1.DPIDaemonsetSpec{
+					Template: &operatorv1.DPIDaemonsetTemplate{
+						Spec: &operatorv1.DPIDaemonsetTemplateSpec{
+							InitContainers: []operatorv1.DPIDaemonsetInitContainer{
+								{
+									Name:  "snort-rules",
+									Image: "gcr.io/blah/snort-rules:rev01",
+								},
+							},
+						},
+					},
+				},
+			}
+		})
+
+		AfterEach(func() {
+			ids.Spec.DeepPacketInspectionDaemonset = nil
+		})
+
+		It("should render all other DPI resources unchanged when the DPI init container is configured", func() {
+			component := dpi.DPI(cfg)
+
+			resources, _ := component.Objects()
+
+			expectedResources := []client.Object{
+				&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"}},
+				&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionPolicyName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "pull-secret", Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
+				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionName, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "DaemonSet", APIVersion: "apps/v1"}},
+				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: dpi.DeepPacketInspectionLinseedRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: dpi.DeepPacketInspectionNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			}
+
+			rtest.ExpectResources(resources, expectedResources)
+
+			ds := rtest.GetResource(resources, dpi.DeepPacketInspectionName, dpi.DeepPacketInspectionNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
+			Expect(ds.Spec.Template.Spec.Containers[0].Env).Should(ContainElements(
+				corev1.EnvVar{Name: "LINSEED_CLIENT_CERT", Value: "/deep-packet-inspection-tls/tls.crt"},
+				corev1.EnvVar{Name: "LINSEED_CLIENT_KEY", Value: "/deep-packet-inspection-tls/tls.key"},
+				corev1.EnvVar{Name: "LINSEED_TOKEN", Value: "/var/run/secrets/kubernetes.io/serviceaccount/token"},
+			))
+			Expect(len(ds.Spec.Template.Spec.Containers)).Should(Equal(1))
+			Expect(*ds.Spec.Template.Spec.Containers[0].Resources.Requests.Cpu()).Should(Equal(resource.MustParse(dpi.DefaultCPURequest)))
+			Expect(*ds.Spec.Template.Spec.Containers[0].Resources.Limits.Cpu()).Should(Equal(resource.MustParse(dpi.DefaultCPULimit)))
+			Expect(*ds.Spec.Template.Spec.Containers[0].Resources.Requests.Memory()).Should(Equal(resource.MustParse(dpi.DefaultMemoryRequest)))
+			Expect(*ds.Spec.Template.Spec.Containers[0].Resources.Limits.Memory()).Should(Equal(resource.MustParse(dpi.DefaultMemoryLimit)))
+
+			validateDPIComponents(resources, false)
+		})
+
+		It("should render the DPI Daemonset and the init container for the DPI Daemonset with correct volumes and respective mounts", func() {
+			resources, _ := dpi.DPI(cfg).Objects()
+			dpiDaemonset := rtest.GetResource(resources, dpi.DeepPacketInspectionName, dpi.DeepPacketInspectionNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
+
+			Expect(dpiDaemonset.Spec.Template.Spec.Volumes).To(ContainElement(
+				corev1.Volume{
+					Name: "snort-cache",
+					VolumeSource: corev1.VolumeSource{
+						EmptyDir: &corev1.EmptyDirVolumeSource{},
+					},
+				},
+			))
+
+			Expect(dpiDaemonset.Spec.Template.Spec.Containers[0].VolumeMounts).To(ContainElement(
+				corev1.VolumeMount{
+					MountPath: "/usr/etc/snort/rules",
+					Name:      "snort-cache",
+					ReadOnly:  true,
+				},
+			))
+
+			Expect(len(dpiDaemonset.Spec.Template.Spec.InitContainers)).To(Equal(1))
+			Expect(dpiDaemonset.Spec.Template.Spec.InitContainers[0].Name).Should(Equal("snort-rules"))
+			Expect(dpiDaemonset.Spec.Template.Spec.InitContainers[0].Image).Should(Equal("gcr.io/blah/snort-rules:rev01"))
+			Expect(dpiDaemonset.Spec.Template.Spec.InitContainers[0].VolumeMounts).Should(Equal(
+				[]corev1.VolumeMount{
+					{
+						MountPath: "/usr/etc/snort/rules",
+						Name:      "snort-cache",
+						ReadOnly:  false,
+					},
+				},
+			))
+
+			validateDPIComponents(resources, false)
+		})
+
+		It("should respect custom resource requirements for the DPI init container", func() {
+			memoryLimit := resource.MustParse("5Gi")
+			cpuLimit := resource.MustParse("5")
+			ids.Spec.DeepPacketInspectionDaemonset.Spec.Template.Spec.InitContainers[0].Resources = &corev1.ResourceRequirements{
+				Limits: corev1.ResourceList{
+					corev1.ResourceMemory: memoryLimit,
+					corev1.ResourceCPU:    cpuLimit,
+				},
+			}
+
+			resources, _ := dpi.DPI(cfg).Objects()
+			dpiDaemonset := rtest.GetResource(resources, dpi.DeepPacketInspectionName, dpi.DeepPacketInspectionNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
+			Expect(len(dpiDaemonset.Spec.Template.Spec.InitContainers)).Should(Equal(1))
+			Expect(*dpiDaemonset.Spec.Template.Spec.InitContainers[0].Resources.Limits.Cpu()).Should(Equal(cpuLimit))
+			Expect(*dpiDaemonset.Spec.Template.Spec.InitContainers[0].Resources.Limits.Memory()).Should(Equal(memoryLimit))
+			Expect(dpiDaemonset.Spec.Template.Spec.InitContainers[0].Resources.Requests.Cpu().IsZero()).Should(BeTrue())
+			Expect(dpiDaemonset.Spec.Template.Spec.InitContainers[0].Resources.Requests.Memory().IsZero()).Should(BeTrue())
+
+			validateDPIComponents(resources, false)
+		})
+	})
+
+	Context("multi-tenant", func() {
+		It("should render RBAC to allow Linseed access", func() {
+			cfg.Tenant = &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tenantA",
+					Namespace: "tenantANamespace",
+				},
+				Spec: operatorv1.TenantSpec{
+					ID: "tenant-a-id",
+				},
+			}
+			dpiComponent := dpi.DPI(cfg)
+
+			resources, _ := dpiComponent.Objects()
+
+			cr := rtest.GetResource(resources, dpi.DeepPacketInspectionLinseedRBACName, "", rbacv1.GroupName, "v1", "ClusterRole").(*rbacv1.ClusterRole)
+			expectedRules := []rbacv1.PolicyRule{
+				{
+					APIGroups: []string{"linseed.tigera.io"},
+					Resources: []string{"events"},
+					Verbs: []string{
+						"create",
+					},
+				},
+			}
+			Expect(cr.Rules).To(ContainElements(expectedRules))
+			rb := rtest.GetResource(resources, dpi.DeepPacketInspectionLinseedRBACName, "", rbacv1.GroupName, "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
+			Expect(rb.RoleRef.Kind).To(Equal("ClusterRole"))
+			Expect(rb.RoleRef.Name).To(Equal(dpi.DeepPacketInspectionLinseedRBACName))
+			Expect(rb.Subjects).To(ContainElements([]rbacv1.Subject{
+				{
+					Kind:      "ServiceAccount",
+					Name:      dpi.DeepPacketInspectionName,
+					Namespace: dpi.DeepPacketInspectionNamespace,
+				},
+			}))
+		})
 	})
 })
 
@@ -642,5 +803,6 @@ func validateDPIComponents(resources []client.Object, openshift bool) {
 	Expect(dpiDaemonSet.Spec.Template.Spec.Containers[0].SecurityContext.SeccompProfile).To(Equal(
 		&corev1.SeccompProfile{
 			Type: corev1.SeccompProfileTypeRuntimeDefault,
-		}))
+		},
+	))
 }

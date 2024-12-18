@@ -17,9 +17,13 @@ package render_test
 import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
-	operatorv1 "github.com/tigera/operator/api/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/render"
 	rtest "github.com/tigera/operator/pkg/render/common/test"
 )
@@ -35,59 +39,99 @@ var _ = Describe("Namespace rendering tests", func() {
 	It("should render a namespace", func() {
 		component := render.Namespaces(cfg)
 		resources, _ := component.Objects()
-		Expect(len(resources)).To(Equal(1))
-		rtest.ExpectResourceTypeAndObjectMetadata(resources[0], "calico-system", "", "", "v1", "Namespace")
-		meta := resources[0].(metav1.ObjectMetaAccessor).GetObjectMeta()
-		Expect(meta.GetLabels()["name"]).To(Equal("calico-system"))
-		Expect(meta.GetLabels()).NotTo(ContainElement("openshift.io/run-level"))
-		Expect(meta.GetLabels()).NotTo(ContainElement("control-plane"))
-		Expect(meta.GetAnnotations()).NotTo(ContainElement("openshift.io/node-selector"))
+
+		expectedCreateResources := []client.Object{
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-operator-secrets", Namespace: "calico-system"}},
+		}
+
+		rtest.ExpectResources(resources, expectedCreateResources)
+
+		namespace := rtest.GetResource(resources, "calico-system", "", "", "v1", "Namespace").(*corev1.Namespace)
+
+		Expect(namespace.Labels["name"]).To(Equal("calico-system"))
+		Expect(namespace.GetLabels()).NotTo(ContainElement("openshift.io/run-level"))
+		Expect(namespace.GetLabels()).NotTo(ContainElement("control-plane"))
+		Expect(namespace.GetAnnotations()).NotTo(ContainElement("openshift.io/node-selector"))
 	})
 
 	It("should render a namespace for openshift", func() {
 		cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
 		component := render.Namespaces(cfg)
 		resources, _ := component.Objects()
-		Expect(len(resources)).To(Equal(1))
-		rtest.ExpectResourceTypeAndObjectMetadata(resources[0], "calico-system", "", "", "v1", "Namespace")
-		meta := resources[0].(metav1.ObjectMetaAccessor).GetObjectMeta()
-		Expect(meta.GetLabels()["openshift.io/run-level"]).To(Equal("0"))
-		Expect(meta.GetLabels()).NotTo(ContainElement("control-plane"))
-		Expect(meta.GetAnnotations()["openshift.io/node-selector"]).To(Equal(""))
+
+		expectedCreateResources := []client.Object{
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-operator-secrets", Namespace: "calico-system"}},
+		}
+
+		rtest.ExpectResources(resources, expectedCreateResources)
+
+		namespace := rtest.GetResource(resources, "calico-system", "", "", "v1", "Namespace").(*corev1.Namespace)
+		Expect(namespace.GetLabels()["openshift.io/run-level"]).To(Equal("0"))
+		Expect(namespace.GetLabels()).NotTo(ContainElement("control-plane"))
+		Expect(namespace.GetAnnotations()["openshift.io/node-selector"]).To(Equal(""))
+		Expect(namespace.GetAnnotations()["security.openshift.io/scc.podSecurityLabelSync"]).To(Equal("false"))
 	})
 
-	It("should render a namespace for aks", func() {
+	It("should render a namespace for aks with control-plane label when Azure is nil and PodSecurityStandard is privileged", func() {
 		cfg.Installation.KubernetesProvider = operatorv1.ProviderAKS
 		component := render.Namespaces(cfg)
 		resources, _ := component.Objects()
-		Expect(len(resources)).To(Equal(1))
+
+		expectedCreateResources := []client.Object{
+			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}},
+			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-operator-secrets", Namespace: "calico-system"}},
+		}
+
+		rtest.ExpectResources(resources, expectedCreateResources)
+		namespace := rtest.GetResource(resources, "calico-system", "", "", "v1", "Namespace").(*corev1.Namespace)
+		Expect(namespace.GetLabels()).NotTo(ContainElement("openshift.io/run-level"))
+		Expect(namespace.GetLabels()["control-plane"]).To(Equal("true"))
+	})
+
+	It("should render a namespace for aks with control-plane label when Azure.PolicyMode is nil and PodSecurityStandard is privileged", func() {
+		cfg.Installation.KubernetesProvider = operatorv1.ProviderAKS
+		cfg.Installation.Azure = &operatorv1.Azure{}
+		component := render.Namespaces(cfg)
+		resources, _ := component.Objects()
+		Expect(len(resources)).To(Equal(2))
 		rtest.ExpectResourceTypeAndObjectMetadata(resources[0], "calico-system", "", "", "v1", "Namespace")
 		meta := resources[0].(metav1.ObjectMetaAccessor).GetObjectMeta()
 		Expect(meta.GetLabels()).NotTo(ContainElement("openshift.io/run-level"))
 		Expect(meta.GetLabels()["control-plane"]).To(Equal("true"))
+		rtest.ExpectResourceTypeAndObjectMetadata(resources[1], "tigera-operator-secrets", "calico-system", "rbac.authorization.k8s.io", "v1", "RoleBinding")
 	})
 
-	It("should render a namespace for tigera-dex on EE", func() {
-		cfg.Installation.Variant = operatorv1.TigeraSecureEnterprise
+	It("should render a namespace for aks with control-plane label when Azure.PolicyMode is Default and PodSecurityStandard is privileged", func() {
+		cfg.Installation.KubernetesProvider = operatorv1.ProviderAKS
+		policyMode := operatorv1.Default
+		cfg.Installation.Azure = &operatorv1.Azure{
+			PolicyMode: &policyMode,
+		}
 		component := render.Namespaces(cfg)
 		resources, _ := component.Objects()
 		Expect(len(resources)).To(Equal(2))
-		rtest.ExpectResourceTypeAndObjectMetadata(resources[1], "tigera-dex", "", "", "v1", "Namespace")
-		meta := resources[1].(metav1.ObjectMetaAccessor).GetObjectMeta()
-		Expect(meta.GetLabels()["name"]).To(Equal("tigera-dex"))
+		rtest.ExpectResourceTypeAndObjectMetadata(resources[0], "calico-system", "", "", "v1", "Namespace")
+		meta := resources[0].(metav1.ObjectMetaAccessor).GetObjectMeta()
 		Expect(meta.GetLabels()).NotTo(ContainElement("openshift.io/run-level"))
-		Expect(meta.GetAnnotations()).NotTo(ContainElement("openshift.io/node-selector"))
+		Expect(meta.GetLabels()["control-plane"]).To(Equal("true"))
+		rtest.ExpectResourceTypeAndObjectMetadata(resources[1], "tigera-operator-secrets", "calico-system", "rbac.authorization.k8s.io", "v1", "RoleBinding")
 	})
 
-	It("should render a namespace for tigera-dex for openshift on EE", func() {
-		cfg.Installation.Variant = operatorv1.TigeraSecureEnterprise
-		cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
+	It("should render a namespace for aks without control-plane label when Azure.PolicyMode is Manual", func() {
+		cfg.Installation.KubernetesProvider = operatorv1.ProviderAKS
+		policyMode := operatorv1.Manual
+		cfg.Installation.Azure = &operatorv1.Azure{
+			PolicyMode: &policyMode,
+		}
 		component := render.Namespaces(cfg)
 		resources, _ := component.Objects()
 		Expect(len(resources)).To(Equal(2))
-		rtest.ExpectResourceTypeAndObjectMetadata(resources[1], "tigera-dex", "", "", "v1", "Namespace")
-		meta := resources[1].(metav1.ObjectMetaAccessor).GetObjectMeta()
-		Expect(meta.GetLabels()["openshift.io/run-level"]).To(Equal("0"))
-		Expect(meta.GetAnnotations()["openshift.io/node-selector"]).To(Equal(""))
+		rtest.ExpectResourceTypeAndObjectMetadata(resources[0], "calico-system", "", "", "v1", "Namespace")
+		meta := resources[0].(metav1.ObjectMetaAccessor).GetObjectMeta()
+		Expect(meta.GetLabels()).NotTo(ContainElement("openshift.io/run-level"))
+		Expect(meta.GetLabels()).NotTo(ContainElement("control-plane"))
+		rtest.ExpectResourceTypeAndObjectMetadata(resources[1], "tigera-operator-secrets", "calico-system", "rbac.authorization.k8s.io", "v1", "RoleBinding")
 	})
 })

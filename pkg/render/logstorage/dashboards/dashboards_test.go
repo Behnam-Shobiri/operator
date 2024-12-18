@@ -18,27 +18,23 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/tigera/api/pkg/lib/numorstring"
-
-	"k8s.io/apimachinery/pkg/api/resource"
-
-	"github.com/google/go-cmp/cmp"
-	"github.com/tigera/operator/pkg/render/logstorage"
-	batchv1 "k8s.io/api/batch/v1"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/google/go-cmp/cmp"
+
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+	"github.com/tigera/api/pkg/lib/numorstring"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
@@ -49,6 +45,8 @@ import (
 	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rtest "github.com/tigera/operator/pkg/render/common/test"
+	"github.com/tigera/operator/pkg/render/logstorage"
+	"github.com/tigera/operator/pkg/render/logstorage/kibana"
 	"github.com/tigera/operator/pkg/render/testutils"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
@@ -74,13 +72,12 @@ var _ = Describe("Dashboards rendering tests", func() {
 			{Name, render.ElasticsearchNamespace, &batchv1.Job{}, nil},
 			{Name, "", &rbacv1.ClusterRole{}, nil},
 			{Name, "", &rbacv1.ClusterRoleBinding{}, nil},
-			{Name, "", &policyv1beta1.PodSecurityPolicy{}, nil},
 		}
 
 		BeforeEach(func() {
 			installation = &operatorv1.InstallationSpec{
 				ControlPlaneReplicas: &replicas,
-				KubernetesProvider:   operatorv1.ProviderNone,
+				KubernetesProvider:   operatorv1.ProviderOpenShift,
 				Registry:             "testregistry.com/",
 			}
 
@@ -93,7 +90,6 @@ var _ = Describe("Dashboards rendering tests", func() {
 					{ObjectMeta: metav1.ObjectMeta{Name: "tigera-pull-secret"}},
 				},
 				TrustedBundle: bundle,
-				UsePSP:        true,
 				Namespace:     render.ElasticsearchNamespace,
 				KibanaHost:    "tigera-secure-kb-http.tigera-kibana.svc",
 				KibanaScheme:  "https",
@@ -107,18 +103,19 @@ var _ = Describe("Dashboards rendering tests", func() {
 			compareResources(createResources, expectedResources)
 		})
 
-		It("should render properly when PSP is not supported by the cluster", func() {
-			cfg.UsePSP = false
+		It("should render SecurityContextConstrains properly when provider is OpenShift", func() {
+			cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
 			component := Dashboards(cfg)
 			Expect(component.ResolveImages(nil)).To(BeNil())
 			resources, _ := component.Objects()
 
-			// Should not contain any PodSecurityPolicies
-			for _, r := range resources {
-				Expect(r.GetObjectKind().GroupVersionKind().Kind).NotTo(Equal("PodSecurityPolicy"))
-				Expect(r.GetObjectKind().GroupVersionKind().Kind).NotTo(Equal("ClusterRole"))
-				Expect(r.GetObjectKind().GroupVersionKind().Kind).NotTo(Equal("ClusterRoleBinding"))
-			}
+			role := rtest.GetResource(resources, "dashboards-installer", "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
+			Expect(role.Rules).To(ContainElement(rbacv1.PolicyRule{
+				APIGroups:     []string{"security.openshift.io"},
+				Resources:     []string{"securitycontextconstraints"},
+				Verbs:         []string{"use"},
+				ResourceNames: []string{"nonroot-v2"},
+			}))
 		})
 
 		It("should apply controlPlaneNodeSelector correctly", func() {
@@ -130,6 +127,22 @@ var _ = Describe("Dashboards rendering tests", func() {
 			job, ok := rtest.GetResource(resources, Name, render.ElasticsearchNamespace, "batch", "v1", "Job").(*batchv1.Job)
 			Expect(ok).To(BeTrue(), "Job not found")
 			Expect(job.Spec.Template.Spec.NodeSelector).To(Equal(map[string]string{"foo": "bar"}))
+		})
+
+		It("should render toleration on GKE", func() {
+			cfg.Installation.KubernetesProvider = operatorv1.ProviderGKE
+
+			component := Dashboards(cfg)
+
+			resources, _ := component.Objects()
+			job, ok := rtest.GetResource(resources, Name, render.ElasticsearchNamespace, "batch", "v1", "Job").(*batchv1.Job)
+			Expect(ok).To(BeTrue(), "Job not found")
+			Expect(job.Spec.Template.Spec.Tolerations).To(ContainElement(corev1.Toleration{
+				Key:      "kubernetes.io/arch",
+				Operator: corev1.TolerationOpEqual,
+				Value:    "arm64",
+				Effect:   corev1.TaintEffectNoSchedule,
+			}))
 		})
 
 		It("should apply controlPlaneTolerations correctly", func() {
@@ -161,7 +174,7 @@ var _ = Describe("Dashboards rendering tests", func() {
 
 			DescribeTable("should render allow-tigera policy",
 				func(scenario testutils.AllowTigeraScenario) {
-					if scenario.Openshift {
+					if scenario.OpenShift {
 						cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
 					} else {
 						cfg.Installation.KubernetesProvider = operatorv1.ProviderNone
@@ -178,30 +191,9 @@ var _ = Describe("Dashboards rendering tests", func() {
 				},
 				// Dashboards only renders in the presence of an LogStorage CR and absence of a ManagementClusterConnection CR, therefore
 				// does not have a config option for managed clusters.
-				Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: false}),
-				Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, Openshift: true}),
+				Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false}),
+				Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true}),
 			)
-		})
-
-		It("should not render when FIPS mode is enabled", func() {
-			bundle := getBundle(installation)
-			enabled := operatorv1.FIPSModeEnabled
-			installation.FIPSMode = &enabled
-			component := Dashboards(&Config{
-				Installation: installation,
-				PullSecrets: []*corev1.Secret{
-					{ObjectMeta: metav1.ObjectMeta{Name: "tigera-pull-secret"}},
-				},
-				TrustedBundle: bundle,
-				Namespace:     render.ElasticsearchNamespace,
-				KibanaHost:    "tigera-secure-kb-http.tigera-kibana.tigera-kibana.svc",
-				KibanaScheme:  "htpps",
-				KibanaPort:    5601,
-			})
-
-			resources, _ := component.Objects()
-			_, ok := rtest.GetResource(resources, Name, render.ElasticsearchNamespace, "batch", "v1", "Job").(*batchv1.Job)
-			Expect(ok).To(BeFalse(), "Jobs not found")
 		})
 	})
 
@@ -451,7 +443,7 @@ var _ = Describe("Dashboards rendering tests", func() {
 			netPol := rtest.GetResource(resources, fmt.Sprintf("allow-tigera.%s", Name), render.ElasticsearchNamespace, "projectcalico.org", "v3", "NetworkPolicy").(*v3.NetworkPolicy)
 			Expect(netPol).NotTo(BeNil())
 			Expect(netPol.Spec.Egress).To(HaveLen(2))
-			Expect(netPol.Spec.Egress[1].Destination).To(Equal(render.KibanaEntityRule))
+			Expect(netPol.Spec.Egress[1].Destination).To(Equal(kibana.EntityRule))
 		})
 
 		It("should render single-tenant environment variables", func() {
@@ -586,16 +578,6 @@ func compareResources(resources []client.Object, expectedResources []resourceTes
 	ExpectWithOffset(1, job.Spec.Template.Annotations).To(HaveKeyWithValue("hash.operator.tigera.io/elasticsearch-secrets", Not(BeEmpty())))
 
 	// Check permissions
-	clusterRole := rtest.GetResource(resources, Name, "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
-	Expect(clusterRole.Rules).To(ConsistOf([]rbacv1.PolicyRule{
-
-		{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
-			ResourceNames: []string{Name},
-			Verbs:         []string{"use"},
-		},
-	}))
 	clusterRoleBinding := rtest.GetResource(resources, Name, "", "rbac.authorization.k8s.io", "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
 	Expect(clusterRoleBinding.RoleRef.Name).To(Equal(Name))
 	Expect(clusterRoleBinding.Subjects).To(ConsistOf([]rbacv1.Subject{
@@ -680,10 +662,6 @@ func expectedContainers() []corev1.Container {
 				{
 					Name:  "KB_CA_CERT",
 					Value: "/etc/pki/tls/certs/tigera-ca-bundle.crt",
-				},
-				{
-					Name:  "FIPS_MODE_ENABLED",
-					Value: "false",
 				},
 				{
 					Name:  "ELASTIC_USER",

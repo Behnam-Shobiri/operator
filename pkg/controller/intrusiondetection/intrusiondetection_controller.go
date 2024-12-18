@@ -20,8 +20,6 @@ import (
 
 	esv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/elasticsearch/v1"
 
-	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
-	"github.com/tigera/operator/pkg/ctrlruntime"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -29,12 +27,15 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
@@ -46,6 +47,8 @@ import (
 	"github.com/tigera/operator/pkg/controller/tenancy"
 	"github.com/tigera/operator/pkg/controller/utils"
 	"github.com/tigera/operator/pkg/controller/utils/imageset"
+	"github.com/tigera/operator/pkg/ctrlruntime"
+	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
@@ -394,7 +397,8 @@ func (r *ReconcileIntrusionDetection) Reconcile(ctx context.Context, request rec
 	}
 
 	// intrusionDetectionKeyPair is the key pair intrusion detection presents to identify itself
-	intrusionDetectionKeyPair, err := certificateManager.GetOrCreateKeyPair(r.client, render.IntrusionDetectionTLSSecretName, helper.TruthNamespace(), []string{render.IntrusionDetectionTLSSecretName})
+	dnsNames := dns.GetServiceDNSNames(render.IntrusionDetectionTLSSecretName, helper.InstallNamespace(), r.clusterDomain)
+	intrusionDetectionKeyPair, err := certificateManager.GetOrCreateKeyPair(r.client, render.IntrusionDetectionTLSSecretName, helper.TruthNamespace(), dnsNames)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Error creating TLS certificate", err, reqLogger)
 		return reconcile.Result{}, err
@@ -456,7 +460,7 @@ func (r *ReconcileIntrusionDetection) Reconcile(ctx context.Context, request rec
 		LogCollector:                 lc,
 		Installation:                 network,
 		PullSecrets:                  pullSecrets,
-		Openshift:                    r.provider == operatorv1.ProviderOpenShift,
+		OpenShift:                    r.provider.IsOpenShift(),
 		ClusterDomain:                r.clusterDomain,
 		ManagedCluster:               isManagedCluster,
 		ManagementCluster:            isManagementCluster,
@@ -467,7 +471,16 @@ func (r *ReconcileIntrusionDetection) Reconcile(ctx context.Context, request rec
 		BindNamespaces:               namespaces,
 		Tenant:                       tenant,
 		ExternalElastic:              r.elasticExternal,
+		SyslogForwardingIsEnabled:    syslogForwardingIsEnabled(lc),
 	}
+	intrusionDetectionNamespaceComponent := render.IntrusionDetectionNamespaceComponent(&render.IntrusionDetectionNamespaceConfiguration{
+		KubernetesProvider:        network.KubernetesProvider,
+		Namespace:                 helper.InstallNamespace(),
+		Tenant:                    tenant,
+		HasNoLicense:              hasNoLicense,
+		SyslogForwardingIsEnabled: syslogForwardingIsEnabled(lc),
+		Azure:                     network.Azure,
+	})
 	intrusionDetectionComponent := render.IntrusionDetection(intrusionDetectionCfg)
 
 	if err = imageset.ApplyImageSet(ctx, r.client, variant, intrusionDetectionComponent); err != nil {
@@ -487,20 +500,20 @@ func (r *ReconcileIntrusionDetection) Reconcile(ctx context.Context, request rec
 	}
 
 	components := []render.Component{
-		intrusionDetectionComponent,
+		intrusionDetectionNamespaceComponent,
 		rcertificatemanagement.CertificateManagement(&rcertificatemanagement.Config{
 			Namespace:       helper.InstallNamespace(),
+			TruthNamespace:  helper.TruthNamespace(),
 			ServiceAccounts: []string{render.IntrusionDetectionName},
 			KeyPairOptions: []rcertificatemanagement.KeyPairOption{
 				rcertificatemanagement.NewKeyPairOption(intrusionDetectionCfg.IntrusionDetectionCertSecret, true, true),
 			},
 			TrustedBundle: bundleMaker,
 		}),
+		intrusionDetectionComponent,
 	}
 
 	if !r.multiTenant {
-		// DPI is only supported in single-tenant / zero-tenant clusters.
-
 		// FIXME: core controller creates TyphaNodeTLSConfig, this controller should only get it.
 		// But changing the call from GetOrCreateTyphaNodeTLSConfig() to GetTyphaNodeTLSConfig()
 		// makes tests fail, this needs to be looked at.
@@ -523,7 +536,7 @@ func (r *ReconcileIntrusionDetection) Reconcile(ctx context.Context, request rec
 			Installation:       network,
 			TyphaNodeTLS:       typhaNodeTLS,
 			PullSecrets:        pullSecrets,
-			Openshift:          r.provider == operatorv1.ProviderOpenShift,
+			OpenShift:          r.provider.IsOpenShift(),
 			ManagedCluster:     isManagedCluster,
 			ManagementCluster:  isManagementCluster,
 			HasNoLicense:       hasNoLicense,
@@ -545,6 +558,18 @@ func (r *ReconcileIntrusionDetection) Reconcile(ctx context.Context, request rec
 			},
 			TrustedBundle: typhaNodeTLS.TrustedBundle,
 		}))
+	} else {
+		dpiComponent := dpi.DPI(&dpi.DPIConfig{
+			IntrusionDetection: instance,
+			Installation:       network,
+			PullSecrets:        pullSecrets,
+			OpenShift:          r.provider.IsOpenShift(),
+			ManagedCluster:     isManagedCluster,
+			ManagementCluster:  isManagementCluster,
+			ClusterDomain:      r.clusterDomain,
+			Tenant:             tenant,
+		})
+		components = append(components, dpiComponent)
 	}
 
 	for _, comp := range components {
@@ -575,6 +600,26 @@ func (r *ReconcileIntrusionDetection) Reconcile(ctx context.Context, request rec
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
+}
+
+// Determine whether this component's configuration has syslog forwarding enabled or not.
+// Look inside LogCollector spec for whether or not Syslog log type SyslogLogIDSEvents
+// exists. If it does, then we need to turn on forwarding for IDS event logs.
+func syslogForwardingIsEnabled(logCollector *operatorv1.LogCollector) bool {
+	if logCollector != nil && logCollector.Spec.AdditionalStores != nil {
+		syslog := logCollector.Spec.AdditionalStores.Syslog
+		if syslog != nil {
+			if syslog.LogTypes != nil {
+				for _, t := range syslog.LogTypes {
+					switch t {
+					case operatorv1.SyslogLogIDSEvents:
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
 }
 
 // fillDefaults updates the IntrusionDetection resource with defaults if

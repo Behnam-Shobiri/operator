@@ -22,8 +22,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/tigera/operator/pkg/controller/logstorage/initializer"
-
 	esv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/elasticsearch/v1"
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	"github.com/tigera/operator/pkg/common"
@@ -39,11 +37,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
+	"github.com/tigera/operator/pkg/controller/logstorage/initializer"
 	"github.com/tigera/operator/pkg/controller/options"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
+	"github.com/tigera/operator/pkg/render/logstorage/kibana"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -63,7 +63,6 @@ type DashboardsSubController struct {
 	status          status.StatusManager
 	provider        operatorv1.Provider
 	clusterDomain   string
-	usePSP          bool
 	multiTenant     bool
 	elasticExternal bool
 	tierWatchReady  *utils.ReadyFlag
@@ -142,7 +141,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	}
 
 	// Catch if something modifies the resources that this controller consumes.
-	if err := utils.AddServiceWatch(c, render.KibanaServiceName, helper.InstallNamespace()); err != nil {
+	if err := utils.AddServiceWatch(c, kibana.ServiceName, helper.InstallNamespace()); err != nil {
 		return fmt.Errorf("log-storage-dashboards-controller failed to watch the Service resource: %w", err)
 	}
 	if err := utils.AddConfigMapWatch(c, certificatemanagement.TrustedCertConfigMapName, helper.InstallNamespace(), &handler.EnqueueRequestForObject{}); err != nil {
@@ -349,7 +348,6 @@ func (d DashboardsSubController) Reconcile(ctx context.Context, request reconcil
 		PullSecrets:                pullSecrets,
 		Namespace:                  helper.InstallNamespace(),
 		TrustedBundle:              trustedBundle,
-		UsePSP:                     d.usePSP,
 		IsManaged:                  managementClusterConnection != nil,
 		Tenant:                     tenant,
 		KibanaHost:                 kibanaHost,
@@ -389,7 +387,7 @@ func parsePort(port string) (uint16, error) {
 		return 0, err
 	}
 	if kibanaPort > math.MaxInt16 {
-		return 0, fmt.Errorf(fmt.Sprintf("Kibana port is larger them max %d", math.MaxInt16))
+		return 0, fmt.Errorf("Kibana port is larger them max %d", math.MaxInt16)
 	}
 	return uint16(kibanaPort), nil
 }

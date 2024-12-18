@@ -20,15 +20,30 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 
-	elastic "github.com/olivere/elastic/v7"
-
+	"github.com/olivere/elastic/v7"
+	apps "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	operatorv1 "github.com/tigera/operator/api/v1"
+	"github.com/tigera/operator/pkg/apis"
+	"github.com/tigera/operator/pkg/common"
+	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
+	"github.com/tigera/operator/pkg/render"
+	"github.com/tigera/operator/pkg/render/common/secret"
+	"github.com/tigera/operator/pkg/render/logstorage"
+	"github.com/tigera/operator/pkg/tls"
 )
 
 const (
@@ -37,16 +52,112 @@ const (
 )
 
 var newPolicies bool
+var updateToReadonly bool
 var _ = Describe("Elasticsearch tests", func() {
+	Context("Create elasticsearch client", func() {
+		var (
+			c      client.Client
+			ctx    context.Context
+			scheme *runtime.Scheme
+		)
+
+		BeforeEach(func() {
+			// Create a Kubernetes client.
+			scheme = runtime.NewScheme()
+			err := apis.AddToScheme(scheme)
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(v1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+			Expect(apps.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+			Expect(batchv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+
+			c = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
+			ctx = context.Background()
+
+			Expect(c.Create(ctx, &operatorv1.Installation{
+				ObjectMeta: metav1.ObjectMeta{Name: "default"},
+			})).ShouldNot(HaveOccurred())
+		})
+
+		It("creates an client for internal elastic", func() {
+			Expect(c.Create(ctx, &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Namespace: common.OperatorNamespace(), Name: render.ElasticsearchAdminUserSecret},
+				Data:       map[string][]byte{"elastic": []byte("anyPass")},
+			})).ShouldNot(HaveOccurred())
+
+			esInternalCert, err := secret.CreateTLSSecret(
+				nil,
+				render.TigeraElasticsearchInternalCertSecret,
+				common.OperatorNamespace(),
+				"tls.key",
+				"tls.crt",
+				tls.DefaultCertificateDuration,
+				nil,
+			)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(c.Create(ctx, esInternalCert)).ShouldNot(HaveOccurred())
+
+			mockServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.WriteHeader(http.StatusOK)
+			}))
+			defer mockServer.Close()
+
+			_, err = NewElasticClient(c, ctx, mockServer.URL, false)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("creates an client for external elastic", func() {
+			Expect(c.Create(ctx, &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Namespace: common.OperatorNamespace(), Name: render.ElasticsearchAdminUserSecret},
+				Data:       map[string][]byte{"tigera-mgmt": []byte("anyPass")},
+			})).ShouldNot(HaveOccurred())
+
+			esExternalCert, err := secret.CreateTLSSecret(
+				nil,
+				logstorage.ExternalESPublicCertName,
+				common.OperatorNamespace(),
+				"tls.key",
+				"tls.crt",
+				tls.DefaultCertificateDuration,
+				nil,
+				"elastic.tigera.io",
+			)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(c.Create(ctx, esExternalCert)).ShouldNot(HaveOccurred())
+
+			clientCert, err := secret.CreateTLSSecret(
+				nil,
+				logstorage.ExternalCertsSecret,
+				common.OperatorNamespace(),
+				"client.key",
+				"client.crt",
+				tls.DefaultCertificateDuration,
+				nil,
+			)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(c.Create(ctx, clientCert)).ShouldNot(HaveOccurred())
+
+			mockServer := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.WriteHeader(http.StatusOK)
+			}))
+			defer mockServer.Close()
+
+			_, err = NewElasticClient(c, ctx, mockServer.URL, true)
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
 	Context("ILM", func() {
 		var (
 			eClient     *esClient
 			ctx         context.Context
 			rolloverMax = resource.MustParse(fmt.Sprintf("%dGi", DefaultMaxIndexSizeGi))
+			trt         *testRoundTripper
 		)
 		BeforeEach(func() {
+			trt = &testRoundTripper{}
 			client := &http.Client{
-				Transport: http.RoundTripper(&testRoundTripper{}),
+				Transport: http.RoundTripper(trt),
 			}
 			eClient = mockElasticClient(client, baseURI)
 			ctx = context.Background()
@@ -75,7 +186,7 @@ var _ = Describe("Elasticsearch tests", func() {
 		It("apply new lifecycle policy", func() {
 			newPolicies = true
 			totalDiskSize := resource.MustParse("100Gi")
-			pd := buildILMPolicy(totalDiskSize.Value(), 0.7, .9, 10)
+			pd := buildILMPolicy(totalDiskSize.Value(), 0.7, .9, 10, true)
 
 			err := eClient.createOrUpdatePolicies(ctx, map[string]policyDetail{
 				indexName: pd,
@@ -85,17 +196,39 @@ var _ = Describe("Elasticsearch tests", func() {
 		It("update existing lifecycle policy", func() {
 			newPolicies = false
 			totalDiskSize := resource.MustParse("100Gi")
-			pd := buildILMPolicy(totalDiskSize.Value(), 0.7, .9, 5)
+			pd := buildILMPolicy(totalDiskSize.Value(), 0.7, .9, 5, false)
 			err := eClient.createOrUpdatePolicies(ctx, map[string]policyDetail{
 				indexName: pd,
 			})
 			Expect(err).To(BeNil())
+			Expect(trt.hasUpdatedPolicy).To(BeTrue())
+
+			// Applying the same policy has no effect (since there is no change)
+			trt.hasUpdatedPolicy = false
+			trt.getPolicyOverride = "test_files/02_get_policy.json"
+			pd = buildILMPolicy(totalDiskSize.Value(), 0.7, .9, 5, false)
+			err = eClient.createOrUpdatePolicies(ctx, map[string]policyDetail{
+				indexName: pd,
+			})
+			Expect(err).To(BeNil())
+			Expect(trt.hasUpdatedPolicy).To(BeFalse())
+
+			// Applying an updated policy (warm index writable) triggers an update (since there is a change)
+			updateToReadonly = true
+			pd = buildILMPolicy(totalDiskSize.Value(), 0.7, .9, 5, true)
+			err = eClient.createOrUpdatePolicies(ctx, map[string]policyDetail{
+				indexName: pd,
+			})
+			Expect(err).To(BeNil())
+			Expect(trt.hasUpdatedPolicy).To(BeTrue())
 		})
 	})
 })
 
 type testRoundTripper struct {
-	e error
+	e                 error
+	hasUpdatedPolicy  bool
+	getPolicyOverride string
 }
 
 func (t *testRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -121,10 +254,14 @@ func (t *testRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 					Request:    req,
 				}, nil
 			}
+			getPolicyFile := "test_files/01_get_policy.json"
+			if len(t.getPolicyOverride) > 0 {
+				getPolicyFile = t.getPolicyOverride
+			}
 			return &http.Response{
 				StatusCode: 200,
 				Request:    req,
-				Body:       mustOpen("test_files/02_get_policy.json"),
+				Body:       mustOpen(getPolicyFile),
 			}, nil
 		}
 	case "POST":
@@ -151,11 +288,15 @@ func (t *testRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 			Expect(err).To(BeNil())
 
 			jsonFile, err := os.Open("test_files/02_put_policy.json")
+			if updateToReadonly {
+				jsonFile, err = os.Open("test_files/02_put_policy_readonly.json")
+			}
 			Expect(err).To(BeNil())
 			defer jsonFile.Close()
 			expectedBody, _ := io.ReadAll(jsonFile)
 			Expect(actualBody).To(MatchJSON(expectedBody))
 
+			t.hasUpdatedPolicy = true
 			return &http.Response{
 				StatusCode: 200,
 				Request:    req,

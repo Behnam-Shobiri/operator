@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/common/validation"
@@ -48,6 +49,7 @@ import (
 	"github.com/tigera/operator/pkg/dns"
 	"github.com/tigera/operator/pkg/render"
 	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
+	"github.com/tigera/operator/pkg/render/common/authentication"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/monitor"
@@ -81,7 +83,6 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 
 		go utils.WaitToAddNetworkPolicyWatches(c, k8sClient, log, []types.NamespacedName{
 			{Name: render.APIServerPolicyName, Namespace: rmeta.APIServerNamespace(operatorv1.TigeraSecureEnterprise)},
-			{Name: render.PacketCapturePolicyName, Namespace: render.PacketCaptureNamespace},
 		})
 	}
 
@@ -97,9 +98,9 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions) *ReconcileAPISe
 		enterpriseCRDsExist: opts.EnterpriseCRDExists,
 		status:              status.New(mgr.GetClient(), "apiserver", opts.KubernetesVersion),
 		clusterDomain:       opts.ClusterDomain,
-		usePSP:              opts.UsePSP,
 		tierWatchReady:      &utils.ReadyFlag{},
 		multiTenant:         opts.MultiTenant,
+		kubernetesVersion:   opts.KubernetesVersion,
 	}
 	r.status.Run(opts.ShutdownContext)
 	return r
@@ -114,12 +115,6 @@ func add(c ctrlruntime.Controller, r *ReconcileAPIServer) error {
 		return fmt.Errorf("apiserver-controller failed to watch primary resource: %v", err)
 	}
 
-	// Watch for changes to packet capture.
-	err = c.WatchObject(&operatorv1.PacketCapture{}, &handler.EnqueueRequestForObject{})
-	if err != nil {
-		return fmt.Errorf("apiserver-controller failed to watch resource: %w", err)
-	}
-
 	if err = utils.AddInstallationWatch(c); err != nil {
 		log.V(5).Info("Failed to create network watch", "err", err)
 		return fmt.Errorf("apiserver-controller failed to watch Tigera network resource: %v", err)
@@ -130,6 +125,12 @@ func add(c ctrlruntime.Controller, r *ReconcileAPIServer) error {
 	}
 
 	if r.enterpriseCRDsExist {
+		// Watch for changes to ApplicationLayer
+		err = c.WatchObject(&operatorv1.ApplicationLayer{ObjectMeta: metav1.ObjectMeta{Name: utils.DefaultTSEEInstanceKey.Name}}, &handler.EnqueueRequestForObject{})
+		if err != nil {
+			return fmt.Errorf("apiserver-controller failed to watch ApplicationLayer resource: %v", err)
+		}
+
 		// Watch for changes to primary resource ManagementCluster
 		err = c.WatchObject(&operatorv1.ManagementCluster{}, &handler.EnqueueRequestForObject{})
 		if err != nil {
@@ -155,6 +156,7 @@ func add(c ctrlruntime.Controller, r *ReconcileAPIServer) error {
 		if err != nil {
 			return fmt.Errorf("apiserver-controller failed to watch resource: %w", err)
 		}
+
 	}
 
 	// Watch for the namespace(s) managed by this controller.
@@ -166,7 +168,7 @@ func add(c ctrlruntime.Controller, r *ReconcileAPIServer) error {
 	}
 
 	for _, secretName := range []string{
-		"calico-apiserver-certs", "tigera-apiserver-certs", render.PacketCaptureServerCert,
+		"calico-apiserver-certs", "tigera-apiserver-certs",
 		certificatemanagement.CASecretName, render.DexTLSSecretName, monitor.PrometheusClientTLSSecretName,
 	} {
 		if err = utils.AddSecretsWatch(c, secretName, common.OperatorNamespace()); err != nil {
@@ -199,9 +201,9 @@ type ReconcileAPIServer struct {
 	enterpriseCRDsExist bool
 	status              status.StatusManager
 	clusterDomain       string
-	usePSP              bool
 	tierWatchReady      *utils.ReadyFlag
 	multiTenant         bool
+	kubernetesVersion   *common.VersionInfo
 }
 
 // Reconcile reads that state of the cluster for a APIServer object and makes changes based on the state read
@@ -250,7 +252,7 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 	}
 
 	// Query for the installation object.
-	variant, installationSpec, err := utils.GetInstallation(context.Background(), r.client)
+	_, installationSpec, err := utils.GetInstallation(context.Background(), r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotFound, "Installation not found", err, reqLogger)
@@ -259,11 +261,11 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying installation", err, reqLogger)
 		return reconcile.Result{}, err
 	}
-	if variant == "" {
-		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for Installation to be ready", nil, reqLogger)
+	if installationSpec.Variant == "" {
+		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for Installation Variant to be set", nil, reqLogger)
 		return reconcile.Result{}, nil
 	}
-	ns := rmeta.APIServerNamespace(variant)
+	ns := rmeta.APIServerNamespace(installationSpec.Variant)
 
 	certificateManager, err := certificatemanager.Create(r.client, installationSpec, r.clusterDomain, common.OperatorNamespace())
 	if err != nil {
@@ -290,10 +292,19 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 	// Query enterprise-only data.
 	var tunnelCAKeyPair certificatemanagement.KeyPairInterface
 	var trustedBundle certificatemanagement.TrustedBundle
+	var applicationLayer *operatorv1.ApplicationLayer
 	var managementCluster *operatorv1.ManagementCluster
 	var managementClusterConnection *operatorv1.ManagementClusterConnection
+	var keyValidatorConfig authentication.KeyValidatorConfig
 	includeV3NetworkPolicy := false
-	if variant == operatorv1.TigeraSecureEnterprise {
+	if installationSpec.Variant == operatorv1.TigeraSecureEnterprise {
+		trustedBundle = certificateManager.CreateTrustedBundle()
+		applicationLayer, err = utils.GetApplicationLayer(ctx, r.client)
+		if err != nil {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Error reading ApplicationLayer", err, reqLogger)
+			return reconcile.Result{}, err
+		}
+
 		managementCluster, err = utils.GetManagementCluster(ctx, r.client)
 		if err != nil {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Error reading ManagementCluster", err, reqLogger)
@@ -354,7 +365,44 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get certificate", err, reqLogger)
 			return reconcile.Result{}, err
 		} else if prometheusCertificate != nil {
-			trustedBundle = certificatemanagement.CreateTrustedBundle(prometheusCertificate)
+			trustedBundle.AddCertificates(prometheusCertificate)
+		}
+
+		var authenticationCR *operatorv1.Authentication
+		// Fetch the Authentication spec. If present, we use it to configure user authentication.
+		authenticationCR, err = utils.GetAuthentication(ctx, r.client)
+		if err != nil && !errors.IsNotFound(err) {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Error while fetching Authentication", err, reqLogger)
+			return reconcile.Result{}, err
+		}
+
+		if authenticationCR != nil && authenticationCR.Status.State != operatorv1.TigeraStatusReady {
+			r.status.SetDegraded(operatorv1.ResourceNotReady,
+				fmt.Sprintf("Authentication is not ready authenticationCR status: %s", authenticationCR.Status.State),
+				nil, reqLogger)
+			return reconcile.Result{}, nil
+		} else if authenticationCR != nil && !utils.IsDexDisabled(authenticationCR) {
+			// Do not include DEX TLS Secret Name if authentication CR does not have type Dex
+			secret := render.DexTLSSecretName
+			certificate, err := certificateManager.GetCertificate(r.client, secret, common.OperatorNamespace())
+			if err != nil {
+				r.status.SetDegraded(operatorv1.CertificateError, fmt.Sprintf("Failed to retrieve %s", secret),
+					err, reqLogger)
+				return reconcile.Result{}, err
+			} else if certificate == nil {
+				reqLogger.Info(fmt.Sprintf("Waiting for secret '%s' to become available", secret))
+				r.status.SetDegraded(operatorv1.ResourceNotReady,
+					fmt.Sprintf("Waiting for secret '%s' to become available", secret),
+					nil, reqLogger)
+				return reconcile.Result{}, nil
+			}
+			trustedBundle.AddCertificates(certificate)
+		}
+
+		keyValidatorConfig, err = utils.GetKeyValidatorConfig(ctx, r.client, authenticationCR, r.clusterDomain)
+		if err != nil {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get KeyValidator Config", err, reqLogger)
+			return reconcile.Result{}, err
 		}
 	}
 
@@ -381,14 +429,16 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 		Installation:                installationSpec,
 		APIServer:                   &instance.Spec,
 		ForceHostNetwork:            false,
+		ApplicationLayer:            applicationLayer,
 		ManagementCluster:           managementCluster,
 		ManagementClusterConnection: managementClusterConnection,
 		TLSKeyPair:                  tlsSecret,
 		PullSecrets:                 pullSecrets,
-		Openshift:                   r.provider == operatorv1.ProviderOpenShift,
+		OpenShift:                   r.provider.IsOpenShift(),
 		TrustedBundle:               trustedBundle,
-		UsePSP:                      r.usePSP,
 		MultiTenant:                 r.multiTenant,
+		KeyValidatorConfig:          keyValidatorConfig,
+		KubernetesVersion:           r.kubernetesVersion,
 	}
 
 	component, err := render.APIServer(&apiServerCfg)
@@ -399,8 +449,8 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 	components := []render.Component{
 		component,
 		rcertificatemanagement.CertificateManagement(&rcertificatemanagement.Config{
-			Namespace:       rmeta.APIServerNamespace(variant),
-			ServiceAccounts: []string{render.APIServerServiceAccountName(variant)},
+			Namespace:       rmeta.APIServerNamespace(installationSpec.Variant),
+			ServiceAccounts: []string{render.APIServerServiceAccountName(installationSpec.Variant)},
 			KeyPairOptions: []rcertificatemanagement.KeyPairOption{
 				rcertificatemanagement.NewKeyPairOption(tlsSecret, true, true),
 				rcertificatemanagement.NewKeyPairOption(tunnelCAKeyPair, false, true),
@@ -409,88 +459,14 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 		}),
 	}
 
-	var pcPolicy render.Component
-	if variant == operatorv1.TigeraSecureEnterprise && (!r.multiTenant || managementCluster == nil) {
-		packetCaptureCertSecret, err := certificateManager.GetOrCreateKeyPair(
-			r.client,
-			render.PacketCaptureServerCert,
-			common.OperatorNamespace(),
-			dns.GetServiceDNSNames(render.PacketCaptureServiceName, render.PacketCaptureNamespace, r.clusterDomain))
-		if err != nil {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Error retrieve or creating packet capture TLS certificate", err, reqLogger)
-			return reconcile.Result{}, err
-		}
-
-		// Fetch the Authentication spec. If present, we use to configure user authentication.
-		authenticationCR, err := utils.GetAuthentication(ctx, r.client)
-		if err != nil && !errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying Authentication", err, reqLogger)
-			return reconcile.Result{}, err
-		}
-
-		keyValidatorConfig, err := utils.GetKeyValidatorConfig(ctx, r.client, authenticationCR, r.clusterDomain)
-		if err != nil {
-			r.status.SetDegraded(operatorv1.ResourceUpdateError, "Failed to process the authentication CR.", err, reqLogger)
-			return reconcile.Result{}, err
-		}
-
-		var certificates []certificatemanagement.CertificateInterface
-		if keyValidatorConfig != nil {
-			dexSecret, err := certificateManager.GetCertificate(r.client, render.DexTLSSecretName, common.OperatorNamespace())
-			if err != nil {
-				r.status.SetDegraded(operatorv1.ResourceReadError, fmt.Sprintf("Failed to retrieve %s", render.DexTLSSecretName), err, reqLogger)
-				return reconcile.Result{}, err
-			} else if dexSecret != nil {
-				certificates = append(certificates, dexSecret)
-			}
-		}
-		trustedBundle := certificateManager.CreateTrustedBundle(certificates...)
-
-		//Fetch the packet capture spec. If it exists, we utilize it to configure packet capture resource requirements.
-		packetcapture, err := utils.GetPacketCapture(ctx, r.client)
-		if err != nil && !errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying PacketCapture", err, reqLogger)
-			return reconcile.Result{}, err
-		}
-
-		packetCaptureApiCfg := &render.PacketCaptureApiConfiguration{
-			PullSecrets:                 pullSecrets,
-			Openshift:                   r.provider == operatorv1.ProviderOpenShift,
-			Installation:                installationSpec,
-			KeyValidatorConfig:          keyValidatorConfig,
-			ServerCertSecret:            packetCaptureCertSecret,
-			ClusterDomain:               r.clusterDomain,
-			ManagementClusterConnection: managementClusterConnection,
-			TrustedBundle:               trustedBundle,
-			UsePSP:                      r.usePSP,
-			PacketCapture:               packetcapture,
-		}
-		pc := render.PacketCaptureAPI(packetCaptureApiCfg)
-		pcPolicy = render.PacketCaptureAPIPolicy(packetCaptureApiCfg)
-		components = append(components, pc,
-			rcertificatemanagement.CertificateManagement(&rcertificatemanagement.Config{
-				Namespace:       render.PacketCaptureNamespace,
-				ServiceAccounts: []string{render.PacketCaptureServiceAccountName},
-				KeyPairOptions: []rcertificatemanagement.KeyPairOption{
-					rcertificatemanagement.NewKeyPairOption(packetCaptureCertSecret, true, true),
-				},
-				TrustedBundle: trustedBundle,
-			}),
-		)
-		certificateManager.AddToStatusManager(r.status, render.PacketCaptureNamespace)
-	}
-
 	// v3 NetworkPolicy will fail to reconcile if the API server deployment is unhealthy. In case the API Server
 	// deployment becomes unhealthy and reconciliation of non-NetworkPolicy resources in the apiserver controller
 	// would resolve it, we render the network policies of components last to prevent a chicken-and-egg scenario.
 	if includeV3NetworkPolicy {
 		components = append(components, render.APIServerPolicy(&apiServerCfg))
-		if pcPolicy != nil {
-			components = append(components, pcPolicy)
-		}
 	}
 
-	if err = imageset.ApplyImageSet(ctx, r.client, variant, components...); err != nil {
+	if err = imageset.ApplyImageSet(ctx, r.client, installationSpec.Variant, components...); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error with images from ImageSet", err, reqLogger)
 		return reconcile.Result{}, err
 	}

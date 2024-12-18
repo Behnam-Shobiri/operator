@@ -22,7 +22,6 @@ import (
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -57,6 +56,7 @@ var _ = Describe("CSI rendering tests", func() {
 		}{
 			{name: "csi.tigera.io", ns: "", group: "storage", version: "v1", kind: "CSIDriver"},
 			{name: "csi-node-driver", ns: common.CalicoNamespace, group: "apps", version: "v1", kind: "DaemonSet"},
+			{name: "csi-node-driver", ns: common.CalicoNamespace, group: "", version: "v1", kind: "ServiceAccount"},
 		}
 
 		comp := render.CSI(&cfg)
@@ -102,6 +102,7 @@ var _ = Describe("CSI rendering tests", func() {
 			&corev1.SeccompProfile{
 				Type: corev1.SeccompProfileTypeRuntimeDefault,
 			}))
+		Expect(ds.Spec.Template.Spec.ServiceAccountName).To(Equal(render.CSIDaemonSetName))
 	})
 
 	It("should render properly when KubeletVolumePluginPath is set to 'None'", func() {
@@ -114,7 +115,8 @@ var _ = Describe("CSI rendering tests", func() {
 			kind    string
 		}{
 			{name: "csi.tigera.io", ns: "", group: "storage", version: "v1", kind: "CSIDriver"},
-			{name: "csi-node-driver", ns: common.CalicoNamespace, group: "apps", version: "v1", kind: "DaemonSet"},
+			{name: "csi-node-driver", ns: "calico-system", group: "apps", version: "v1", kind: "DaemonSet"},
+			{name: "csi-node-driver", ns: common.CalicoNamespace, group: "", version: "v1", kind: "ServiceAccount"},
 		}
 		comp := render.CSI(&cfg)
 		Expect(comp.ResolveImages(nil)).To(BeNil())
@@ -151,50 +153,20 @@ var _ = Describe("CSI rendering tests", func() {
 		}
 	})
 
-	It("should render CSI's PSP and the corresponding clusterroles when UsePSP is set true", func() {
-		cfg.UsePSP = true
-		resources, _ := render.CSI(&cfg).Objects()
+	It("should render SecurityContextConstrains properly when provider is OpenShift", func() {
+		cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
+		cfg.OpenShift = true
+		component := render.CSI(&cfg)
+		Expect(component.ResolveImages(nil)).To(BeNil())
+		resources, _ := component.Objects()
 
-		ds := rtest.GetResource(resources, render.CSIDaemonSetName, common.CalicoNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
-		Expect(ds).NotTo(BeNil())
-		Expect(ds.Spec.Template.Spec.ServiceAccountName).To(Equal("csi-node-driver"))
-
-		serviceAccount := rtest.GetResource(resources, render.CSIDaemonSetName, render.CSIDaemonSetNamespace, "", "v1", "ServiceAccount")
-		Expect(serviceAccount).ToNot(BeNil())
-
-		psp := rtest.GetResource(resources, render.CSIDaemonSetName, "", "policy", "v1beta1", "PodSecurityPolicy").(*policyv1beta1.PodSecurityPolicy)
-		Expect(psp).ToNot(BeNil())
-		Expect(psp.Spec.Privileged).To(BeTrue())
-		Expect(*psp.Spec.AllowPrivilegeEscalation).To(BeTrue())
-		Expect(psp.Spec.RunAsUser.Rule).To(Equal(policyv1beta1.RunAsUserStrategyRunAsAny))
-
-		role := rtest.GetResource(resources, render.CSIDaemonSetName, render.CSIDaemonSetNamespace, "rbac.authorization.k8s.io", "v1", "Role").(*rbacv1.Role)
-		Expect(role).ToNot(BeNil())
+		role := rtest.GetResource(resources, "csi-node-driver", "calico-system", "rbac.authorization.k8s.io", "v1", "Role").(*rbacv1.Role)
 		Expect(role.Rules).To(ContainElement(rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{render.CSIDaemonSetName},
+			ResourceNames: []string{"privileged"},
 		}))
-
-		roleBinding := rtest.GetResource(resources, render.CSIDaemonSetName, render.CSIDaemonSetNamespace, "rbac.authorization.k8s.io", "v1", "RoleBinding").(*rbacv1.RoleBinding)
-		Expect(roleBinding).ToNot(BeNil())
-		Expect(roleBinding.Subjects).To(HaveLen(1))
-		Expect(roleBinding.Subjects).To(ContainElement(
-			rbacv1.Subject{
-				Kind:      "ServiceAccount",
-				Name:      render.CSIDaemonSetName,
-				Namespace: render.CSIDaemonSetNamespace,
-			},
-		))
-	})
-
-	It("should not add ServiceAccountName field when UsePSP is false", func() {
-		cfg.UsePSP = false
-		resources, _ := render.CSI(&cfg).Objects()
-
-		ds := rtest.GetResource(resources, render.CSIDaemonSetName, common.CalicoNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
-		Expect(ds.Spec.Template.Spec.ServiceAccountName).To(BeEmpty())
 	})
 
 	Describe("AKS", func() {

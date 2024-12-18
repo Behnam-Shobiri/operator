@@ -26,9 +26,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apiserver/pkg/authentication/serviceaccount"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/components"
 	rcomponents "github.com/tigera/operator/pkg/render/common/components"
@@ -37,6 +39,7 @@ import (
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 	"github.com/tigera/operator/pkg/tls/certkeyusage"
 )
@@ -49,13 +52,13 @@ const (
 	ElasticsearchIntrusionDetectionJobUserSecret = "tigera-ee-installer-elasticsearch-access"
 	ElasticsearchPerformanceHotspotsUserSecret   = "tigera-ee-performance-hotspots-elasticsearch-access"
 
-	IntrusionDetectionInstallerJobName     = "intrusion-detection-es-job-installer"
-	IntrusionDetectionControllerName       = "intrusion-detection-controller"
-	IntrusionDetectionControllerPolicyName = networkpolicy.TigeraComponentPolicyPrefix + IntrusionDetectionControllerName
-	IntrusionDetectionInstallerPolicyName  = networkpolicy.TigeraComponentPolicyPrefix + "intrusion-detection-elastic"
+	IntrusionDetectionInstallerJobName                     = "intrusion-detection-es-job-installer"
+	IntrusionDetectionControllerName                       = "intrusion-detection-controller"
+	IntrusionDetectionControllerPolicyName                 = networkpolicy.TigeraComponentPolicyPrefix + IntrusionDetectionControllerName
+	IntrusionDetectionInstallerPolicyName                  = networkpolicy.TigeraComponentPolicyPrefix + "intrusion-detection-elastic"
+	MultiTenantManagedClustersAccessClusterRoleBindingName = "tigera-intrusion-detection-managed-cluster-access"
 
 	ADAPIObjectName                 = "anomaly-detection-api"
-	ADAPIPodSecurityPolicyName      = "anomaly-detection-api"
 	IntrusionDetectionTLSSecretName = "intrusion-detection-tls"
 	DPITLSSecretName                = "deep-packet-inspection-tls"
 	ADAPIPolicyName                 = networkpolicy.TigeraComponentPolicyPrefix + ADAPIObjectName
@@ -94,15 +97,16 @@ func IntrusionDetection(cfg *IntrusionDetectionConfiguration) Component {
 
 // IntrusionDetectionConfiguration contains all the config information needed to render the component.
 type IntrusionDetectionConfiguration struct {
-	IntrusionDetection *operatorv1.IntrusionDetection
-	LogCollector       *operatorv1.LogCollector
-	Installation       *operatorv1.InstallationSpec
-	PullSecrets        []*corev1.Secret
-	Openshift          bool
-	ClusterDomain      string
-	ESLicenseType      ElasticsearchLicenseType
-	ManagedCluster     bool
-	ManagementCluster  bool
+	IntrusionDetection        *operatorv1.IntrusionDetection
+	LogCollector              *operatorv1.LogCollector
+	Installation              *operatorv1.InstallationSpec
+	PullSecrets               []*corev1.Secret
+	OpenShift                 bool
+	ClusterDomain             string
+	ESLicenseType             ElasticsearchLicenseType
+	ManagedCluster            bool
+	ManagementCluster         bool
+	SyslogForwardingIsEnabled bool
 
 	HasNoLicense                 bool
 	TrustedCertBundle            certificatemanagement.TrustedBundleRO
@@ -138,7 +142,7 @@ func (c *intrusionDetectionComponent) ResolveImages(is *operatorv1.ImageSet) err
 	}
 
 	if len(errMsgs) != 0 {
-		return fmt.Errorf(strings.Join(errMsgs, ","))
+		return fmt.Errorf("%s", strings.Join(errMsgs, ","))
 	}
 	return nil
 }
@@ -148,18 +152,9 @@ func (c *intrusionDetectionComponent) SupportedOSType() rmeta.OSType {
 }
 
 func (c *intrusionDetectionComponent) Objects() ([]client.Object, []client.Object) {
-	// Configure pod security standard. If syslog forwarding is enabled, we
-	// need hostpath volumes which require a privileged PSS.
-	pss := PSSRestricted
-	if c.syslogForwardingIsEnabled() {
-		pss = PSSPrivileged
-	}
-
 	objs := []client.Object{}
-	if !c.cfg.Tenant.MultiTenant() {
-		// In multi-tenant environments, the namespace is pre-created. So, only create it if we're not in a multi-tenant environment.
-		objs = append(objs, CreateNamespace(c.cfg.Namespace, c.cfg.Installation.KubernetesProvider, PodSecurityStandard(pss)))
 
+	if !c.cfg.Tenant.MultiTenant() {
 		// GlobalAlertTemplates are not used in multi-tenant management clusters.
 		objs = append(objs, c.globalAlertTemplates()...)
 	}
@@ -177,8 +172,12 @@ func (c *intrusionDetectionComponent) Objects() ([]client.Object, []client.Objec
 		c.intrusionDetectionDeployment(),
 	)
 
+	if c.cfg.Tenant.MultiTenant() {
+		objs = append(objs, c.multiTenantManagedClustersAccess()...)
+	}
+
 	objsToDelete := []client.Object{
-		// PSPs have been removed from the Kubenretes API since v1.25, so we can delete
+		// PSPs have been removed from the Kubernetes API since v1.25, so we can delete
 		// any resources related to them that might still exist.
 		c.intrusionDetectionPSPClusterRole(),
 		c.intrusionDetectionPSPClusterRoleBinding(),
@@ -359,7 +358,7 @@ func (c *intrusionDetectionComponent) intrusionDetectionClusterRole() *rbacv1.Cl
 		// is the owner of the AD Cronjobs - Openshift blocks setting an
 		// blockOwnerDeletion to true if an ownerReference refers to a resource
 		// you can't set finalizers on"
-		if c.cfg.Openshift {
+		if c.cfg.OpenShift {
 			managementRule = append(managementRule,
 				rbacv1.PolicyRule{
 					APIGroups: []string{"apps"},
@@ -371,15 +370,41 @@ func (c *intrusionDetectionComponent) intrusionDetectionClusterRole() *rbacv1.Cl
 		rules = append(rules, managementRule...)
 	}
 
-	if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderOpenShift {
-		if c.syslogForwardingIsEnabled() {
-			rules = append(rules, rbacv1.PolicyRule{
-				APIGroups:     []string{"security.openshift.io"},
-				Resources:     []string{"securitycontextconstraints"},
-				Verbs:         []string{"use"},
-				ResourceNames: []string{PSSPrivileged},
-			})
+	if c.cfg.Tenant.MultiTenant() {
+		// These rules are used by Intrusion Detection Controller in a management cluster serving multiple tenants in order to appear to managed
+		// clusters as the expected serviceaccount. They're only needed when there are multiple tenants sharing the same
+		// management cluster.
+		rules = append(rules, []rbacv1.PolicyRule{
+			{
+				APIGroups:     []string{""},
+				Resources:     []string{"serviceaccounts"},
+				Verbs:         []string{"impersonate"},
+				ResourceNames: []string{IntrusionDetectionControllerName},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"groups"},
+				Verbs:     []string{"impersonate"},
+				ResourceNames: []string{
+					serviceaccount.AllServiceAccountsGroup,
+					"system:authenticated",
+					fmt.Sprintf("%s%s", serviceaccount.ServiceAccountGroupPrefix, IntrusionDetectionNamespace),
+				},
+			},
+		}...)
+	}
+
+	if c.cfg.OpenShift {
+		sccName := securitycontextconstraints.NonRootV2
+		if c.cfg.SyslogForwardingIsEnabled {
+			sccName = securitycontextconstraints.Privileged
 		}
+		rules = append(rules, rbacv1.PolicyRule{
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
+			Verbs:         []string{"use"},
+			ResourceNames: []string{sccName},
+		})
 	}
 
 	return &rbacv1.ClusterRole{
@@ -465,6 +490,35 @@ func (c *intrusionDetectionComponent) intrusionDetectionRoleBinding() *rbacv1.Ro
 	}
 }
 
+func (c *intrusionDetectionComponent) multiTenantManagedClustersAccess() []client.Object {
+	var objects []client.Object
+
+	// In a single tenant setup we want to create a role that binds using service account
+	// intrusion-detection-controller from tigera-intrusion-detection namespace. In a multi-tenant setup
+	// IntrusionDetectionController from the tenant's namespace impersonates service intrusion-detection-controller
+	// from tigera-intrusion-detection namespace
+	objects = append(objects, &rbacv1.RoleBinding{
+		TypeMeta:   metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: MultiTenantManagedClustersAccessClusterRoleBindingName, Namespace: c.cfg.Namespace},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     MultiTenantManagedClustersAccessClusterRoleName,
+		},
+		Subjects: []rbacv1.Subject{
+			// requests for Linseed to managed clusters are done using service account tigera-linseed
+			// from tigera-elasticsearch namespace regardless of tenancy mode (single tenant or multi-tenant)
+			{
+				Kind:      "ServiceAccount",
+				Name:      IntrusionDetectionControllerName,
+				Namespace: IntrusionDetectionNamespace,
+			},
+		},
+	})
+
+	return objects
+}
+
 func (c *intrusionDetectionComponent) intrusionDetectionDeployment() *appsv1.Deployment {
 	var replicas int32 = 1
 
@@ -500,7 +554,7 @@ func (c *intrusionDetectionComponent) deploymentPodTemplate() *corev1.PodTemplat
 	}
 	// If syslog forwarding is enabled then set the necessary hostpath volume to write
 	// logs for Fluentd to access.
-	if c.syslogForwardingIsEnabled() {
+	if c.cfg.SyslogForwardingIsEnabled {
 		dirOrCreate := corev1.HostPathDirectoryOrCreate
 		volumes = append(volumes, corev1.Volume{
 			Name: "var-log-calico",
@@ -541,7 +595,15 @@ func (c *intrusionDetectionComponent) deploymentPodTemplate() *corev1.PodTemplat
 
 	containers := []corev1.Container{
 		intrusionDetectionContainer,
-		c.webhooksControllerContainer(),
+	}
+
+	if !c.cfg.Tenant.MultiTenant() {
+		containers = append(containers, c.webhooksControllerContainer())
+	}
+
+	tolerations := c.cfg.Installation.ControlPlaneTolerations
+	if c.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
 	}
 
 	return &corev1.PodTemplateSpec{
@@ -551,7 +613,7 @@ func (c *intrusionDetectionComponent) deploymentPodTemplate() *corev1.PodTemplat
 			Annotations: c.intrusionDetectionAnnotations(),
 		},
 		Spec: corev1.PodSpec{
-			Tolerations:        c.cfg.Installation.ControlPlaneTolerations,
+			Tolerations:        tolerations,
 			NodeSelector:       c.cfg.Installation.ControlPlaneNodeSelector,
 			ServiceAccountName: IntrusionDetectionName,
 			ImagePullSecrets:   ps,
@@ -613,10 +675,6 @@ func (c *intrusionDetectionComponent) intrusionDetectionControllerContainer() co
 			Value: c.cfg.TrustedCertBundle.MountPath(),
 		},
 		{
-			Name:  "FIPS_MODE_ENABLED",
-			Value: operatorv1.IsFIPSModeEnabledString(c.cfg.Installation.FIPSMode),
-		},
-		{
 			Name:  "LINSEED_URL",
 			Value: relasticsearch.LinseedEndpoint(c.SupportedOSType(), c.cfg.ClusterDomain, LinseedNamespace(c.cfg.Tenant)),
 		},
@@ -656,7 +714,7 @@ func (c *intrusionDetectionComponent) intrusionDetectionControllerContainer() co
 	// write logs for Fluentd.
 	volumeMounts := c.cfg.TrustedCertBundle.VolumeMounts(c.SupportedOSType())
 	volumeMounts = append(volumeMounts, c.cfg.IntrusionDetectionCertSecret.VolumeMount(c.SupportedOSType()))
-	if c.syslogForwardingIsEnabled() {
+	if c.cfg.SyslogForwardingIsEnabled {
 		envs = append(envs,
 			corev1.EnvVar{Name: "IDS_ENABLE_EVENT_FORWARDING", Value: "true"},
 		)
@@ -666,7 +724,7 @@ func (c *intrusionDetectionComponent) intrusionDetectionControllerContainer() co
 		// use privileged UID/GID 0.
 		// On OpenShift, if we need the volume mount to hostpath volume for syslog forwarding,
 		// then IDS controller needs privileged access to write event logs to that volume
-		sc = securitycontext.NewRootContext(c.cfg.Openshift)
+		sc = securitycontext.NewRootContext(c.cfg.OpenShift)
 	}
 
 	if c.cfg.ManagedCluster {
@@ -697,26 +755,6 @@ func (c *intrusionDetectionComponent) intrusionDetectionControllerContainer() co
 		SecurityContext: sc,
 		VolumeMounts:    volumeMounts,
 	}
-}
-
-// Determine whether this component's configuration has syslog forwarding enabled or not.
-// Look inside LogCollector spec for whether or not Syslog log type SyslogLogIDSEvents
-// exists. If it does, then we need to turn on forwarding for IDS event logs.
-func (c *intrusionDetectionComponent) syslogForwardingIsEnabled() bool {
-	if c.cfg.LogCollector != nil && c.cfg.LogCollector.Spec.AdditionalStores != nil {
-		syslog := c.cfg.LogCollector.Spec.AdditionalStores.Syslog
-		if syslog != nil {
-			if syslog.LogTypes != nil {
-				for _, t := range syslog.LogTypes {
-					switch t {
-					case operatorv1.SyslogLogIDSEvents:
-						return true
-					}
-				}
-			}
-		}
-	}
-	return false
 }
 
 func syslogEventsForwardingVolumeMount() corev1.VolumeMount {
@@ -981,7 +1019,7 @@ func (c *intrusionDetectionComponent) intrusionDetectionControllerAllowTigeraPol
 			},
 		},
 	}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, c.cfg.Openshift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, c.cfg.OpenShift)
 	if c.cfg.ManagedCluster {
 		egressRules = append(egressRules, v3.Rule{
 			Action:      v3.Allow,
@@ -1239,4 +1277,57 @@ func (c *intrusionDetectionComponent) intrusionDetectionPSPClusterRoleBinding() 
 		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{Name: "intrusion-detection-psp"},
 	}
+}
+
+func IntrusionDetectionNamespaceComponent(cfg *IntrusionDetectionNamespaceConfiguration) Component {
+	return &intrusionDetectionNamespaceComponent{
+		cfg: cfg,
+	}
+}
+
+type intrusionDetectionNamespaceComponent struct {
+	cfg *IntrusionDetectionNamespaceConfiguration
+}
+
+func (c *intrusionDetectionNamespaceComponent) Ready() bool {
+	return true
+}
+
+type IntrusionDetectionNamespaceConfiguration struct {
+	Tenant                    *operatorv1.Tenant
+	SyslogForwardingIsEnabled bool
+	Namespace                 string
+	KubernetesProvider        operatorv1.Provider
+	HasNoLicense              bool
+	Azure                     *operatorv1.Azure
+}
+
+func (c *intrusionDetectionNamespaceComponent) ResolveImages(is *operatorv1.ImageSet) error {
+	return nil
+}
+
+func (c *intrusionDetectionNamespaceComponent) SupportedOSType() rmeta.OSType {
+	return rmeta.OSTypeLinux
+}
+
+func (c *intrusionDetectionNamespaceComponent) Objects() ([]client.Object, []client.Object) {
+	// Configure pod security standard. If syslog forwarding is enabled, we
+	// need hostpath volumes which require a privileged PSS.
+	pss := PSSRestricted
+	if c.cfg.SyslogForwardingIsEnabled {
+		pss = PSSPrivileged
+	}
+
+	objs := []client.Object{}
+	if !c.cfg.Tenant.MultiTenant() {
+		// In multi-tenant environments, the namespace is pre-created. So, only create it if we're not in a multi-tenant environment.
+		objs = append(objs, CreateNamespace(c.cfg.Namespace, c.cfg.KubernetesProvider, PodSecurityStandard(pss), c.cfg.Azure))
+		objs = append(objs, CreateOperatorSecretsRoleBinding(c.cfg.Namespace))
+	}
+
+	if c.cfg.HasNoLicense {
+		return nil, objs
+	}
+
+	return objs, nil
 }

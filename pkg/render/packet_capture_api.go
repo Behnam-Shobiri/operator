@@ -17,13 +17,13 @@ package render
 import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/ptr"
@@ -32,9 +32,9 @@ import (
 	"github.com/tigera/operator/pkg/render/common/configmap"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
 
@@ -48,7 +48,6 @@ const (
 	PacketCaptureClusterRoleBindingName = PacketCaptureName
 	PacketCaptureDeploymentName         = PacketCaptureName
 	PacketCaptureServiceName            = PacketCaptureName
-	PacketCapturePodSecurityPolicyName  = PacketCaptureName
 	PacketCapturePolicyName             = networkpolicy.TigeraComponentPolicyPrefix + PacketCaptureName
 	PacketCapturePort                   = 8444
 	PacketCaptureServerCert             = "tigera-packetcapture-server-tls"
@@ -62,7 +61,7 @@ var (
 // PacketCaptureApiConfiguration contains all the config information needed to render the component.
 type PacketCaptureApiConfiguration struct {
 	PullSecrets                 []*corev1.Secret
-	Openshift                   bool
+	OpenShift                   bool
 	Installation                *operatorv1.InstallationSpec
 	KeyValidatorConfig          authentication.KeyValidatorConfig
 	ServerCertSecret            certificatemanagement.KeyPairInterface
@@ -70,9 +69,7 @@ type PacketCaptureApiConfiguration struct {
 	ClusterDomain               string
 	ManagementClusterConnection *operatorv1.ManagementClusterConnection
 
-	// Whether the cluster supports pod security policies.
-	UsePSP        bool
-	PacketCapture *operatorv1.PacketCapture
+	PacketCaptureAPI *operatorv1.PacketCaptureAPI
 }
 
 type packetCaptureApiComponent struct {
@@ -109,8 +106,10 @@ func (pc *packetCaptureApiComponent) SupportedOSType() rmeta.OSType {
 
 func (pc *packetCaptureApiComponent) Objects() ([]client.Object, []client.Object) {
 	objs := []client.Object{
-		CreateNamespace(PacketCaptureNamespace, pc.cfg.Installation.KubernetesProvider, PSSRestricted),
+		CreateNamespace(PacketCaptureNamespace, pc.cfg.Installation.KubernetesProvider, PSSRestricted, pc.cfg.Installation.Azure),
 	}
+
+	objs = append(objs, CreateOperatorSecretsRoleBinding(PacketCaptureNamespace))
 	objs = append(objs, secret.ToRuntimeObjects(secret.CopyToNamespace(PacketCaptureNamespace, pc.cfg.PullSecrets...)...)...)
 
 	objs = append(objs,
@@ -130,9 +129,6 @@ func (pc *packetCaptureApiComponent) Objects() ([]client.Object, []client.Object
 		objs = append(objs, pc.cfg.TrustedBundle.ConfigMap(PacketCaptureNamespace))
 	}
 
-	if pc.cfg.UsePSP {
-		objs = append(objs, pc.podSecurityPolicy())
-	}
 	return objs, nil
 }
 
@@ -194,12 +190,12 @@ func (pc *packetCaptureApiComponent) clusterRole() client.Object {
 		},
 	}
 
-	if pc.cfg.UsePSP {
+	if pc.cfg.OpenShift {
 		rules = append(rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
+			APIGroups:     []string{"security.openshift.io"},
+			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{PacketCapturePodSecurityPolicyName},
+			ResourceNames: []string{securitycontextconstraints.NonRootV2},
 		})
 	}
 
@@ -233,11 +229,11 @@ func (pc *packetCaptureApiComponent) clusterRoleBinding() *rbacv1.ClusterRoleBin
 	}
 }
 
-func (pc *packetCaptureApiComponent) podSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	return podsecuritypolicy.NewBasePolicy(PacketCapturePodSecurityPolicyName)
-}
-
 func (pc *packetCaptureApiComponent) deployment() *appsv1.Deployment {
+	tolerations := append(pc.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateCriticalAddonsAndControlPlane...)
+	if pc.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
+	}
 	d := &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -258,7 +254,7 @@ func (pc *packetCaptureApiComponent) deployment() *appsv1.Deployment {
 				Spec: corev1.PodSpec{
 					NodeSelector:       pc.cfg.Installation.ControlPlaneNodeSelector,
 					ServiceAccountName: PacketCaptureServiceAccountName,
-					Tolerations:        append(pc.cfg.Installation.ControlPlaneTolerations, rmeta.TolerateCriticalAddonsAndControlPlane...),
+					Tolerations:        tolerations,
 					ImagePullSecrets:   secret.GetReferenceList(pc.cfg.PullSecrets),
 					InitContainers:     pc.initContainers(),
 					Containers:         []corev1.Container{pc.container()},
@@ -268,8 +264,8 @@ func (pc *packetCaptureApiComponent) deployment() *appsv1.Deployment {
 		},
 	}
 
-	if pc.cfg.PacketCapture != nil {
-		if overrides := pc.cfg.PacketCapture.Spec.PacketCaptureDeployment; overrides != nil {
+	if pc.cfg.PacketCaptureAPI != nil {
+		if overrides := pc.cfg.PacketCaptureAPI.Spec.PacketCaptureAPIDeployment; overrides != nil {
 			rcomponents.ApplyDeploymentOverrides(d, overrides)
 		}
 	}
@@ -293,7 +289,6 @@ func (pc *packetCaptureApiComponent) container() corev1.Container {
 		{Name: "PACKETCAPTURE_API_LOG_LEVEL", Value: "Info"},
 		{Name: "PACKETCAPTURE_API_HTTPS_KEY", Value: pc.cfg.ServerCertSecret.VolumeMountKeyFilePath()},
 		{Name: "PACKETCAPTURE_API_HTTPS_CERT", Value: pc.cfg.ServerCertSecret.VolumeMountCertificateFilePath()},
-		{Name: "PACKETCAPTURE_API_FIPS_MODE_ENABLED", Value: operatorv1.IsFIPSModeEnabledString(pc.cfg.Installation.FIPSMode)},
 	}
 
 	if pc.cfg.KeyValidatorConfig != nil {
@@ -357,7 +352,7 @@ func allowTigeraPolicy(cfg *PacketCaptureApiConfiguration) *v3.NetworkPolicy {
 			Destination: networkpolicy.KubeAPIServerEntityRule,
 		},
 	}
-	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.Openshift)
+	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.OpenShift)
 	if !managedCluster {
 		egressRules = append(egressRules, v3.Rule{
 			Action:      v3.Allow,

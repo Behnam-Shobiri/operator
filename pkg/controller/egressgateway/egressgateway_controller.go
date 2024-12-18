@@ -23,18 +23,6 @@ import (
 	"github.com/go-logr/logr"
 	ocsv1 "github.com/openshift/api/security/v1"
 
-	operatorv1 "github.com/tigera/operator/api/v1"
-	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
-	"github.com/tigera/operator/pkg/components"
-	"github.com/tigera/operator/pkg/controller/options"
-	"github.com/tigera/operator/pkg/controller/status"
-	"github.com/tigera/operator/pkg/controller/utils"
-	"github.com/tigera/operator/pkg/controller/utils/imageset"
-	"github.com/tigera/operator/pkg/ctrlruntime"
-	"github.com/tigera/operator/pkg/render"
-	rmeta "github.com/tigera/operator/pkg/render/common/meta"
-	"github.com/tigera/operator/pkg/render/egressgateway"
-
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -47,6 +35,19 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	operatorv1 "github.com/tigera/operator/api/v1"
+
+	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
+	"github.com/tigera/operator/pkg/components"
+	"github.com/tigera/operator/pkg/controller/options"
+	"github.com/tigera/operator/pkg/controller/status"
+	"github.com/tigera/operator/pkg/controller/utils"
+	"github.com/tigera/operator/pkg/controller/utils/imageset"
+	"github.com/tigera/operator/pkg/ctrlruntime"
+	"github.com/tigera/operator/pkg/render"
+	rmeta "github.com/tigera/operator/pkg/render/common/meta"
+	"github.com/tigera/operator/pkg/render/egressgateway"
 )
 
 const (
@@ -91,7 +92,6 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions, licenseAPIReady
 		status:          status.New(mgr.GetClient(), "egressgateway", opts.KubernetesVersion),
 		clusterDomain:   opts.ClusterDomain,
 		licenseAPIReady: licenseAPIReady,
-		usePSP:          opts.UsePSP,
 	}
 	r.status.Run(opts.ShutdownContext)
 	return r
@@ -141,7 +141,6 @@ type ReconcileEgressGateway struct {
 	status          status.StatusManager
 	clusterDomain   string
 	licenseAPIReady *utils.ReadyFlag
-	usePSP          bool
 }
 
 // Reconcile reads that state of the cluster for an EgressGateway object and makes changes
@@ -162,11 +161,8 @@ func (r *ReconcileEgressGateway) Reconcile(ctx context.Context, request reconcil
 	ch := utils.NewComponentHandler(log, r.client, r.scheme, nil)
 	if len(egws) == 0 {
 		var objects []client.Object
-		if r.provider == operatorv1.ProviderOpenShift {
+		if r.provider.IsOpenShift() {
 			objects = append(objects, egressgateway.SecurityContextConstraints())
-		}
-		if r.usePSP {
-			objects = append(objects, egressgateway.PodSecurityPolicy())
 		}
 		err := ch.CreateOrUpdateOrDelete(ctx, render.NewDeletionPassthrough(objects...), r.status)
 		if err != nil {
@@ -204,7 +200,7 @@ func (r *ReconcileEgressGateway) Reconcile(ctx context.Context, request reconcil
 			// In the case of OpenShift, we are using a single SCC.
 			// Whenever a EGW resource is deleted, remove the corresponding user from the SCC
 			// and update the resource.
-			if r.provider == operatorv1.ProviderOpenShift {
+			if r.provider.IsOpenShift() {
 				scc, err := getOpenShiftSCC(ctx, r.client)
 				if err != nil {
 					reqLogger.Error(err, "Error querying SecurityContextConstraints")
@@ -334,7 +330,7 @@ func (r *ReconcileEgressGateway) Reconcile(ctx context.Context, request reconcil
 		}
 	}
 	if len(errMsgs) != 0 {
-		return reconcile.Result{}, fmt.Errorf(strings.Join(errMsgs, ";"))
+		return reconcile.Result{}, fmt.Errorf("%s", strings.Join(errMsgs, ";"))
 	}
 
 	if unreadyEGW != nil {
@@ -377,9 +373,6 @@ func (r *ReconcileEgressGateway) reconcileEgressGateway(ctx context.Context, egw
 		return err
 	}
 
-	// Set the condition to progressing
-	setProgressing(r.client, ctx, egw, string(operatorv1.ResourceNotReady), "Reconciling")
-
 	egwVXLANPort := egressgateway.DefaultVXLANPort
 	egwVXLANVNI := egressgateway.DefaultVXLANVNI
 	if fc.Spec.EgressIPVXLANPort != nil {
@@ -397,7 +390,6 @@ func (r *ReconcileEgressGateway) reconcileEgressGateway(ctx context.Context, egw
 		}
 	}
 
-	openshift := r.provider == operatorv1.ProviderOpenShift
 	config := &egressgateway.Config{
 		PullSecrets:       pullSecrets,
 		Installation:      installation,
@@ -406,8 +398,7 @@ func (r *ReconcileEgressGateway) reconcileEgressGateway(ctx context.Context, egw
 		VXLANPort:         egwVXLANPort,
 		VXLANVNI:          egwVXLANVNI,
 		IptablesBackend:   ipTablesBackend,
-		UsePSP:            r.usePSP,
-		OpenShift:         openshift,
+		OpenShift:         r.provider.IsOpenShift(),
 		NamespaceAndNames: namespaceAndNames,
 	}
 
@@ -658,25 +649,25 @@ func getUnreadyEgressGateway(egws []operatorv1.EgressGateway) *operatorv1.Egress
 
 // setDegraded updates the degraded status condition of the EGW resource.
 func setDegraded(cli client.Client, ctx context.Context, egw *operatorv1.EgressGateway, reason, msg string) {
-	updateEGWStatusConditions(cli, ctx, egw, operatorv1.ComponentDegraded, metav1.ConditionTrue, reason, msg, true)
+	updateEGWStatusConditions(cli, ctx, egw, operatorv1.ComponentDegraded, metav1.ConditionTrue, reason, msg)
 }
 
-// setProgressing updates the progressing status condition of the EGW resource.
-func setProgressing(cli client.Client, ctx context.Context, egw *operatorv1.EgressGateway, reason, msg string) {
-	updateEGWStatusConditions(cli, ctx, egw, operatorv1.ComponentProgressing, metav1.ConditionTrue, reason, msg, false)
-}
-
-// setProgressing updates the ready status condition of the EGW resource.
+// setAvailable updates the ready status condition of the EGW resource.
 func setAvailable(cli client.Client, ctx context.Context, egw *operatorv1.EgressGateway, reason, msg string) {
-	updateEGWStatusConditions(cli, ctx, egw, operatorv1.ComponentAvailable, metav1.ConditionTrue, reason, msg, true)
+	updateEGWStatusConditions(cli, ctx, egw, operatorv1.ComponentAvailable, metav1.ConditionTrue, reason, msg)
 }
 
 // updateEGWStatusConditions sets the status conditions of the EGW resource and if updateStatus is True, status of the EGW resource
 // is updated in the datastore.
-func updateEGWStatusConditions(cli client.Client, ctx context.Context, egw *operatorv1.EgressGateway, ctype operatorv1.StatusConditionType, status metav1.ConditionStatus, reason, msg string, updateStatus bool) {
+func updateEGWStatusConditions(cli client.Client, ctx context.Context, egw *operatorv1.EgressGateway, ctype operatorv1.StatusConditionType, status metav1.ConditionStatus, reason, msg string) {
 	found := false
 	for idx, cond := range egw.Status.Conditions {
 		if cond.Type == string(ctype) {
+			if cond.Status == status &&
+				cond.Reason == reason &&
+				cond.Message == msg {
+				return
+			}
 			cond.Status = status
 			cond.Reason = reason
 			cond.Message = msg
@@ -693,10 +684,8 @@ func updateEGWStatusConditions(cli client.Client, ctx context.Context, egw *oper
 		condition := metav1.Condition{Type: string(ctype), Status: status, Reason: reason, Message: msg, LastTransitionTime: metav1.NewTime(time.Now())}
 		egw.Status.Conditions = append(egw.Status.Conditions, condition)
 	}
-	if updateStatus {
-		if err := cli.Status().Update(ctx, egw); err != nil {
-			log.WithValues("Name", egw.Name, "Namespace", egw.Namespace, "error", err).Info("Error updating status")
-		}
+	if err := cli.Status().Update(ctx, egw); err != nil {
+		log.WithValues("Name", egw.Name, "Namespace", egw.Namespace, "error", err).Info("Error updating status")
 	}
 }
 

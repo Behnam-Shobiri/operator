@@ -41,7 +41,7 @@ func (r *ESKubeControllersController) createESGateway(
 	hdler utils.ComponentHandler,
 	reqLogger logr.Logger,
 	trustedBundle certificatemanagement.TrustedBundleRO,
-	usePSP bool,
+	logStorage *operatorv1.LogStorage,
 ) error {
 	// Get the ES admin user secret. For internal ES, this is provisioned by the ECK operator as part of installing Elasticsearch,
 	// and so may not be immediately available.
@@ -107,9 +107,9 @@ func (r *ESKubeControllersController) createESGateway(
 		ClusterDomain:              r.clusterDomain,
 		EsAdminUserName:            esAdminUserName,
 		ESGatewayKeyPair:           gatewayKeyPair,
-		UsePSP:                     usePSP,
 		Namespace:                  helper.InstallNamespace(),
 		TruthNamespace:             helper.TruthNamespace(),
+		LogStorage:                 logStorage,
 	}
 
 	esGatewayComponent := esgateway.EsGateway(cfg)

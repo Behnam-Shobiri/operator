@@ -19,13 +19,23 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/tigera/operator/pkg/controller/logstorage/initializer"
+	"github.com/go-logr/logr"
+
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	logstoragecommon "github.com/tigera/operator/pkg/controller/logstorage/common"
+	"github.com/tigera/operator/pkg/controller/logstorage/initializer"
 	"github.com/tigera/operator/pkg/controller/options"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
@@ -36,19 +46,10 @@ import (
 	"github.com/tigera/operator/pkg/render/logstorage"
 	"github.com/tigera/operator/pkg/render/logstorage/esgateway"
 	"github.com/tigera/operator/pkg/render/logstorage/esmetrics"
+	"github.com/tigera/operator/pkg/render/logstorage/kibana"
 	"github.com/tigera/operator/pkg/render/logstorage/linseed"
 	"github.com/tigera/operator/pkg/render/monitor"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
-
-	"github.com/go-logr/logr"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 var log = logf.Log.WithName("controller_logstorage_secrets")
@@ -133,7 +134,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	if err = utils.AddSecretsWatch(c, render.TigeraElasticsearchGatewaySecret, helper.TruthNamespace()); err != nil {
 		return fmt.Errorf("log-storage-secrets-controller failed to watch Secret: %w", err)
 	}
-	if err = utils.AddSecretsWatch(c, render.TigeraKibanaCertSecret, helper.TruthNamespace()); err != nil {
+	if err = utils.AddSecretsWatch(c, kibana.TigeraKibanaCertSecret, helper.TruthNamespace()); err != nil {
 		return fmt.Errorf("log-storage-secrets-controller failed to watch Secret: %w", err)
 	}
 	if err = utils.AddSecretsWatch(c, render.TigeraLinseedSecret, helper.TruthNamespace()); err != nil {
@@ -260,9 +261,6 @@ func (r *SecretSubController) Reconcile(ctx context.Context, request reconcile.R
 	// Provision secrets and the trusted bundle into the cluster.
 	hdler := utils.NewComponentHandler(reqLogger, r.client, r.scheme, ls)
 
-	// Determine if Kibana should be enabled for this cluster.
-	kibanaEnabled := !operatorv1.IsFIPSModeEnabled(install.FIPSMode) && !r.multiTenant
-
 	// Internal ES modes:
 	// - Zero-tenant: everything installed in tigera-elasticsearch/tigera-kibana Namespaces. We need a single trusted bundle in each.
 	// - Single-tenant: everything installed in tigera-elasticsearch/tigera-kibana Namespaces. We need a single trusted bundle in each.
@@ -276,7 +274,7 @@ func (r *SecretSubController) Reconcile(ctx context.Context, request reconcile.R
 		// needs to include the public certificates from other Tigera components.
 
 		// Generate Elasticsearch / Kibana secrets for the tigera-elasticsearch and tigera-kibana namespaces.
-		elasticKeys, err := r.generateInternalElasticSecrets(reqLogger, kibanaEnabled, operatorSigner)
+		elasticKeys, err := r.generateInternalElasticSecrets(reqLogger, operatorSigner)
 		if err != nil {
 			return reconcile.Result{}, err
 		}
@@ -287,7 +285,8 @@ func (r *SecretSubController) Reconcile(ctx context.Context, request reconcile.R
 			return reconcile.Result{}, err
 		}
 
-		if kibanaEnabled {
+		// Multitenant clusters do not get kibana, so TLS assets creation can be skipped.
+		if !r.multiTenant {
 			// Render the key pair and trusted bundle into the Kibana namespace.
 			if err = hdler.CreateOrUpdateOrDelete(ctx, elasticKeys.internalKibanaComponent(elasticKeys.trustedBundle(operatorSigner)), r.status); err != nil {
 				r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating resource", err, reqLogger)
@@ -335,7 +334,7 @@ func (r *SecretSubController) Reconcile(ctx context.Context, request reconcile.R
 
 // generateInternalElasticSecrets generates key pairs for the internal ES cluster and Kibana managed by tigera-operator via ECK
 // when configured to use an internal ES.
-func (r *SecretSubController) generateInternalElasticSecrets(log logr.Logger, kibana bool, cm certificatemanager.CertificateManager) (*elasticKeyPairCollection, error) {
+func (r *SecretSubController) generateInternalElasticSecrets(log logr.Logger, cm certificatemanager.CertificateManager) (*elasticKeyPairCollection, error) {
 	collection := elasticKeyPairCollection{log: log}
 
 	// Generate a keypair for elasticsearch.
@@ -352,13 +351,14 @@ func (r *SecretSubController) generateInternalElasticSecrets(log logr.Logger, ki
 	}
 	collection.elastic = elasticKeyPair
 
-	if kibana {
+	// Multitenant clusters do not get kibana, so TLS assets creation can be skipped.
+	if !r.multiTenant {
 		// Generate a keypair for Kibana.
 		//
 		// This fetches the existing key pair from the tigera-operator namespace if it exists, or generates a new one in-memory otherwise.
 		// It will be provisioned into the cluster in the render stage later on.
-		kbDNSNames := dns.GetServiceDNSNames(render.KibanaServiceName, render.KibanaNamespace, r.clusterDomain)
-		kibanaKeyPair, err := cm.GetOrCreateKeyPair(r.client, render.TigeraKibanaCertSecret, common.OperatorNamespace(), kbDNSNames)
+		kbDNSNames := dns.GetServiceDNSNames(kibana.ServiceName, kibana.Namespace, r.clusterDomain)
+		kibanaKeyPair, err := cm.GetOrCreateKeyPair(r.client, kibana.TigeraKibanaCertSecret, common.OperatorNamespace(), kbDNSNames)
 		if err != nil {
 			log.Error(err, err.Error())
 			r.status.SetDegraded(operatorv1.ResourceCreateError, "Failed to create Kibana secrets", err, log)
@@ -366,7 +366,7 @@ func (r *SecretSubController) generateInternalElasticSecrets(log logr.Logger, ki
 		}
 		collection.kibana = kibanaKeyPair
 
-		// Add the es-proxy certificate to the collection. This is needed in case the user has enabled Kibana with mTLS.
+		// Add the ui-apis certificate to the collection. This is needed in case the user has enabled Kibana with mTLS.
 		cert, err := cm.GetCertificate(r.client, render.ManagerInternalTLSSecretName, render.ManagerNamespace)
 		if err != nil && !errors.IsNotFound(err) {
 			return nil, err
@@ -467,8 +467,8 @@ func (r *SecretSubController) collectUpstreamCerts(log logr.Logger, helper utils
 		// Get certificate for TLS on Prometheus metrics endpoints. This is created in the monitor controller.
 		monitor.PrometheusClientTLSSecretName: common.OperatorNamespace(),
 
-		// Get certificate for es-proxy, which Linseed and es-gateway need to trust.
-		render.ManagerTLSSecretName: helper.TruthNamespace(),
+		// Get certificate for ui-apis, which Linseed and es-gateway need to trust.
+		render.ManagerInternalTLSSecretName: helper.TruthNamespace(),
 
 		// Get certificate for fluentd, which Linseed needs to trust in a standalone or management cluster.
 		render.FluentdPrometheusTLSSecretName: common.OperatorNamespace(),
@@ -506,7 +506,7 @@ func (r *SecretSubController) collectUpstreamCerts(log logr.Logger, helper utils
 		// For internal ES, the operator creates a keypair for ES and Kibana itself earlier in the execution of this controller.
 		// Include these in the trusted bundle as well, so that Linseed and es-gateway can trust them.
 		certs[render.TigeraElasticsearchInternalCertSecret] = common.OperatorNamespace()
-		certs[render.TigeraKibanaCertSecret] = common.OperatorNamespace()
+		certs[kibana.TigeraKibanaCertSecret] = common.OperatorNamespace()
 	}
 
 	// Sort the keys then add them to the upstreamCerts in that order so the keys are always in the same order
@@ -520,8 +520,15 @@ func (r *SecretSubController) collectUpstreamCerts(log logr.Logger, helper utils
 		certNamespace := certs[certName]
 		cert, err := cm.GetCertificate(r.client, certName, certNamespace)
 		if err != nil {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get certificate", err, log)
-			return nil, err
+			if certificatemanager.IsCertExtKeyUsageError(err) {
+				// This secret is missing required key usages. Another controller will need to replace this secret with a
+				// new valid secret, before this controller will read and use it. The other controller may depend on this
+				// controller completing successfully. Therefore, we skip and continue.
+				log.Info(fmt.Sprintf("skipping %s/%s secret it will be added when it is updated: %s", common.OperatorNamespace(), certName, err))
+			} else {
+				r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get certificate", err, log)
+				return nil, err
+			}
 		} else if cert == nil {
 			msg := fmt.Sprintf("%s/%s secret not available yet, will add it if/when it becomes available", certNamespace, certName)
 			log.Info(msg)
@@ -535,7 +542,7 @@ func (r *SecretSubController) collectUpstreamCerts(log logr.Logger, helper utils
 }
 
 func (r *SecretSubController) isEKSLogForwardingEnabled(install *operatorv1.InstallationSpec) bool {
-	if install.KubernetesProvider == operatorv1.ProviderEKS {
+	if install.KubernetesProvider.IsEKS() {
 		instance := &operatorv1.LogCollector{}
 		err := r.client.Get(context.Background(), utils.DefaultTSEEInstanceKey, instance)
 		if err != nil {
@@ -593,8 +600,8 @@ func (c *elasticKeyPairCollection) internalESComponent() render.Component {
 
 func (c *elasticKeyPairCollection) internalKibanaComponent(bundle certificatemanagement.TrustedBundle) render.Component {
 	return rcertificatemanagement.CertificateManagement(&rcertificatemanagement.Config{
-		Namespace:       render.KibanaNamespace,
-		ServiceAccounts: []string{render.KibanaObjectName},
+		Namespace:       kibana.Namespace,
+		ServiceAccounts: []string{kibana.ObjectName},
 		KeyPairOptions: []rcertificatemanagement.KeyPairOption{
 			// We do not want to delete the secret from the tigera-elasticsearch when CertificateManagement is
 			// enabled. Instead, it will be replaced with a TLS secret that serves merely to pass ECK's validation
@@ -613,7 +620,7 @@ type keyPairCollection struct {
 
 	// Certificates that need to be added to the trusted bundle, but
 	// aren't actually generated by this controller.
-	// Prometheus, es-proxy, fluentd, all compliance components.
+	// Prometheus, ui-apis, fluentd, all compliance components.
 	upstreamCerts []certificatemanagement.CertificateInterface
 
 	// Key pairs that are generated by this controller. These need to be

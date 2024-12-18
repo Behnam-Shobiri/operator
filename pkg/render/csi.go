@@ -19,7 +19,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	v1 "k8s.io/api/storage/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -31,8 +30,8 @@ import (
 	"github.com/tigera/operator/pkg/ptr"
 	rcomp "github.com/tigera/operator/pkg/render/common/components"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 )
 
 const (
@@ -46,7 +45,6 @@ const (
 type CSIConfiguration struct {
 	Installation *operatorv1.InstallationSpec
 	Terminating  bool
-	UsePSP       bool
 	OpenShift    bool
 }
 
@@ -106,7 +104,7 @@ func (c *csiComponent) csiTolerations() []corev1.Toleration {
 
 func (c *csiComponent) csiAffinities() *corev1.Affinity {
 	var affinity *corev1.Affinity
-	if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderAKS {
+	if c.cfg.Installation.KubernetesProvider.IsAKS() {
 		affinity = &corev1.Affinity{
 			NodeAffinity: &corev1.NodeAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
@@ -120,7 +118,7 @@ func (c *csiComponent) csiAffinities() *corev1.Affinity {
 				},
 			},
 		}
-	} else if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderEKS {
+	} else if c.cfg.Installation.KubernetesProvider.IsEKS() {
 		affinity = &corev1.Affinity{
 			NodeAffinity: &corev1.NodeAffinity{
 				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
@@ -279,15 +277,12 @@ func (c *csiComponent) csiTemplate() corev1.PodTemplateSpec {
 		Labels: templateLabels,
 	}
 	templateSpec := corev1.PodSpec{
-		Tolerations:      c.csiTolerations(),
-		Affinity:         c.csiAffinities(),
-		Containers:       c.csiContainers(),
-		ImagePullSecrets: c.cfg.Installation.ImagePullSecrets,
-		Volumes:          c.csiVolumes(),
-	}
-
-	if c.cfg.UsePSP {
-		templateSpec.ServiceAccountName = CSIDaemonSetName
+		Tolerations:        c.csiTolerations(),
+		Affinity:           c.csiAffinities(),
+		Containers:         c.csiContainers(),
+		ImagePullSecrets:   c.cfg.Installation.ImagePullSecrets,
+		Volumes:            c.csiVolumes(),
+		ServiceAccountName: CSIDaemonSetName,
 	}
 
 	return corev1.PodTemplateSpec{
@@ -337,17 +332,6 @@ func (c *csiComponent) serviceAccount() *corev1.ServiceAccount {
 	}
 }
 
-// podSecurityPolicy sets up a PodSecurityPolicy for CSI Driver to allow usage of privileged
-// securityContext and hostPath volume.
-func (c *csiComponent) podSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	psp := podsecuritypolicy.NewBasePolicy(CSIDaemonSetName)
-	psp.Spec.Privileged = true
-	psp.Spec.AllowPrivilegeEscalation = ptr.BoolToPtr(true)
-	psp.Spec.Volumes = append(psp.Spec.Volumes, policyv1beta1.HostPath)
-	psp.Spec.RunAsUser.Rule = policyv1beta1.RunAsUserStrategyRunAsAny
-	return psp
-}
-
 func (c *csiComponent) role() *rbacv1.Role {
 	return &rbacv1.Role{
 		TypeMeta: metav1.TypeMeta{Kind: "Role", APIVersion: "rbac.authorization.k8s.io/v1"},
@@ -357,10 +341,10 @@ func (c *csiComponent) role() *rbacv1.Role {
 		},
 		Rules: []rbacv1.PolicyRule{
 			{
-				APIGroups:     []string{"policy"},
-				Resources:     []string{"podsecuritypolicies"},
+				APIGroups:     []string{"security.openshift.io"},
+				Resources:     []string{"securitycontextconstraints"},
 				Verbs:         []string{"use"},
-				ResourceNames: []string{CSIDaemonSetName},
+				ResourceNames: []string{securitycontextconstraints.Privileged},
 			},
 		},
 	}
@@ -422,18 +406,14 @@ func (c *csiComponent) ResolveImages(is *operatorv1.ImageSet) error {
 }
 
 func (c *csiComponent) Objects() (objsToCreate, objsToDelete []client.Object) {
-	objs := []client.Object{c.csiDriver(), c.csiDaemonset()}
+	objs := []client.Object{
+		c.csiDriver(),
+		c.csiDaemonset(),
+		c.serviceAccount(),
+	}
 
-	// create PSP and corresponding clusterrole if it allows, clusterroles are currently
-	// only for attaching the PSP to CSI's DaemonSet, do not render them if the PSPs
-	// are also not rendered
-	if c.cfg.UsePSP {
-		objs = append(objs,
-			c.serviceAccount(),
-			c.role(),
-			c.roleBinding(),
-			c.podSecurityPolicy(),
-		)
+	if c.cfg.OpenShift {
+		objs = append(objs, c.role(), c.roleBinding())
 	}
 
 	if c.cfg.Terminating || c.cfg.Installation.KubeletVolumePluginPath == "None" {

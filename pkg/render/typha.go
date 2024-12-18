@@ -20,7 +20,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
-	policyv1beta1 "k8s.io/api/policy/v1beta1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -33,8 +32,8 @@ import (
 	"github.com/tigera/operator/pkg/controller/migration"
 	rcomp "github.com/tigera/operator/pkg/render/common/components"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
-	"github.com/tigera/operator/pkg/render/common/podsecuritypolicy"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
+	"github.com/tigera/operator/pkg/render/common/securitycontextconstraints"
 )
 
 const (
@@ -70,9 +69,6 @@ type TyphaConfiguration struct {
 	// The health port that Felix is bound to. We configure Typha to bind to the port
 	// that is one less.
 	FelixHealthPort int
-
-	// Whether the cluster supports pod security policies.
-	UsePSP bool
 }
 
 // Typha creates the typha daemonset and other resources for the daemonset to operate normally.
@@ -119,10 +115,6 @@ func (c *typhaComponent) Objects() ([]client.Object, []client.Object) {
 		c.typhaRoleBinding(),
 		c.typhaService(),
 		c.typhaPodDisruptionBudget(),
-	}
-
-	if c.cfg.UsePSP {
-		objs = append(objs, c.typhaPodSecurityPolicy())
 	}
 
 	// Add deployment last, as it may depend on the creation of previous objects in the list.
@@ -232,6 +224,12 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 				Verbs:     []string{"watch", "list"},
 			},
 			{
+				// For enforcing admin network policies.
+				APIGroups: []string{"policy.networking.k8s.io"},
+				Resources: []string{"adminnetworkpolicies", "baselineadminnetworkpolicies"},
+				Verbs:     []string{"watch", "list"},
+			},
+			{
 				// Metadata from these are used in conjunction with network policy.
 				APIGroups: []string{""},
 				Resources: []string{"pods", "namespaces", "serviceaccounts"},
@@ -262,6 +260,7 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 					"ipreservations",
 					"networkpolicies",
 					"networksets",
+					"tiers",
 				},
 				Verbs: []string{"get", "list", "watch"},
 			},
@@ -284,6 +283,14 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 					"ippools",
 				},
 				Verbs: []string{"create", "update"},
+			},
+			{
+				// Calico creates some tiers on startup.
+				APIGroups: []string{"crd.projectcalico.org"},
+				Resources: []string{
+					"tiers",
+				},
+				Verbs: []string{"create"},
 			},
 			{
 				// Calico monitors nodes for some networking configuration.
@@ -319,7 +326,7 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
 		extraRules := []rbacv1.PolicyRule{
 			{
-				// Tigera Secure needs to be able to read licenses, tiers, and config.
+				// Tigera Secure needs to be able to read licenses, and config.
 				APIGroups: []string{"crd.projectcalico.org"},
 				Resources: []string{
 					"licensekeys",
@@ -327,40 +334,23 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 					"stagedglobalnetworkpolicies",
 					"stagedkubernetesnetworkpolicies",
 					"stagednetworkpolicies",
-					"tiers",
 					"packetcaptures",
 					"deeppacketinspections",
 					"externalnetworks",
 					"egressgatewaypolicies",
+					"bfdconfigurations",
 				},
 				Verbs: []string{"get", "list", "watch"},
-			},
-			{
-				// Tigera Secure creates some tiers on startup.
-				APIGroups: []string{"crd.projectcalico.org"},
-				Resources: []string{
-					"tiers",
-				},
-				Verbs: []string{"create"},
 			},
 		}
 		role.Rules = append(role.Rules, extraRules...)
 	}
-	if c.cfg.UsePSP {
-		// Allow access to the pod security policy in case this is enforced on the cluster
-		role.Rules = append(role.Rules, rbacv1.PolicyRule{
-			APIGroups:     []string{"policy"},
-			Resources:     []string{"podsecuritypolicies"},
-			Verbs:         []string{"use"},
-			ResourceNames: []string{common.TyphaDeploymentName},
-		})
-	}
-	if c.cfg.Installation.KubernetesProvider == operatorv1.ProviderOpenShift {
+	if c.cfg.Installation.KubernetesProvider.IsOpenShift() {
 		role.Rules = append(role.Rules, rbacv1.PolicyRule{
 			APIGroups:     []string{"security.openshift.io"},
 			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
-			ResourceNames: []string{PSSPrivileged},
+			ResourceNames: []string{securitycontextconstraints.NonRootV2},
 		})
 	}
 	return role
@@ -403,6 +393,9 @@ func (c *typhaComponent) typhaDeployment() *appsv1.Deployment {
 	tolerations := rmeta.TolerateAll
 	if len(c.cfg.Installation.ControlPlaneTolerations) != 0 {
 		tolerations = c.cfg.Installation.ControlPlaneTolerations
+	}
+	if c.cfg.Installation.KubernetesProvider.IsGKE() {
+		tolerations = append(tolerations, rmeta.TolerateGKEARM64NoSchedule)
 	}
 
 	d := appsv1.Deployment{
@@ -546,7 +539,6 @@ func (c *typhaComponent) typhaEnvVars() []corev1.EnvVar {
 		{Name: "TYPHA_CAFILE", Value: c.cfg.TLS.TrustedBundle.MountPath()},
 		{Name: "TYPHA_SERVERCERTFILE", Value: c.cfg.TLS.TyphaSecret.VolumeMountCertificateFilePath()},
 		{Name: "TYPHA_SERVERKEYFILE", Value: c.cfg.TLS.TyphaSecret.VolumeMountKeyFilePath()},
-		{Name: "TYPHA_FIPSMODEENABLED", Value: operatorv1.IsFIPSModeEnabledString(c.cfg.Installation.FIPSMode)},
 		{Name: shutdownTimeoutEnvVar, Value: fmt.Sprint(defaultTyphaTerminationGracePeriod)}, // May get overridden later.
 	}
 	// We need at least the CN or URISAN set, we depend on the validation
@@ -655,12 +647,6 @@ func (c *typhaComponent) typhaService() *corev1.Service {
 			},
 		},
 	}
-}
-
-func (c *typhaComponent) typhaPodSecurityPolicy() *policyv1beta1.PodSecurityPolicy {
-	psp := podsecuritypolicy.NewBasePolicy(common.TyphaDeploymentName)
-	psp.Spec.HostNetwork = true
-	return psp
 }
 
 // affinity sets the user-specified typha affinity if specified.

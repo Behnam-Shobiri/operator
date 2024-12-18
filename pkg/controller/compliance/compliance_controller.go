@@ -18,34 +18,34 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/tigera/operator/pkg/controller/tenancy"
-
-	"k8s.io/apimachinery/pkg/types"
-
-	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
-	"github.com/tigera/operator/pkg/render/common/networkpolicy"
-
-	operatorv1 "github.com/tigera/operator/api/v1"
-	"github.com/tigera/operator/pkg/common"
-	"github.com/tigera/operator/pkg/controller/certificatemanager"
-	"github.com/tigera/operator/pkg/controller/options"
-	"github.com/tigera/operator/pkg/controller/status"
-	"github.com/tigera/operator/pkg/controller/utils"
-	"github.com/tigera/operator/pkg/controller/utils/imageset"
-	"github.com/tigera/operator/pkg/ctrlruntime"
-	"github.com/tigera/operator/pkg/dns"
-	"github.com/tigera/operator/pkg/render"
-	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
-	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
+	operatorv1 "github.com/tigera/operator/api/v1"
+	"github.com/tigera/operator/pkg/common"
+	"github.com/tigera/operator/pkg/controller/certificatemanager"
+	"github.com/tigera/operator/pkg/controller/options"
+	"github.com/tigera/operator/pkg/controller/status"
+	"github.com/tigera/operator/pkg/controller/tenancy"
+	"github.com/tigera/operator/pkg/controller/utils"
+	"github.com/tigera/operator/pkg/controller/utils/imageset"
+	"github.com/tigera/operator/pkg/ctrlruntime"
+	"github.com/tigera/operator/pkg/dns"
+	"github.com/tigera/operator/pkg/render"
+	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
+	"github.com/tigera/operator/pkg/render/common/networkpolicy"
+	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 )
 
 const ResourceName = "compliance"
@@ -161,7 +161,6 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions, licenseAPIReady
 		clusterDomain:   opts.ClusterDomain,
 		licenseAPIReady: licenseAPIReady,
 		tierWatchReady:  tierWatchReady,
-		usePSP:          opts.UsePSP,
 		multiTenant:     opts.MultiTenant,
 		externalElastic: opts.ElasticExternal,
 	}
@@ -183,7 +182,6 @@ type ReconcileCompliance struct {
 	clusterDomain   string
 	licenseAPIReady *utils.ReadyFlag
 	tierWatchReady  *utils.ReadyFlag
-	usePSP          bool
 	multiTenant     bool
 	externalElastic bool
 }
@@ -426,6 +424,15 @@ func (r *ReconcileCompliance) Reconcile(ctx context.Context, request reconcile.R
 		return reconcile.Result{}, nil
 	}
 
+	// Determine the namespaces to which we must bind the cluster role.
+	// For multi-tenant, the cluster role will be bind to the service account in the tenant namespace
+	// For single-tenant or zero-tenant, the cluster role will be bind to the service account in the tigera-policy-recommendation
+	// namespace
+	bindNamespaces, err := helper.TenantNamespaces(r.client)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
 	// Create a component handler to manage the rendered component.
 	handler := utils.NewComponentHandler(log, r.client, r.scheme, instance)
 
@@ -437,10 +444,11 @@ func (r *ReconcileCompliance) Reconcile(ctx context.Context, request reconcile.R
 
 	reqLogger.V(3).Info("rendering components")
 
-	namespaceComp := render.NewPassthrough(render.CreateNamespace(helper.InstallNamespace(), network.KubernetesProvider, render.PSSPrivileged))
+	namespaceComp := render.NewPassthrough(render.CreateNamespace(helper.InstallNamespace(), network.KubernetesProvider, render.PSSPrivileged, network.Azure))
+	opSecretsRB := render.NewPassthrough(render.CreateOperatorSecretsRoleBinding(helper.InstallNamespace()))
 
 	hasNoLicense := !utils.IsFeatureActive(license, common.ComplianceFeature)
-	openshift := r.provider == operatorv1.ProviderOpenShift
+	openshift := r.provider.IsOpenShift()
 	complianceCfg := &render.ComplianceConfiguration{
 		TrustedBundle:               trustedBundle,
 		Installation:                network,
@@ -450,14 +458,14 @@ func (r *ReconcileCompliance) Reconcile(ctx context.Context, request reconcile.R
 		SnapshotterKeyPair:          snapshotterKeyPair.Interface,
 		ReporterKeyPair:             reporterKeyPair.Interface,
 		PullSecrets:                 pullSecrets,
-		Openshift:                   openshift,
+		OpenShift:                   openshift,
 		ManagementCluster:           managementCluster,
 		ManagementClusterConnection: managementClusterConnection,
 		KeyValidatorConfig:          keyValidatorConfig,
 		ClusterDomain:               r.clusterDomain,
 		HasNoLicense:                hasNoLicense,
-		UsePSP:                      r.usePSP,
 		Namespace:                   helper.InstallNamespace(),
+		BindingNamespaces:           bindNamespaces,
 		Tenant:                      tenant,
 		Compliance:                  instance,
 		ExternalElastic:             r.externalElastic,
@@ -488,7 +496,7 @@ func (r *ReconcileCompliance) Reconcile(ctx context.Context, request reconcile.R
 		TrustedBundle: bundleMaker,
 	})
 
-	for _, comp := range []render.Component{namespaceComp, certificateComponent, comp} {
+	for _, comp := range []render.Component{namespaceComp, opSecretsRB, certificateComponent, comp} {
 		if err := handler.CreateOrUpdateOrDelete(ctx, comp, r.status); err != nil {
 			r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating / deleting resource", err, reqLogger)
 			return reconcile.Result{}, err

@@ -188,14 +188,15 @@ var _ = Describe("VoltronRouteConfigBuilder", func() {
 
 				// Add enough routes with different keys from the same config map to force the conflict to go above 10,
 				// so we can test that we don't go over the 63 char limit when the number of digits increase for the suffix.
-				for i := 0; i < 6; i++ {
+				num := 6
+				for i := 0; i < num; i++ {
 					mtlsCert.Data[fmt.Sprintf("%s%d", "cert.pem", i)] = []byte("bytes")
 					mtlsCert.Data[fmt.Sprintf("%s%d", "key.pem", i)] = []byte("bytes")
 					route := operatorv1.TLSTerminatedRoute{
 						ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("%d-test-route", i), Namespace: "tigera-manager"},
 						Spec: operatorv1.TLSTerminatedRouteSpec{
 							PathMatch: &operatorv1.PathMatch{
-								Path:        "/foobar",
+								Path:        fmt.Sprintf("/foobar-%d", num-1-i),
 								PathRegexp:  ptr.ToPtr("^/foobar$"),
 								PathReplace: ptr.ToPtr("/"),
 							},
@@ -247,7 +248,7 @@ var _ = Describe("VoltronRouteConfigBuilder", func() {
 					"hash.operator.tigera.io/routeconf-s-verylongnametoforceconfli10": "b64f683d0e588b7b03b62f62460efd553df9491e",
 					"hash.operator.tigera.io/routeconf-s-verylongnametoforceconfli11": "b64f683d0e588b7b03b62f62460efd553df9491e",
 					"hash.operator.tigera.io/routeconf-cm-ca-bundle-bundle":           "ed2e97c745074a9d7ed51a99ea4dfb8b337a3109",
-					"hash.operator.tigera.io/routeconf-cm-voltron-routes-uitlstermro": "50ba4f0e0df0bec537299c44127daea5e7e8031d",
+					"hash.operator.tigera.io/routeconf-cm-voltron-routes-uitlstermro": "b23457c4614fa00a609dc47aaa630bb8ea54b078",
 				}))
 			})
 		})
@@ -344,9 +345,9 @@ var _ = Describe("VoltronRouteConfigBuilder", func() {
 					"hash.operator.tigera.io/routeconf-s-mtls-key-key.pem":   "6b519c7eea53167b5fe03c86b7650ada4e7a4784",
 					routeCMKey: "907bc0d66a81235ae423c36bda0ed50fa73f7f51",
 				}))
-				Expect(config.VolumeMounts()).Should(Equal([]corev1.VolumeMount{caBundleVolumeMount, mtlsCertVolumeMount, mtlsKeyVolumeMount, routesConfigMapVolumeMount}))
+				Expect(config.VolumeMounts()).Should(Equal([]corev1.VolumeMount{caBundleVolumeMount, routesConfigMapVolumeMount, mtlsCertVolumeMount, mtlsKeyVolumeMount}))
 
-				Expect(config.Volumes()).Should(Equal([]corev1.Volume{caBundleVolume, mtlsCertVolume, mtlsKeyVolume, routesConfigMapVolume}))
+				Expect(config.Volumes()).Should(Equal([]corev1.Volume{caBundleVolume, routesConfigMapVolume, mtlsCertVolume, mtlsKeyVolume}))
 
 				cm := config.RoutesConfigMap("tigera-manager")
 				cm.Data[fileName] = compactJSONString(cm.Data[fileName])
@@ -357,6 +358,111 @@ var _ = Describe("VoltronRouteConfigBuilder", func() {
 				Entry("UI target", operatorv1.TargetTypeUI, "uiTLSTermRoutes.json", "hash.operator.tigera.io/routeconf-cm-voltron-routes-uitlstermro"),
 				Entry("Upstream tunnel target", operatorv1.TargetTypeUpstreamTunnel, "upTunTLSTermRoutes.json", "hash.operator.tigera.io/routeconf-cm-voltron-routes-uptuntlster"),
 			)
+		})
+
+		When("adding multiple routes out of order", func() {
+			It("volume and volume mounts should be sorted", func() {
+				routes := []operatorv1.TLSTerminatedRoute{
+					{
+						TypeMeta:   metav1.TypeMeta{},
+						ObjectMeta: metav1.ObjectMeta{Name: "route-2"},
+						Spec: operatorv1.TLSTerminatedRouteSpec{
+							Target: operatorv1.TargetTypeUI,
+							CABundle: &corev1.ConfigMapKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: "ca-bundle",
+								},
+								Key: "ca-bundle.crt",
+							},
+							PathMatch: &operatorv1.PathMatch{
+								Path:        "/bar/",
+								PathRegexp:  ptr.ToPtr("^/bar/?"),
+								PathReplace: ptr.ToPtr("/"),
+							},
+							Destination: "bar",
+						},
+					},
+					{
+						TypeMeta:   metav1.TypeMeta{},
+						ObjectMeta: metav1.ObjectMeta{Name: "route-1"},
+						Spec: operatorv1.TLSTerminatedRouteSpec{
+							Target: operatorv1.TargetTypeUI,
+							CABundle: &corev1.ConfigMapKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: "public-cert",
+								},
+								Key: "tls.crt",
+							},
+							PathMatch: &operatorv1.PathMatch{
+								Path:        "/foo/",
+								PathRegexp:  ptr.ToPtr("^/foo/?"),
+								PathReplace: ptr.ToPtr("/"),
+							},
+							Destination: "foo",
+						},
+					},
+					{
+						TypeMeta:   metav1.TypeMeta{},
+						ObjectMeta: metav1.ObjectMeta{Name: "route-3"},
+						Spec: operatorv1.TLSTerminatedRouteSpec{
+							Target: operatorv1.TargetTypeUI,
+							CABundle: &corev1.ConfigMapKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{
+									Name: "ca-bundle",
+								},
+								Key: "ca-bundle.crt",
+							},
+							PathMatch: &operatorv1.PathMatch{
+								Path:        "/goo/",
+								PathRegexp:  ptr.ToPtr("^/goo/?"),
+								PathReplace: ptr.ToPtr("/"),
+							},
+							Destination: "goo",
+						},
+					},
+				}
+				for _, route := range routes {
+					builder.AddTLSTerminatedRoute(route)
+				}
+
+				builder.AddConfigMap(&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "public-cert",
+					},
+					Data: map[string]string{
+						"tls.crt": "bundle",
+					},
+				})
+				builder.AddConfigMap(&corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "ca-bundle",
+					},
+					Data: map[string]string{
+						"ca-bundle.crt": "bundle",
+					},
+				})
+				config, err := builder.Build()
+				Expect(err).ShouldNot(HaveOccurred())
+
+				Expect(config.VolumeMounts()).Should(Equal([]corev1.VolumeMount{
+					{
+						Name:      "cm-ca-bundle",
+						MountPath: "/config_maps/ca-bundle",
+						ReadOnly:  true,
+					},
+					{
+						Name:      "cm-public-cert",
+						MountPath: "/config_maps/public-cert",
+						ReadOnly:  true,
+					},
+					{
+						Name:      "cm-voltron-routes",
+						MountPath: "/config_maps/voltron-routes",
+						ReadOnly:  true,
+					},
+				}))
+
+			})
 		})
 	})
 })

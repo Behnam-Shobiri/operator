@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2024-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -49,7 +49,7 @@ type yamlKind struct {
 }
 
 // This struct defines all of the resources that we expect to read from the rendered Envoy Gateway
-// helm chart (as of v1.1.2).
+// helm chart (as of the version indicated by `ENVOY_GATEWAY_VERSION` in `Makefile`).
 type gatewayAPIResources struct {
 	namespace                 *corev1.Namespace
 	k8sCRDs                   []*apiextenv1.CustomResourceDefinition
@@ -245,8 +245,8 @@ func GatewayAPIResourcesGetter() func() *gatewayAPIResources {
 			if len(resources.k8sCRDs) != 10 {
 				panic(fmt.Sprintf("missing/extra k8s CRDs from gateway API YAML (%v != 10)", len(resources.k8sCRDs)))
 			}
-			if len(resources.envoyCRDs) != 7 {
-				panic(fmt.Sprintf("missing/extra envoy CRDs from gateway API YAML (%v != 7)", len(resources.envoyCRDs)))
+			if len(resources.envoyCRDs) != 8 {
+				panic(fmt.Sprintf("missing/extra envoy CRDs from gateway API YAML (%v != 8)", len(resources.envoyCRDs)))
 			}
 			if resources.controllerServiceAccount == nil {
 				panic("missing controller ServiceAccount from gateway API YAML")
@@ -293,33 +293,17 @@ func GatewayAPIResourcesGetter() func() *gatewayAPIResources {
 
 			// Further assumptions that we rely on below in `Objects()`.  We put these
 			// here, instead of later, so that they are verified in UT.
-			defaultGatewayImage, _ := components.GetReference(components.ComponentGatewayAPIEnvoyGateway, "", "", "", nil)
-			defaultRatelimitImage, _ := components.GetReference(components.ComponentGatewayAPIEnvoyRatelimit, "", "", "", nil)
 			if len(resources.controllerDeployment.Spec.Template.Spec.Containers) != 1 {
 				panic("expected 1 container in deployment from gateway API YAML")
 			}
 			if resources.controllerDeployment.Spec.Template.Spec.Containers[0].Name != EnvoyGatewayDeploymentContainerName {
 				panic("expected container name 'envoy-gateway' in deployment from gateway API YAML")
 			}
-			if resources.controllerDeployment.Spec.Template.Spec.Containers[0].Image != defaultGatewayImage {
-				panic(fmt.Sprintf("unexpected image in deployment from gateway API YAML (%v != %v)",
-					resources.controllerDeployment.Spec.Template.Spec.Containers[0].Image,
-					defaultGatewayImage))
-			}
 			if len(resources.certgenJob.Spec.Template.Spec.Containers) != 1 {
 				panic("expected 1 container in certgen job from gateway API YAML")
 			}
 			if resources.certgenJob.Spec.Template.Spec.Containers[0].Name != EnvoyGatewayJobContainerName {
 				panic("expected container name 'envoy-gateway' in certgen job from gateway API YAML")
-			}
-			if resources.certgenJob.Spec.Template.Spec.Containers[0].Image != defaultGatewayImage {
-				panic("unexpected image in certgen job from gateway API YAML")
-			}
-			if *resources.envoyGatewayConfig.Provider.Kubernetes.RateLimitDeployment.Container.Image != defaultRatelimitImage {
-				panic("wrong ratelimit image in envoy-gateway-config from gateway API YAML")
-			}
-			if *resources.envoyGatewayConfig.Provider.Kubernetes.ShutdownManager.Image != defaultGatewayImage {
-				panic("wrong gateway image in envoy-gateway-config from gateway API YAML")
 			}
 		}
 		return resources
@@ -366,17 +350,32 @@ func (pr *gatewayAPIImplementationComponent) ResolveImages(is *operatorv1.ImageS
 	prefix := pr.cfg.Installation.ImagePrefix
 
 	var err error
-	pr.envoyGatewayImage, err = components.GetReference(components.ComponentGatewayAPIEnvoyGateway, reg, path, prefix, is)
-	if err != nil {
-		return err
-	}
-	pr.envoyProxyImage, err = components.GetReference(components.ComponentGatewayAPIEnvoyProxy, reg, path, prefix, is)
-	if err != nil {
-		return err
-	}
-	pr.envoyRatelimitImage, err = components.GetReference(components.ComponentGatewayAPIEnvoyRatelimit, reg, path, prefix, is)
-	if err != nil {
-		return err
+	if pr.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+		pr.envoyGatewayImage, err = components.GetReference(components.ComponentGatewayAPIEnvoyGateway, reg, path, prefix, is)
+		if err != nil {
+			return err
+		}
+		pr.envoyProxyImage, err = components.GetReference(components.ComponentGatewayAPIEnvoyProxy, reg, path, prefix, is)
+		if err != nil {
+			return err
+		}
+		pr.envoyRatelimitImage, err = components.GetReference(components.ComponentGatewayAPIEnvoyRatelimit, reg, path, prefix, is)
+		if err != nil {
+			return err
+		}
+	} else {
+		pr.envoyGatewayImage, err = components.GetReference(components.ComponentCalicoEnvoyGateway, reg, path, prefix, is)
+		if err != nil {
+			return err
+		}
+		pr.envoyProxyImage, err = components.GetReference(components.ComponentCalicoEnvoyProxy, reg, path, prefix, is)
+		if err != nil {
+			return err
+		}
+		pr.envoyRatelimitImage, err = components.GetReference(components.ComponentCalicoEnvoyRatelimit, reg, path, prefix, is)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -402,6 +401,9 @@ func (pr *gatewayAPIImplementationComponent) Objects() ([]client.Object, []clien
 			pr.cfg.Installation.Azure,
 		),
 	}
+
+	// Create role binding to allow creating secrets in our namespace.
+	objs = append(objs, CreateOperatorSecretsRoleBinding(resources.namespace.Name))
 
 	// Add pull secrets (inferred from the Installation resource).
 	objs = append(objs, secret.ToRuntimeObjects(secret.CopyToNamespace(resources.namespace.Name, pr.cfg.PullSecrets...)...)...)
@@ -441,6 +443,11 @@ func (pr *gatewayAPIImplementationComponent) Objects() ([]client.Object, []clien
 		envoyGatewayConfig.Provider.Kubernetes.RateLimitDeployment.Pod = &envoyapi.KubernetesPodSpec{}
 	}
 	envoyGatewayConfig.Provider.Kubernetes.RateLimitDeployment.Pod.ImagePullSecrets = secret.GetReferenceList(pr.cfg.PullSecrets)
+
+	// Enable backend APIs.
+	envoyGatewayConfig.ExtensionAPIs = &envoyapi.ExtensionAPISettings{
+		EnableBackend: true,
+	}
 
 	// Rebuild the ConfigMap with those changes.
 	envoyGatewayConfigMap := resources.envoyGatewayConfigMap.DeepCopyObject().(*corev1.ConfigMap)

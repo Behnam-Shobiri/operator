@@ -1,5 +1,5 @@
-// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
-
+// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
+//
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -131,6 +131,9 @@ var _ = Describe("Node rendering tests", func() {
 				// Dummy service endpoint for k8s API.
 				k8sServiceEp = k8sapi.ServiceEndpoint{}
 
+				defaultCNIConfDir, defaultCNIBinDir := render.DefaultCNIDirectories(defaultInstance.KubernetesProvider)
+				defaultInstance.CNI.ConfDir, defaultInstance.CNI.BinDir = &defaultCNIConfDir, &defaultCNIBinDir
+
 				// Create a default configuration.
 				cfg = render.NodeConfiguration{
 					K8sServiceEp:                  k8sServiceEp,
@@ -225,10 +228,6 @@ var _ = Describe("Node rendering tests", func() {
           "kubeconfig": "__KUBECONFIG_FILEPATH__"
       }
     },
-    {
-      "type": "bandwidth",
-      "capabilities": {"bandwidth": true}
-    },
     {"type": "portmap", "snat": true, "capabilities": {"portMappings": true}}
   ]
 }`, enableIPv4, enableIPv6)))
@@ -249,7 +248,7 @@ var _ = Describe("Node rendering tests", func() {
 
 				// Node image override results in correct image.
 				Expect(ds.Spec.Template.Spec.Containers).To(HaveLen(1))
-				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)))
+				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)))
 
 				Expect(*ds.Spec.Template.Spec.Containers[0].SecurityContext.AllowPrivilegeEscalation).To(BeTrue())
 				Expect(*ds.Spec.Template.Spec.Containers[0].SecurityContext.Privileged).To(BeTrue())
@@ -272,7 +271,7 @@ var _ = Describe("Node rendering tests", func() {
 				// CNI container uses image override.
 				cniContainer := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni")
 				rtest.ExpectEnv(cniContainer.Env, "CNI_NET_DIR", "/etc/cni/net.d")
-				Expect(cniContainer.Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
+				Expect(cniContainer.Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
 
 				Expect(*cniContainer.SecurityContext.AllowPrivilegeEscalation).To(BeTrue())
 				Expect(*cniContainer.SecurityContext.Privileged).To(BeTrue())
@@ -291,7 +290,7 @@ var _ = Describe("Node rendering tests", func() {
 
 				// Verify the Flex volume container image.
 				flexvolContainer := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver")
-				Expect(flexvolContainer.Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
+				Expect(flexvolContainer.Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				Expect(*flexvolContainer.SecurityContext.AllowPrivilegeEscalation).To(BeTrue())
 				Expect(*flexvolContainer.SecurityContext.Privileged).To(BeTrue())
@@ -335,6 +334,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHAK8SSERVICENAME", Value: "calico-typha"},
 					{Name: "FELIX_TYPHACAFILE", Value: certificatemanagement.TrustedCertBundleMountPath},
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
+					{Name: "FELIX_TYPHACN", Value: "typha-server"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
@@ -491,12 +491,6 @@ var _ = Describe("Node rendering tests", func() {
       }
     },
     {
-      "type": "bandwidth",
-      "capabilities": {
-        "bandwidth": true
-      }
-    },
-    {
       "type": "portmap",
       "snat": true,
       "capabilities": {
@@ -521,17 +515,17 @@ var _ = Describe("Node rendering tests", func() {
 				rtest.ExpectEnv(cniContainer.Env, "CNI_NET_DIR", "/etc/cni/net.d")
 
 				// Node image override results in correct image.
-				calicoNodeImage := fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)
+				calicoNodeImage := fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)
 				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(calicoNodeImage))
 
 				// Validate correct number of init containers.
 				Expect(len(ds.Spec.Template.Spec.InitContainers)).To(Equal(3))
 
 				// CNI container uses image override.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify the mount-bpffs image and command.
 				mountBpffs := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "mount-bpffs")
@@ -580,6 +574,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHAK8SSERVICENAME", Value: "calico-typha"},
 					{Name: "FELIX_TYPHACAFILE", Value: certificatemanagement.TrustedCertBundleMountPath},
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
+					{Name: "FELIX_TYPHACN", Value: "typha-server"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
@@ -717,10 +712,6 @@ var _ = Describe("Node rendering tests", func() {
           "kubeconfig": "__KUBECONFIG_FILEPATH__"
       }
     },
-    {
-      "type": "bandwidth",
-      "capabilities": {"bandwidth": true}
-    },
     {"type": "portmap", "snat": true, "capabilities": {"portMappings": true}}
   ]
 }`, enableIPv4, enableIPv6)))
@@ -797,6 +788,26 @@ var _ = Describe("Node rendering tests", func() {
 				// Verify the Flex volume container image.
 				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("%s%s:%s", components.TigeraRegistry, components.ComponentTigeraFlexVolume.Image, components.ComponentTigeraFlexVolume.Version)))
 
+				// Verify the mount-bpffs image and command.
+				mountBpffs := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "mount-bpffs")
+				Expect(mountBpffs.Image).To(Equal(ds.Spec.Template.Spec.Containers[0].Image))
+				Expect(mountBpffs.Command).To(Equal([]string{"calico-node", "-init"}))
+
+				Expect(*mountBpffs.SecurityContext.AllowPrivilegeEscalation).To(BeTrue())
+				Expect(*mountBpffs.SecurityContext.Privileged).To(BeTrue())
+				Expect(*mountBpffs.SecurityContext.RunAsGroup).To(BeEquivalentTo(0))
+				Expect(*mountBpffs.SecurityContext.RunAsNonRoot).To(BeFalse())
+				Expect(*mountBpffs.SecurityContext.RunAsUser).To(BeEquivalentTo(0))
+				Expect(mountBpffs.SecurityContext.Capabilities).To(Equal(
+					&corev1.Capabilities{
+						Drop: []corev1.Capability{"ALL"},
+					},
+				))
+				Expect(mountBpffs.SecurityContext.SeccompProfile).To(Equal(
+					&corev1.SeccompProfile{
+						Type: corev1.SeccompProfileTypeRuntimeDefault,
+					}))
+
 				expectedNodeEnv := []corev1.EnvVar{
 					// Default envvars.
 					{Name: "DATASTORE_TYPE", Value: "kubernetes"},
@@ -824,6 +835,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHAK8SSERVICENAME", Value: "calico-typha"},
 					{Name: "FELIX_TYPHACAFILE", Value: certificatemanagement.TrustedCertBundleMountPath},
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
+					{Name: "FELIX_TYPHACN", Value: "typha-server"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					// Tigera-specific envvars
 					{Name: "FELIX_PROMETHEUSREPORTERENABLED", Value: "true"},
@@ -847,7 +859,15 @@ var _ = Describe("Node rendering tests", func() {
 				ms := rtest.GetResource(resources, "calico-node-metrics", "calico-system", "", "v1", "Service").(*corev1.Service)
 				Expect(len(ms.Spec.Ports)).To(Equal(2))
 
+				dirMustExist := corev1.HostPathDirectory
+				bpfVol := corev1.Volume{Name: "bpffs", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/sys/fs/bpf", Type: &dirMustExist}}}
+				Expect(ds.Spec.Template.Spec.Volumes).To(ContainElement(bpfVol))
+
+				bpfVolMount := corev1.VolumeMount{MountPath: "/sys/fs/bpf", Name: "bpffs"}
+				Expect(ds.Spec.Template.Spec.Containers[0].VolumeMounts).To(ContainElement(bpfVolMount))
+
 				verifyProbesAndLifecycle(ds, false, true)
+
 			})
 
 			It("should render felix service metric with FelixPrometheusMetricPort when FelixPrometheusMetricsEnabled is true", func() {
@@ -964,17 +984,17 @@ var _ = Describe("Node rendering tests", func() {
 				Expect(hostPathContainer.VolumeMounts).To(ConsistOf(expectedHostPathInitVolumeMounts))
 
 				// Node image override results in correct image.
-				calicoNodeImage := fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)
+				calicoNodeImage := fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)
 				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(calicoNodeImage))
 
 				// Validate correct number of init containers.
 				Expect(len(ds.Spec.Template.Spec.InitContainers)).To(Equal(3))
 
 				// CNI container uses image override.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify the mount-bpffs image and command.
 				mountBpffs := rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "mount-bpffs")
@@ -1107,10 +1127,6 @@ var _ = Describe("Node rendering tests", func() {
           "kubeconfig": "__KUBECONFIG_FILEPATH__"
       }
     },
-    {
-      "type": "bandwidth",
-      "capabilities": {"bandwidth": true}
-    },
     {"type": "portmap", "snat": true, "capabilities": {"portMappings": true}}
   ]
 }`, enableIPv4, enableIPv6)))
@@ -1130,16 +1146,16 @@ var _ = Describe("Node rendering tests", func() {
 				rtest.ExpectEnv(cniContainer.Env, "CNI_NET_DIR", "/etc/cni/net.d")
 
 				// Node image override results in correct image.
-				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)))
+				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)))
 
 				// Validate correct number of init containers.
 				Expect(len(ds.Spec.Template.Spec.InitContainers)).To(Equal(2))
 
 				// CNI container uses image override.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify env
 				expectedNodeEnv := []corev1.EnvVar{
@@ -1168,6 +1184,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHAK8SSERVICENAME", Value: "calico-typha"},
 					{Name: "FELIX_TYPHACAFILE", Value: certificatemanagement.TrustedCertBundleMountPath},
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
+					{Name: "FELIX_TYPHACN", Value: "typha-server"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
@@ -1298,7 +1315,7 @@ var _ = Describe("Node rendering tests", func() {
 				Expect(len(ds.Spec.Template.Spec.InitContainers)).To(Equal(1))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify env
 				expectedNodeEnv := []corev1.EnvVar{
@@ -1331,6 +1348,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHAK8SSERVICENAME", Value: "calico-typha"},
 					{Name: "FELIX_TYPHACAFILE", Value: certificatemanagement.TrustedCertBundleMountPath},
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
+					{Name: "FELIX_TYPHACN", Value: "typha-server"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "FELIX_INTERFACEPREFIX", Value: "eni"},
 					{Name: "FELIX_IPTABLESMANGLEALLOWACTION", Value: "Return"},
@@ -1393,6 +1411,33 @@ var _ = Describe("Node rendering tests", func() {
 
 				// Verify readiness and liveness probes.
 				verifyProbesAndLifecycle(ds, false, true)
+			})
+
+			It("should return customized CNI directories when specified", func() {
+				customBinDir, customConfDir := "/custom/cni/bin", "/custom/cni/net.d"
+				cfg.Installation.CNI.BinDir = &customBinDir
+				cfg.Installation.CNI.ConfDir = &customConfDir
+				component := render.Node(&cfg)
+				Expect(component.ResolveImages(nil)).To(BeNil())
+				resources, _ := component.Objects()
+				dsResource := rtest.GetResource(resources, "calico-node", "calico-system", "apps", "v1", "DaemonSet")
+				Expect(dsResource).ToNot(BeNil())
+
+				// The DaemonSet should have the correct configuration.
+				ds := dsResource.(*appsv1.DaemonSet)
+
+				dirOrCreate := corev1.HostPathDirectoryOrCreate
+				expectedVols := []corev1.Volume{
+					{Name: "cni-bin-dir", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/custom/cni/bin", Type: &dirOrCreate}}},
+					{Name: "cni-net-dir", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/custom/cni/net.d"}}},
+					{Name: "cni-log-dir", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/var/log/calico/cni"}}},
+				}
+				Expect(ds.Spec.Template.Spec.Volumes).To(ContainElements(expectedVols))
+				expectedCNIVolumeMounts := []corev1.VolumeMount{
+					{MountPath: "/host/opt/cni/bin", Name: "cni-bin-dir"},
+					{MountPath: "/host/etc/cni/net.d", Name: "cni-net-dir"},
+				}
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").VolumeMounts).To(ConsistOf(expectedCNIVolumeMounts))
 			})
 
 			DescribeTable("should properly render configuration using non-Calico CNI plugin",
@@ -1527,10 +1572,6 @@ var _ = Describe("Node rendering tests", func() {
           "kubeconfig": "__KUBECONFIG_FILEPATH__"
       }
     },
-    {
-      "type": "bandwidth",
-      "capabilities": {"bandwidth": true}
-    },
     {"type": "portmap", "snat": true, "capabilities": {"portMappings": true}}
   ]
 }`, enableIPv4, enableIPv6)))
@@ -1550,16 +1591,16 @@ var _ = Describe("Node rendering tests", func() {
 				rtest.ExpectEnv(cniContainer.Env, "CNI_NET_DIR", "/etc/cni/net.d")
 
 				// Node image override results in correct image.
-				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)))
+				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)))
 
 				// Validate correct number of init containers.
 				Expect(len(ds.Spec.Template.Spec.InitContainers)).To(Equal(2))
 
 				// CNI container uses image override.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify env
 				expectedNodeEnv := []corev1.EnvVar{
@@ -1588,6 +1629,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHAK8SSERVICENAME", Value: "calico-typha"},
 					{Name: "FELIX_TYPHACAFILE", Value: certificatemanagement.TrustedCertBundleMountPath},
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
+					{Name: "FELIX_TYPHACN", Value: "typha-server"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
@@ -1715,7 +1757,7 @@ var _ = Describe("Node rendering tests", func() {
 				Expect(len(ds.Spec.Template.Spec.InitContainers)).To(Equal(1))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify env
 				expectedNodeEnv := []corev1.EnvVar{
@@ -1748,6 +1790,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHAK8SSERVICENAME", Value: "calico-typha"},
 					{Name: "FELIX_TYPHACAFILE", Value: certificatemanagement.TrustedCertBundleMountPath},
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
+					{Name: "FELIX_TYPHACN", Value: "typha-server"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "FELIX_INTERFACEPREFIX", Value: "eni"},
 					{Name: "FELIX_IPTABLESMANGLEALLOWACTION", Value: "Return"},
@@ -1832,6 +1875,8 @@ var _ = Describe("Node rendering tests", func() {
 
 				defaultInstance.FlexVolumePath = "/etc/kubernetes/kubelet-plugins/volume/exec/"
 				defaultInstance.KubernetesProvider = operatorv1.ProviderOpenShift
+				defaultCNIConfDir, defaultCNIBinDir := render.DefaultCNIDirectories(defaultInstance.KubernetesProvider)
+				defaultInstance.CNI.ConfDir, defaultInstance.CNI.BinDir = &defaultCNIConfDir, &defaultCNIBinDir
 				cfg.FelixHealthPort = 9199
 				component := render.Node(&cfg)
 				Expect(component.ResolveImages(nil)).To(BeNil())
@@ -1856,7 +1901,7 @@ var _ = Describe("Node rendering tests", func() {
 
 				// The DaemonSet should have the correct configuration.
 				ds := rtest.GetResource(resources, "calico-node", "calico-system", "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
-				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)))
+				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)))
 
 				// The pod template should have node critical priority
 				Expect(ds.Spec.Template.Spec.PriorityClassName).To(Equal(render.NodePriorityClassName))
@@ -1926,6 +1971,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHAK8SSERVICENAME", Value: "calico-typha"},
 					{Name: "FELIX_TYPHACAFILE", Value: certificatemanagement.TrustedCertBundleMountPath},
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
+					{Name: "FELIX_TYPHACN", Value: "typha-server"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
@@ -1957,6 +2003,8 @@ var _ = Describe("Node rendering tests", func() {
 
 				defaultInstance.Variant = operatorv1.TigeraSecureEnterprise
 				defaultInstance.KubernetesProvider = operatorv1.ProviderOpenShift
+				defaultCNIConfDir, defaultCNIBinDir := render.DefaultCNIDirectories(defaultInstance.KubernetesProvider)
+				defaultInstance.CNI.ConfDir, defaultInstance.CNI.BinDir = &defaultCNIConfDir, &defaultCNIBinDir
 				cfg.NodeReporterMetricsPort = 9081
 				cfg.FelixHealthPort = 9199
 
@@ -2020,6 +2068,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHAK8SSERVICENAME", Value: "calico-typha"},
 					{Name: "FELIX_TYPHACAFILE", Value: certificatemanagement.TrustedCertBundleMountPath},
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
+					{Name: "FELIX_TYPHACN", Value: "typha-server"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					// Tigera-specific envvars
 					{Name: "FELIX_PROMETHEUSREPORTERENABLED", Value: "true"},
@@ -2063,6 +2112,8 @@ var _ = Describe("Node rendering tests", func() {
 
 				defaultInstance.Variant = operatorv1.TigeraSecureEnterprise
 				defaultInstance.KubernetesProvider = operatorv1.ProviderRKE2
+				defaultCNIConfDir, defaultCNIBinDir := render.DefaultCNIDirectories(defaultInstance.KubernetesProvider)
+				defaultInstance.CNI.ConfDir, defaultInstance.CNI.BinDir = &defaultCNIConfDir, &defaultCNIBinDir
 				cfg.NodeReporterMetricsPort = 9081
 				cfg.FelixHealthPort = 9199
 
@@ -2114,6 +2165,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHAK8SSERVICENAME", Value: "calico-typha"},
 					{Name: "FELIX_TYPHACAFILE", Value: certificatemanagement.TrustedCertBundleMountPath},
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
+					{Name: "FELIX_TYPHACN", Value: "typha-server"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 					// Tigera-specific envvars
@@ -2165,6 +2217,8 @@ var _ = Describe("Node rendering tests", func() {
 					"template-1.yaml": "dataforTemplate1 that is not used here",
 				}
 				defaultInstance.KubernetesProvider = operatorv1.ProviderOpenShift
+				defaultCNIConfDir, defaultCNIBinDir := render.DefaultCNIDirectories(defaultInstance.KubernetesProvider)
+				defaultInstance.CNI.ConfDir, defaultInstance.CNI.BinDir = &defaultCNIConfDir, &defaultCNIBinDir
 				component := render.Node(&cfg)
 				Expect(component.ResolveImages(nil)).To(BeNil())
 				resources, _ := component.Objects()
@@ -2209,6 +2263,8 @@ var _ = Describe("Node rendering tests", func() {
 			Describe("AKS", func() {
 				It("should avoid virtual nodes", func() {
 					defaultInstance.KubernetesProvider = operatorv1.ProviderAKS
+					defaultCNIConfDir, defaultCNIBinDir := render.DefaultCNIDirectories(defaultInstance.KubernetesProvider)
+					defaultInstance.CNI.ConfDir, defaultInstance.CNI.BinDir = &defaultCNIConfDir, &defaultCNIBinDir
 					component := render.Node(&cfg)
 					Expect(component.ResolveImages(nil)).To(BeNil())
 					resources, _ := component.Objects()
@@ -2235,6 +2291,8 @@ var _ = Describe("Node rendering tests", func() {
 			Describe("EKS", func() {
 				It("should avoid virtual fargate nodes", func() {
 					defaultInstance.KubernetesProvider = operatorv1.ProviderEKS
+					defaultCNIConfDir, defaultCNIBinDir := render.DefaultCNIDirectories(defaultInstance.KubernetesProvider)
+					defaultInstance.CNI.ConfDir, defaultInstance.CNI.BinDir = &defaultCNIConfDir, &defaultCNIBinDir
 					component := render.Node(&cfg)
 					Expect(component.ResolveImages(nil)).To(BeNil())
 					resources, _ := component.Objects()
@@ -2338,6 +2396,8 @@ var _ = Describe("Node rendering tests", func() {
 
 			It("should include updates needed for the core upgrade", func() {
 				defaultInstance.KubernetesProvider = operatorv1.ProviderOpenShift
+				defaultCNIConfDir, defaultCNIBinDir := render.DefaultCNIDirectories(defaultInstance.KubernetesProvider)
+				defaultInstance.CNI.ConfDir, defaultInstance.CNI.BinDir = &defaultCNIConfDir, &defaultCNIBinDir
 				cfg.MigrateNamespaces = true
 				component := render.Node(&cfg)
 				Expect(component.ResolveImages(nil)).To(BeNil())
@@ -2542,10 +2602,6 @@ var _ = Describe("Node rendering tests", func() {
       "kubernetes": {
           "kubeconfig": "__KUBECONFIG_FILEPATH__"
       }
-    },
-    {
-      "type": "bandwidth",
-      "capabilities": {"bandwidth": true}
     }
   ]
 }`, enableIPv4, enableIPv6)))
@@ -2648,12 +2704,6 @@ var _ = Describe("Node rendering tests", func() {
     },
     {
       "capabilities": {
-        "bandwidth": true
-      },
-      "type": "bandwidth"
-    },
-    {
-      "capabilities": {
         "portMappings": true
       },
       "snat": true,
@@ -2715,10 +2765,6 @@ var _ = Describe("Node rendering tests", func() {
           "kubeconfig": "__KUBECONFIG_FILEPATH__"
       }
     },
-    {
-      "type": "bandwidth",
-      "capabilities": {"bandwidth": true}
-    },
     {"type": "portmap", "snat": true, "capabilities": {"portMappings": true}}
   ]
 }`, enableIPv4, enableIPv6)))
@@ -2766,10 +2812,6 @@ var _ = Describe("Node rendering tests", func() {
       "kubernetes": {
           "kubeconfig": "__KUBECONFIG_FILEPATH__"
       }
-    },
-    {
-      "type": "bandwidth",
-      "capabilities": {"bandwidth": true}
     },
     {"type": "portmap", "snat": true, "capabilities": {"portMappings": true}}
   ]
@@ -2833,7 +2875,6 @@ var _ = Describe("Node rendering tests", func() {
       "policy": { "type": "k8s" },
       "kubernetes": { "kubeconfig": "__KUBECONFIG_FILEPATH__" }
     },
-    {"type": "bandwidth", "capabilities": {"bandwidth": true}},
     {"type": "portmap", "snat": true, "capabilities": {"portMappings": true}}
   ]
 }`, subnetStr)))
@@ -2890,7 +2931,6 @@ var _ = Describe("Node rendering tests", func() {
       "policy": { "type": "k8s" },
       "kubernetes": { "kubeconfig": "__KUBECONFIG_FILEPATH__" }
     },
-    {"type": "bandwidth", "capabilities": {"bandwidth": true}},
     {"type": "portmap", "snat": true, "capabilities": {"portMappings": true}}
   ]
 }`))
@@ -2941,7 +2981,6 @@ var _ = Describe("Node rendering tests", func() {
       "policy": { "type": "k8s" },
       "kubernetes": { "kubeconfig": "__KUBECONFIG_FILEPATH__" }
     },
-    {"type": "bandwidth", "capabilities": {"bandwidth": true}},
     {"type": "portmap", "snat": true, "capabilities": {"portMappings": true}}
   ]
 }`))
@@ -2990,12 +3029,6 @@ var _ = Describe("Node rendering tests", func() {
       "kubernetes": {
         "k8s_api_root": "https://k8shost:1234",
         "kubeconfig": "__KUBECONFIG_FILEPATH__"
-      }
-    },
-    {
-      "type": "bandwidth",
-      "capabilities": {
-        "bandwidth": true
       }
     },
     {
@@ -3134,10 +3167,6 @@ var _ = Describe("Node rendering tests", func() {
           "kubeconfig": "__KUBECONFIG_FILEPATH__"
       }
     },
-    {
-      "type": "bandwidth",
-      "capabilities": {"bandwidth": true}
-    },
     {"type": "portmap", "snat": true, "capabilities": {"portMappings": true}}
   ]
 }`))
@@ -3157,16 +3186,16 @@ var _ = Describe("Node rendering tests", func() {
 				rtest.ExpectEnv(cniContainer.Env, "CNI_NET_DIR", "/etc/cni/net.d")
 
 				// Node image override results in correct image.
-				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)))
+				Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoNode.Image, components.ComponentCalicoNode.Version)))
 
 				// Validate correct number of init containers.
 				Expect(len(ds.Spec.Template.Spec.InitContainers)).To(Equal(2))
 
 				// CNI container uses image override.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "install-cni").Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoCNI.Image, components.ComponentCalicoCNI.Version)))
 
 				// Verify the Flex volume container image.
-				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("docker.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
+				Expect(rtest.GetContainer(ds.Spec.Template.Spec.InitContainers, "flexvol-driver").Image).To(Equal(fmt.Sprintf("quay.io/%s:%s", components.ComponentCalicoFlexVolume.Image, components.ComponentCalicoFlexVolume.Version)))
 
 				// Verify env
 				expectedNodeEnv := []corev1.EnvVar{
@@ -3196,6 +3225,7 @@ var _ = Describe("Node rendering tests", func() {
 					{Name: "FELIX_TYPHAK8SSERVICENAME", Value: "calico-typha"},
 					{Name: "FELIX_TYPHACAFILE", Value: certificatemanagement.TrustedCertBundleMountPath},
 					{Name: "FELIX_TYPHACERTFILE", Value: "/node-certs/tls.crt"},
+					{Name: "FELIX_TYPHACN", Value: "typha-server"},
 					{Name: "FELIX_TYPHAKEYFILE", Value: "/node-certs/tls.key"},
 					{Name: "NO_DEFAULT_POOLS", Value: "true"},
 				}
@@ -3228,6 +3258,8 @@ var _ = Describe("Node rendering tests", func() {
 				func(isOpenshift, isEnterprise bool, bgpOption operatorv1.BGPOption) {
 					if isOpenshift {
 						defaultInstance.KubernetesProvider = operatorv1.ProviderOpenShift
+						defaultCNIConfDir, defaultCNIBinDir := render.DefaultCNIDirectories(defaultInstance.KubernetesProvider)
+						defaultInstance.CNI.ConfDir, defaultInstance.CNI.BinDir = &defaultCNIConfDir, &defaultCNIBinDir
 						cfg.FelixHealthPort = 9199
 					}
 

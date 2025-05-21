@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ var _ = Describe("Egress Gateway rendering tests", func() {
 	var timeout int32 = 40
 	var pullSecrets []*corev1.Secret
 	rbac := "rbac.authorization.k8s.io"
-	logSeverity := operatorv1.LogLevelInfo
+	logSeverity := operatorv1.LogSeverityInfo
 	labels := map[string]string{"egress-code": "red"}
 
 	topoConstraint := corev1.TopologySpreadConstraint{
@@ -115,6 +115,7 @@ var _ = Describe("Egress Gateway rendering tests", func() {
 			version string
 			kind    string
 		}{
+			{"tigera-operator-secrets", "test-ns", "rbac.authorization.k8s.io", "v1", "RoleBinding"},
 			{"test-secret", "test-ns", "", "v1", "Secret"},
 			{"egress-test", "test-ns", "", "v1", "ServiceAccount"},
 			{"egress-test", "test-ns", "apps", "v1", "Deployment"},
@@ -273,7 +274,7 @@ var _ = Describe("Egress Gateway rendering tests", func() {
 			VXLANPort:    4790,
 		})
 		resources, _ := component.Objects()
-		Expect(resources).To(HaveLen(2))
+		Expect(resources).To(HaveLen(3))
 		dep := rtest.GetResource(resources, "egress-test", "test-ns", "apps", "v1", "Deployment").(*appsv1.Deployment)
 		Expect(dep.Spec.Template.Spec.Containers[0].Resources).To(Equal(expectedResource))
 		elasticIPAnnotation := dep.Spec.Template.ObjectMeta.Annotations["cni.projectcalico.org/awsElasticIPs"]
@@ -288,6 +289,7 @@ var _ = Describe("Egress Gateway rendering tests", func() {
 			version string
 			kind    string
 		}{
+			{"tigera-operator-secrets", "test-ns", "rbac.authorization.k8s.io", "v1", "RoleBinding"},
 			{"egress-test", "test-ns", "", "v1", "ServiceAccount"},
 			{"egress-test", "test-ns", rbac, "v1", "Role"},
 			{"egress-test", "test-ns", rbac, "v1", "RoleBinding"},

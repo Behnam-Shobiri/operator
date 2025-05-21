@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,7 +28,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	kerror "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -37,6 +36,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	rconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -53,6 +53,15 @@ import (
 const (
 	ManageCRDsEnable  = true
 	ManageCRDsDisable = false
+
+	EnterpriseCRDsExist    = true
+	EnterpriseCRDsNotExist = false
+
+	WhiskerCRDExists    = true
+	WhiskerCRDNotExists = false
+
+	MultiTenant  = true
+	SingleTenant = false
 )
 
 var _ = Describe("Mainline component function tests", func() {
@@ -62,13 +71,13 @@ var _ = Describe("Mainline component function tests", func() {
 	var cancel context.CancelFunc
 	var operatorDone chan struct{}
 	BeforeEach(func() {
-		c, shutdownContext, cancel, mgr = setupManager(ManageCRDsDisable, false)
+		c, shutdownContext, cancel, mgr = setupManager(ManageCRDsDisable, SingleTenant, EnterpriseCRDsExist)
 
 		By("Cleaning up resources before the test")
 		cleanupResources(c)
 
 		By("Verifying CRDs are installed")
-		verifyCRDsExist(c)
+		verifyCRDsExist(c, operator.TigeraSecureEnterprise)
 
 		By("Creating the tigera-operator namespace, if it doesn't exist")
 		ns := &corev1.Namespace{
@@ -87,7 +96,7 @@ var _ = Describe("Mainline component function tests", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "default"},
 		}
 		err = c.Get(context.Background(), types.NamespacedName{Name: "default"}, instance)
-		Expect(errors.IsNotFound(err)).To(BeTrue(), fmt.Sprintf("Expected Installation not to exist, but got: %s", err))
+		Expect(kerror.IsNotFound(err)).To(BeTrue(), fmt.Sprintf("Expected Installation not to exist, but got: %s", err))
 	})
 
 	AfterEach(func() {
@@ -228,12 +237,12 @@ var _ = Describe("Mainline component function tests with ignored resource", func
 	var cancel context.CancelFunc
 
 	BeforeEach(func() {
-		c, shutdownContext, cancel, mgr = setupManager(ManageCRDsDisable, false)
-		verifyCRDsExist(c)
+		c, shutdownContext, cancel, mgr = setupManager(ManageCRDsDisable, SingleTenant, EnterpriseCRDsExist)
+		verifyCRDsExist(c, operator.TigeraSecureEnterprise)
 	})
 
 	AfterEach(func() {
-		removeInstallation(c, "not-default", context.Background())
+		removeInstallation(context.Background(), c, "not-default")
 	})
 
 	It("Should ignore a CRD resource not named 'default'", func() {
@@ -270,7 +279,7 @@ var _ = Describe("Mainline component function tests with ignored resource", func
 
 var _ = Describe("Mainline component function tests - multi-tenant", func() {
 	It("should set up all controllers correctly in multi-tenant mode", func() {
-		_, _, cancel, _ := setupManager(ManageCRDsDisable, true)
+		_, _, cancel, _ := setupManager(ManageCRDsDisable, MultiTenant, EnterpriseCRDsExist)
 		cancel()
 	})
 })
@@ -308,12 +317,16 @@ func newNonCachingClient(config *rest.Config, options client.Options) (client.Cl
 	return client.New(config, options)
 }
 
-func setupManager(manageCRDs bool, multiTenant bool) (client.Client, context.Context, context.CancelFunc, manager.Manager) {
+func setupManager(manageCRDs bool, multiTenant bool, enterpriseCRDsExist bool) (client.Client, context.Context, context.CancelFunc, manager.Manager) {
 	// Create a Kubernetes client.
 	cfg, err := config.GetConfig()
 	Expect(err).NotTo(HaveOccurred())
 
+	clientset, err := kubernetes.NewForConfig(cfg)
+	Expect(err).NotTo(HaveOccurred())
+
 	// Create a manager to use in the tests.
+	skipNameValidation := true
 	mgr, err := manager.New(cfg, manager.Options{
 		Metrics: server.Options{
 			BindAddress: "0",
@@ -326,6 +339,9 @@ func setupManager(manageCRDs bool, multiTenant bool) (client.Client, context.Con
 		// was not updating and tests were failing as a result of looking at stale cluster state
 		NewClient: newNonCachingClient,
 		Client:    client.Options{},
+		Controller: rconfig.Controller{
+			SkipNameValidation: &skipNameValidation,
+		},
 	})
 	Expect(err).NotTo(HaveOccurred())
 
@@ -340,9 +356,10 @@ func setupManager(manageCRDs bool, multiTenant bool) (client.Client, context.Con
 	// Setup all Controllers
 	err = controller.AddToManager(mgr, options.AddOptions{
 		DetectedProvider:    operator.ProviderNone,
-		EnterpriseCRDExists: true,
+		EnterpriseCRDExists: enterpriseCRDsExist,
 		ManageCRDs:          manageCRDs,
 		ShutdownContext:     ctx,
+		K8sClientset:        clientset,
 		MultiTenant:         multiTenant,
 	})
 	Expect(err).NotTo(HaveOccurred())
@@ -364,20 +381,29 @@ func createAPIServer(c client.Client, mgr manager.Manager, ctx context.Context, 
 	Expect(err).NotTo(HaveOccurred())
 }
 
-func removeAPIServer(c client.Client, ctx context.Context) {
+func removeAPIServer(ctx context.Context, c client.Client) {
 	instance := &operator.APIServer{
 		TypeMeta:   metav1.TypeMeta{Kind: "APIServer", APIVersion: "operator.tigera.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{Name: "default"},
 	}
-	err := c.Get(ctx, client.ObjectKey{Name: "default"}, instance)
-	if err != nil && kerror.IsNotFound(err) {
-		return
-	}
-	Expect(err).NotTo(HaveOccurred())
 
-	By("Deleting the APIServer CRD")
-	err = c.Delete(ctx, instance)
-	Expect(err).NotTo(HaveOccurred())
+	// Use Eventually to handle transient errors.
+	exists := true
+	Eventually(func() error {
+		err := c.Get(ctx, client.ObjectKey{Name: "default"}, instance)
+		if err != nil && kerror.IsNotFound(err) {
+			exists = false
+			return nil
+		}
+		return err
+	}, 1*time.Second, 100*time.Millisecond).ShouldNot(HaveOccurred(), "Failed to get APIServer CR")
+
+	if exists {
+		By("Deleting the default APIServer CR")
+		Eventually(func() error {
+			return c.Delete(ctx, instance)
+		}, 1*time.Second, 100*time.Millisecond).ShouldNot(HaveOccurred(), "Failed to delete APIServer CR")
+	}
 }
 
 func createInstallation(c client.Client, mgr manager.Manager, ctx context.Context, spec *operator.InstallationSpec) (doneChan chan struct{}) {
@@ -398,28 +424,37 @@ func createInstallation(c client.Client, mgr manager.Manager, ctx context.Contex
 	return RunOperator(mgr, ctx)
 }
 
-func removeInstallation(c client.Client, name string, ctx context.Context) {
+func removeInstallation(ctx context.Context, c client.Client, name string) {
 	// Delete any CRD that might have been created by the test.
 	instance := &operator.Installation{
 		TypeMeta:   metav1.TypeMeta{Kind: "Installation", APIVersion: "operator.tigera.io/v1"},
 		ObjectMeta: metav1.ObjectMeta{Name: name},
 	}
-	err := c.Get(ctx, client.ObjectKey{Name: name}, instance)
-	if err != nil && kerror.IsNotFound(err) {
-		return
-	}
-	Expect(err).NotTo(HaveOccurred())
 
-	By("Deleting the Installation CRD")
-	err = c.Delete(ctx, instance)
-	Expect(err).NotTo(HaveOccurred())
+	// Use Eventually to handle transient errors.
+	exists := true
+	EventuallyWithOffset(1, func() error {
+		err := c.Get(ctx, client.ObjectKey{Name: name}, instance)
+		if err != nil && kerror.IsNotFound(err) {
+			exists = false
+			return nil
+		}
+		return err
+	}, 1*time.Second, 100*time.Millisecond).ShouldNot(HaveOccurred(), "Failed to get Installation CR")
+
+	if exists {
+		By("Deleting the Installation CRD")
+		EventuallyWithOffset(1, func() error {
+			return c.Delete(ctx, instance)
+		}, 1*time.Second, 100*time.Millisecond).ShouldNot(HaveOccurred(), "Failed to delete Installation CR")
+	}
 
 	// Need to wait here for Installation resource to be fully deleted prior to cancelling the context
 	// which will in turn terminate the operator. Race conditions can occur otherwise that will leave the
 	// Installation resource intact while the operator is no longer running which will result in test failures
 	// that try to create an Installation resource of their own
 	By("Waiting for the Installation CR to be removed")
-	Eventually(func() error {
+	EventuallyWithOffset(1, func() error {
 		err := c.Get(ctx, client.ObjectKey{Name: name}, instance)
 		if kerror.IsNotFound(err) {
 			return nil
@@ -500,22 +535,21 @@ func verifyCalicoHasDeployed(c client.Client) {
 	}, 60*time.Second).Should(BeNil())
 }
 
-func verifyCRDsExist(c client.Client) {
+func verifyCRDsExist(c client.Client, variant operator.ProductVariant) {
 	crdNames := []string{}
-	for _, x := range crds.GetCRDs(operator.TigeraSecureEnterprise) {
+	for _, x := range crds.GetCRDs(variant) {
 		crdNames = append(crdNames, fmt.Sprintf("%s.%s", x.Spec.Names.Plural, x.Spec.Group))
 	}
 
 	// Eventually all the Enterprise CRDs should be available
-	Eventually(func() error {
+	EventuallyWithOffset(1, func() error {
 		for _, n := range crdNames {
 			crd := &apiextensionsv1.CustomResourceDefinition{
 				TypeMeta:   metav1.TypeMeta{Kind: "CustomResourceDefinition", APIVersion: "apiextensions.k8s.io/v1"},
 				ObjectMeta: metav1.ObjectMeta{Name: n},
 			}
-			err := GetResource(c, crd)
-			// If getting any of the CRDs is an error then the CRDs do not exist
-			if err != nil {
+			if err := GetResource(c, crd); err != nil {
+				// If getting any of the CRDs is an error then the CRDs do not exist
 				return err
 			}
 		}
@@ -583,8 +617,8 @@ func cleanupIPPools(c client.Client) {
 }
 
 func cleanupResources(c client.Client) {
-	removeAPIServer(c, context.Background())
-	removeInstallation(c, "default", context.Background())
+	removeAPIServer(context.Background(), c)
+	removeInstallation(context.Background(), c, "default")
 	cleanupIPPools(c)
 	waitForProductTeardown(c)
 }

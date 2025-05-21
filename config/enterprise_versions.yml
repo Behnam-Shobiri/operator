@@ -46,12 +46,12 @@ components:
     image: tigera/dex
     version: master
   eck-kibana:
-    version: 8.16.1
+    version: 8.17.1
   kibana:
     image: tigera/kibana
     version: master
   eck-elasticsearch:
-    version: 8.16.1
+    version: 8.17.1
   elasticsearch:
     image: tigera/elasticsearch
     version: master
@@ -64,7 +64,10 @@ components:
   intrusion-detection-controller:
     image: tigera/intrusion-detection-controller
     version: master
-  security-event-webhooks-processor:
+  waf-http-filter:
+    image: tigera/waf-http-filter
+    version: master
+  webhooks-processor:
     image: tigera/webhooks-processor
     version: master
   compliance-controller:
@@ -110,7 +113,7 @@ components:
   # coreos-prometheus holds the version of alertmanager built for tigera/alertmanager,
   # which prometheus operator uses to validate.
   coreos-alertmanager:
-    version: v0.27.0
+    version: v0.28.0
   alertmanager:
     image: tigera/alertmanager
     version: master
@@ -135,7 +138,7 @@ components:
     image: tigera/eck-operator
     version: master
   eck-elasticsearch-operator:
-    version: 2.6.1
+    version: 2.16.0
   l7-collector:
     image: tigera/l7-collector
     version: master
@@ -155,14 +158,11 @@ components:
     image: tigera/key-cert-provisioner
     version: master
   gateway-api-envoy-gateway:
-    image: envoyproxy/gateway
-    version: v1.1.2
-    registry: docker.io/
+    image: tigera/envoy-gateway
+    version: master
   gateway-api-envoy-proxy:
-    image: envoyproxy/envoy
-    version: distroless-v1.31.0
-    registry: docker.io/
+    image: tigera/envoy-proxy
+    version: master
   gateway-api-envoy-ratelimit:
-    image: envoyproxy/ratelimit
-    version: "26f28d78"
-    registry: docker.io/
+    image: tigera/envoy-ratelimit
+    version: master

@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -167,7 +167,7 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 		// voltron container
 		Expect(voltron.Env).To(ContainElements([]corev1.EnvVar{
 			{Name: "VOLTRON_ENABLE_COMPLIANCE", Value: "true"},
-			{Name: "VOLTRON_ENABLE_NONCLUSTER_HOST_LOG_INGESTION", Value: "true"},
+			{Name: "VOLTRON_ENABLE_NONCLUSTER_HOST", Value: "true"},
 			{Name: "VOLTRON_QUERYSERVER_ENDPOINT", Value: "https://tigera-api.tigera-system.svc:8080"},
 			{Name: "VOLTRON_QUERYSERVER_BASE_PATH", Value: "/api/v1/namespaces/tigera-system/services/https:tigera-api:8080/proxy/"},
 			{Name: "VOLTRON_QUERYSERVER_CA_BUNDLE_PATH", Value: "/etc/pki/tls/certs/tigera-ca-bundle.crt"},
@@ -348,6 +348,14 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 				APIGroups: []string{"networking.k8s.io"},
 				Resources: []string{"networkpolicies"},
 				Verbs:     []string{"get", "list"},
+			},
+			{
+				APIGroups: []string{"policy.networking.k8s.io"},
+				Resources: []string{
+					"adminnetworkpolicies",
+					"baselineadminnetworkpolicies",
+				},
+				Verbs: []string{"list"},
 			},
 			{
 				APIGroups: []string{""},
@@ -618,6 +626,14 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 				APIGroups: []string{"networking.k8s.io"},
 				Resources: []string{"networkpolicies"},
 				Verbs:     []string{"get", "list"},
+			},
+			{
+				APIGroups: []string{"policy.networking.k8s.io"},
+				Resources: []string{
+					"adminnetworkpolicies",
+					"baselineadminnetworkpolicies",
+				},
+				Verbs: []string{"list"},
 			},
 			{
 				APIGroups: []string{""},
@@ -1073,6 +1089,39 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			}))
 		})
 
+		It("should render distinct RBAC for Calico OSS managed cluster tenants", func() {
+			resources := renderObjects(renderConfig{
+				oidc:                    false,
+				managementCluster:       nil,
+				installation:            installation,
+				compliance:              compliance,
+				complianceFeatureActive: true,
+				ns:                      tenantBNamespace,
+				bindingNamespaces:       []string{tenantANamespace, tenantBNamespace},
+				ossBindingNamespaces:    []string{tenantBNamespace},
+				tenant: &operatorv1.Tenant{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tenantB",
+						Namespace: tenantBNamespace,
+					},
+					Spec: operatorv1.TenantSpec{
+						ID:                    "tenant-b",
+						ManagedClusterVariant: &operatorv1.Calico,
+					},
+				},
+			})
+
+			// It should only bind to the ossBindingNamespaces.
+			crb := rtest.GetResource(resources, render.ManagerManagedCalicoClusterRoleBinding, "", "rbac.authorization.k8s.io", "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
+			Expect(crb.Subjects).To(Equal([]rbacv1.Subject{
+				{
+					Kind:      "ServiceAccount",
+					Name:      render.ManagerServiceAccount,
+					Namespace: tenantBNamespace,
+				},
+			}))
+		})
+
 		It("should render cluster role/roles with additional RBAC", func() {
 			resources := renderObjects(renderConfig{
 				oidc:                    false,
@@ -1310,6 +1359,7 @@ type renderConfig struct {
 	openshift               bool
 	ns                      string
 	bindingNamespaces       []string
+	ossBindingNamespaces    []string
 	tenant                  *operatorv1.Tenant
 	manager                 *operatorv1.Manager
 	externalElastic         bool
@@ -1375,6 +1425,7 @@ func renderObjects(roc renderConfig) []client.Object {
 		OpenShift:               roc.openshift,
 		Namespace:               roc.ns,
 		BindingNamespaces:       roc.bindingNamespaces,
+		OSSTenantNamespaces:     roc.ossBindingNamespaces,
 		TruthNamespace:          common.OperatorNamespace(),
 		Tenant:                  roc.tenant,
 		Manager:                 roc.manager,

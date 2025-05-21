@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 package crds
 
 import (
+	"bytes"
 	"context"
 	"embed"
 	"fmt"
@@ -40,7 +41,6 @@ var (
 	//go:embed operator/*
 	operatorCRDFiles embed.FS
 
-	yamlDelimRe       *regexp.Regexp
 	calicoOprtrCRDsRe *regexp.Regexp
 
 	// We cache these CRDs because to generate the calico and enterprise takes
@@ -51,9 +51,7 @@ var (
 )
 
 func init() {
-	yamlDelimRe = regexp.MustCompile(`\n---`)
-
-	calicoCRDNames := []string{"installation", "apiserver", "imageset", "tigerastatus"}
+	calicoCRDNames := []string{"installation", "apiserver", "gatewayapi", "imageset", "tigerastatus", "whisker", "goldmane", "managementclusterconnection"}
 	calicoOprtrCRDsRe = regexp.MustCompile(fmt.Sprintf("(%s)", strings.Join(calicoCRDNames, "|")))
 }
 
@@ -70,11 +68,10 @@ func getCalicoCRDSource() map[string][]byte {
 			panic(fmt.Sprintf("Failed to read Calico CRD %s: %v", entry.Name(), err))
 		}
 
-		if len(yamlDelimRe.FindAllString(string(b), -1)) > 1 {
-			panic(fmt.Sprintf("Too many yaml delimiters in Calico CRD %s", entry.Name()))
+		crds := bytes.Split(b, []byte("\n---"))
+		for i, crd := range crds {
+			ret[fmt.Sprintf("%s_%d", entry.Name(), i)] = crd
 		}
-
-		ret[entry.Name()] = yamlDelimRe.ReplaceAll(b, []byte("\n"))
 	}
 
 	return ret
@@ -93,11 +90,10 @@ func getEnterpriseCRDSource() map[string][]byte {
 			panic(fmt.Sprintf("Failed to read Enterprise CRD %s: %v", entry.Name(), err))
 		}
 
-		if len(yamlDelimRe.FindAllString(string(b), -1)) > 1 {
-			panic(fmt.Sprintf("Too many yaml delimiters in Enterprise CRD %s", entry.Name()))
+		crds := bytes.Split(b, []byte("\n---"))
+		for i, crd := range crds {
+			ret[fmt.Sprintf("%s_%d", entry.Name(), i)] = crd
 		}
-
-		ret[entry.Name()] = yamlDelimRe.ReplaceAll(b, []byte("\n"))
 	}
 
 	return ret
@@ -122,11 +118,10 @@ func getOperatorCRDSource(variant opv1.ProductVariant) map[string][]byte {
 			panic(fmt.Sprintf("Failed to read Operator CRD %s: %v", entry.Name(), err))
 		}
 
-		if len(yamlDelimRe.FindAllString(string(b), -1)) > 1 {
-			panic(fmt.Sprintf("Too many yaml delimiters in Operator CRD %s", entry.Name()))
+		crds := bytes.Split(b, []byte("\n---"))
+		for i, crd := range crds {
+			ret[fmt.Sprintf("%s_%d", entry.Name(), i)] = crd
 		}
-
-		ret[entry.Name()] = yamlDelimRe.ReplaceAll(b, []byte("\n"))
 	}
 
 	return ret
@@ -170,6 +165,10 @@ func GetCRDs(variant opv1.ProductVariant) []*apiextenv1.CustomResourceDefinition
 	// our original copy of the definitions are not tainted with a ResourceVersion
 	copy := []*apiextenv1.CustomResourceDefinition{}
 	for _, crd := range crds {
+		// Skip the Tenant CRD - this is only used in Calico Cloud.
+		if crd.Name == "tenants.operator.tigera.io" {
+			continue
+		}
 		copy = append(copy, crd.DeepCopy())
 	}
 
@@ -193,10 +192,6 @@ func ToRuntimeObjects(crds ...*apiextenv1.CustomResourceDefinition) []client.Obj
 func Ensure(c client.Client, variant string) error {
 	// Ensure Calico CRDs exist, which will allow us to bootstrap.
 	for _, crd := range GetCRDs(opv1.ProductVariant(variant)) {
-		// Skip the Tenant CRD - this is only used in Calico Cloud.
-		if crd.Name == "tenants.operator.tigera.io" {
-			continue
-		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if err := c.Create(ctx, crd); err != nil {

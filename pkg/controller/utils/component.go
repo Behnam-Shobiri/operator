@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -50,6 +51,12 @@ type ComponentHandler interface {
 
 	// Set this component handler to "create only" operation - i.e. it only creates resources if
 	// they do not already exist, and never tries to correct existing resources.
+	//
+	// When a component handler is "create only", and some of the objects that it is asked to
+	// create already exist, but no other error occurs, the CreateOrUpdateOrDelete() method will
+	// return an error that satisfies `errors.IsAlreadyExists`.  If a more serious error occurs,
+	// the method will return that more serious error instead.  If none of the objects already
+	// exist, and no other errors occur, the method will return nil.
 	SetCreateOnly()
 }
 
@@ -125,12 +132,32 @@ func (c *componentHandler) createOrUpdateObject(ctx context.Context, obj client.
 		logCtx.V(2).Info("Failed converting object", "obj", obj)
 		return fmt.Errorf("failed converting object %+v", obj)
 	}
-	// Check to see if the object exists or not.
+
+	// Check to see if the object exists or not - this determines whether we should create or update.
 	err := c.client.Get(ctx, key, cur)
 	if err != nil {
 		if !errors.IsNotFound(err) {
 			// Anything other than "Not found" we should retry.
 			return err
+		}
+
+		// Check to see if the object's Namespace exists, and whether the Namespace
+		// is currently terminating. We cannot create objects in a terminating Namespace.
+		namespaceTerminating := false
+		if ns := cur.GetNamespace(); ns != "" {
+			nsKey := client.ObjectKey{Name: ns}
+			namespace, err := GetIfExists[v1.Namespace](ctx, nsKey, c.client)
+			if err != nil {
+				logCtx.WithValues("key", nsKey).Error(err, "Failed to get Namespace.")
+				return err
+			}
+			if namespace != nil {
+				namespaceTerminating = namespace.GetDeletionTimestamp() != nil
+			}
+		}
+		if namespaceTerminating {
+			logCtx.Info("Object's Namespace is terminating, skipping creation.")
+			return nil
 		}
 
 		// Otherwise, if it was not found, we should create it and move on.
@@ -151,7 +178,13 @@ func (c *componentHandler) createOrUpdateObject(ctx context.Context, obj client.
 	if c.createOnly {
 		// This component handler only creates resources if they do not already exist.
 		logCtx.Info("Create-only operation, ignoring existing object")
-		return nil
+		return errors.NewAlreadyExists(
+			schema.GroupResource{
+				Group:    obj.GetObjectKind().GroupVersionKind().Group,
+				Resource: obj.GetObjectKind().GroupVersionKind().Kind,
+			},
+			obj.GetName(),
+		)
 	}
 
 	// The object exists. Update it, unless the user has marked it as "ignored".
@@ -290,22 +323,30 @@ func (c *componentHandler) CreateOrUpdateOrDelete(ctx context.Context, component
 	objsToCreate, objsToDelete := component.Objects()
 	osType := component.SupportedOSType()
 
+	var alreadyExistsErr error = nil
+
 	for _, obj := range objsToCreate {
 		key := client.ObjectKeyFromObject(obj)
 
 		// Pass in a DeepCopy so any modifications made by createOrUpdateObject won't be included
 		// if we need to retry the function
+		alreadyRetriedConflict := false
+	conflictRetry:
 		err := c.createOrUpdateObject(ctx, obj.DeepCopyObject().(client.Object), osType)
-		if err != nil && errors.IsConflict(err) {
-			// If the error is a resource Conflict, try the update again
-			cmpLog.WithValues("key", key, "conflict_message", err).Info("Failed to update object, retrying.")
-			err = c.createOrUpdateObject(ctx, obj, osType)
-			if err != nil {
+		if err != nil {
+			if errors.IsAlreadyExists(err) {
+				// Remember that we've had an "already exists" error, but otherwise
+				// carry on.
+				alreadyExistsErr = err
+			} else if errors.IsConflict(err) && !alreadyRetriedConflict {
+				// If the error is a resource Conflict, try the update again.
+				cmpLog.WithValues("key", key, "conflict_message", err).Info("Failed to update object, retrying.")
+				alreadyRetriedConflict = true
+				goto conflictRetry
+			} else {
+				cmpLog.Error(err, "Failed to create or update object", "key", key)
 				return err
 			}
-		} else if err != nil {
-			cmpLog.Error(err, "Failed to create or update object", "key", key)
-			return err
 		}
 
 		// Keep track of some objects so we can report on their status.
@@ -367,7 +408,10 @@ func (c *componentHandler) CreateOrUpdateOrDelete(ctx context.Context, component
 	if status != nil {
 		status.ReadyToMonitor()
 	}
-	return nil
+
+	// alreadyExistsErr is only non-nil if this component handler is in "create only" mode and
+	// one (or more) of objsToCreate already existed.
+	return alreadyExistsErr
 }
 
 // skipAddingOwnerReference returns true if owner is a namespaced resource and
@@ -446,8 +490,18 @@ func mergeState(desired client.Object, current runtime.Object) client.Object {
 		cj := current.(*batchv1.Job)
 		dj := desired.(*batchv1.Job)
 
-		// We're only comparing jobs based off of annotations for now so we can send a signal to recreate a job. Later
-		// we might want to have some better comparison of jobs so that a changed in the container spec would trigger
+		if len(cj.Spec.Template.Spec.Containers) != len(dj.Spec.Template.Spec.Containers) {
+			return dj
+		}
+
+		for i := range cj.Spec.Template.Spec.Containers {
+			if cj.Spec.Template.Spec.Containers[i].Image != dj.Spec.Template.Spec.Containers[i].Image {
+				return dj
+			}
+		}
+
+		// We're only comparing jobs based off of annotations and containers images for now so we can send a signal to recreate a job.
+		// Later we might want to have some better comparison of jobs so that a changed in the container spec would trigger
 		// a recreation of the job
 		if reflect.DeepEqual(cj.Spec.Template.Annotations, dj.Spec.Template.Annotations) {
 			return nil

@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -32,7 +32,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
 	"github.com/tigera/operator/pkg/common"
@@ -78,7 +77,7 @@ type NamespaceMigration interface {
 type CoreNamespaceMigration struct {
 	client            kubernetes.Interface
 	informer          cache.Controller
-	indexer           cache.Indexer
+	indexer           cache.Store
 	stopCh            chan struct{}
 	migrationComplete bool
 }
@@ -120,13 +119,8 @@ func (m *CoreNamespaceMigration) NeedsCoreNamespaceMigration(ctx context.Context
 }
 
 // NewCoreNamespaceMigration initializes a CoreNamespaceMigration and returns a handle to it.
-func NewCoreNamespaceMigration(cfg *rest.Config) (NamespaceMigration, error) {
-	migration := &CoreNamespaceMigration{migrationComplete: false}
-	var err error
-	migration.client, err = kubernetes.NewForConfig(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("unable to get kubernetes client: %s", err)
-	}
+func NewCoreNamespaceMigration(clientset *kubernetes.Clientset) (NamespaceMigration, error) {
+	migration := &CoreNamespaceMigration{migrationComplete: false, client: clientset}
 
 	// Create a Node watcher.
 	listWatcher := cache.NewListWatchFromClient(migration.client.CoreV1().RESTClient(), "nodes", "", fields.Everything())
@@ -137,7 +131,13 @@ func NewCoreNamespaceMigration(cfg *rest.Config) (NamespaceMigration, error) {
 	}
 
 	// Informer handles managing the watch and signals us when nodes are added.
-	migration.indexer, migration.informer = cache.NewIndexerInformer(listWatcher, &v1.Node{}, 0, handlers, cache.Indexers{})
+	migration.indexer, migration.informer = cache.NewInformerWithOptions(cache.InformerOptions{
+		ListerWatcher: listWatcher,
+		ObjectType:    &v1.Node{},
+		ResyncPeriod:  0,
+		Handler:       handlers,
+		Indexers:      cache.Indexers{},
+	})
 
 	migration.stopCh = make(chan struct{})
 

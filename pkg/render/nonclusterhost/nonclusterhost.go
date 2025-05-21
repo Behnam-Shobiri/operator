@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2024-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -123,7 +123,7 @@ func (c *nonClusterHostComponent) clusterRole() *rbacv1.ClusterRole {
 			// For enforcing admin network policies.
 			APIGroups: []string{"policy.networking.k8s.io"},
 			Resources: []string{"adminnetworkpolicies", "baselineadminnetworkpolicies"},
-			Verbs:     []string{"watch", "list"},
+			Verbs:     []string{"get", "watch", "list"},
 		},
 		{
 			// Metadata from these are used in conjunction with network policy.
@@ -136,6 +136,12 @@ func (c *nonClusterHostComponent) clusterRole() *rbacv1.ClusterRole {
 			APIGroups: []string{""},
 			Resources: []string{"nodes"},
 			Verbs:     []string{"get", "list", "watch"},
+		},
+		{
+			// For non-cluster host to get tigera-ca-bundle config map.
+			APIGroups: []string{""},
+			Resources: []string{"configmaps"},
+			Verbs:     []string{"get"},
 		},
 		{
 			// For monitoring Calico-specific configuration.
@@ -185,6 +191,30 @@ func (c *nonClusterHostComponent) clusterRole() *rbacv1.ClusterRole {
 			APIGroups: []string{"linseed.tigera.io"},
 			Resources: []string{"flowlogs"},
 			Verbs:     []string{"create"},
+		},
+	}...)
+
+	// For non-cluster host to request a operator signed certificate.
+	rules = append(rules, []rbacv1.PolicyRule{
+		{
+			APIGroups: []string{"certificates.k8s.io"},
+			Resources: []string{"certificatesigningrequests"},
+			Verbs:     []string{"create", "list", "watch"},
+		},
+		{
+			APIGroups:     []string{"certificates.tigera.io"},
+			Resources:     []string{"certificatesigningrequests/common-name"},
+			Verbs:         []string{"create"},
+			ResourceNames: []string{render.TyphaCommonName + render.TyphaNonClusterHostSuffix},
+		},
+	}...)
+
+	// For non-cluster host init process to update labels.
+	rules = append(rules, []rbacv1.PolicyRule{
+		{
+			APIGroups: []string{"projectcalico.org"},
+			Resources: []string{"hostendpoints"},
+			Verbs:     []string{"list", "update"},
 		},
 	}...)
 

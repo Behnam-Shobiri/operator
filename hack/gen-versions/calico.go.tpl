@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -147,6 +147,55 @@ var (
 		Registry: "{{ .Registry }}",
 	}
 {{- end }}
+{{ with index .Components "calico/goldmane"}}
+	ComponentCalicoGoldmane = Component{
+		Version:  "{{ .Version }}",
+		Image:    "{{ .Image }}",
+		Registry: "{{ .Registry }}",
+	}
+{{- end }}
+{{ with index .Components "calico/whisker"}}
+	ComponentCalicoWhisker = Component{
+		Version:  "{{ .Version }}",
+		Image:    "{{ .Image }}",
+		Registry: "{{ .Registry }}",
+	}
+{{- end }}
+{{ with index .Components "calico/whisker-backend"}}
+	ComponentCalicoWhiskerBackend = Component{
+		Version:  "{{ .Version }}",
+		Image:    "{{ .Image }}",
+		Registry: "{{ .Registry }}",
+	}
+{{- end }}
+{{ with index .Components "calico/envoy-gateway"}}
+	ComponentCalicoEnvoyGateway = Component{
+		Version:  "{{ .Version }}",
+		Image:    "{{ .Image }}",
+		Registry: "{{ .Registry }}",
+	}
+{{- end }}
+{{ with index .Components "calico/envoy-proxy"}}
+	ComponentCalicoEnvoyProxy = Component{
+		Version:  "{{ .Version }}",
+		Image:    "{{ .Image }}",
+		Registry: "{{ .Registry }}",
+	}
+{{- end }}
+{{ with index .Components "calico/envoy-ratelimit"}}
+	ComponentCalicoEnvoyRatelimit = Component{
+		Version:  "{{ .Version }}",
+		Image:    "{{ .Image }}",
+		Registry: "{{ .Registry }}",
+	}
+{{- end }}
+{{ with index .Components "calico/guardian" }}
+	ComponentCalicoGuardian = Component{
+		Version:  "{{ .Version }}",
+		Image:    "{{ .Image }}",
+		Registry: "{{ .Registry }}",
+	}
+{{- end }}
 	ComponentOperatorInit = Component{
 		Version: version.VERSION,
 		Image:   "tigera/operator",
@@ -171,5 +220,12 @@ var (
 		ComponentCalicoCSIFIPS,
 		ComponentCalicoCSIRegistrar,
 		ComponentCalicoCSIRegistrarFIPS,
+		ComponentCalicoGoldmane,
+		ComponentCalicoWhisker,
+		ComponentCalicoWhiskerBackend,
+		ComponentCalicoEnvoyGateway,
+		ComponentCalicoEnvoyProxy,
+		ComponentCalicoEnvoyRatelimit,
+		ComponentCalicoGuardian,
 	}
 )

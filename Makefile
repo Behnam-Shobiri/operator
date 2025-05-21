@@ -22,6 +22,32 @@ GIT       = echo [DRY RUN] $(GIT_CMD)
 CURL      = echo [DRY RUN] $(CURL_CMD)
 endif
 
+# These values are used for fetching tools to run as part of the build process
+# and shouldn't vary based on the target we're building for
+NATIVE_ARCH := $(shell bash -c 'if [[ "$(shell uname -m)" == "x86_64" ]]; then echo amd64; else uname -m; fi')
+NATIVE_OS := $(shell uname -s | tr A-Z a-z)
+
+# The version of kustomize we use for generating bundles
+KUSTOMIZE_VERSION = v5.6.0
+KUSTOMIZE_DOWNLOAD_URL = https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F$(KUSTOMIZE_VERSION)/kustomize_$(KUSTOMIZE_VERSION)_$(NATIVE_OS)_$(NATIVE_ARCH).tar.gz
+
+# Our version of operator-sdk
+OPERATOR_SDK_VERSION = v1.39.2
+OPERATOR_SDK_URL = https://github.com/operator-framework/operator-sdk/releases/download/$(OPERATOR_SDK_VERSION)/operator-sdk_$(NATIVE_OS)_$(NATIVE_ARCH)
+
+# Our version of helm3 - Note that we use BUILD_ARCH here instead of NATIVE_ARCH because
+# that's what we used before and we don't want to break things if that's necessary.
+HELM3_VERSION = v3.11.3
+HELM3_URL = https://get.helm.sh/helm-$(HELM3_VERSION)-$(NATIVE_OS)-$(BUILDARCH).tar.gz
+HELM_BUILDARCH_BINARY = $(HACK_BIN)/helm-$(BUILDARCH)
+HELM_BUILDARCH_VERSIONED_BINARY = $(HELM_BUILDARCH_BINARY)-$(HELM3_VERSION)
+
+
+# The directory into which we download binaries we need to run certain
+# processes, e.g. generating bundles
+HACK_BIN ?= hack/bin
+$(HACK_BIN):
+	mkdir -p $(HACK_BIN)
 
 # Shortcut targets
 default: build
@@ -91,7 +117,7 @@ endif
 REPO?=tigera/operator
 PACKAGE_NAME?=github.com/tigera/operator
 LOCAL_USER_ID?=$(shell id -u $$USER)
-GO_BUILD_VER?=v0.95
+GO_BUILD_VER?=1.24.2-llvm18.1.8-k8s1.32.3
 CALICO_BUILD?=calico/go-build:$(GO_BUILD_VER)-$(BUILDARCH)
 SRC_FILES=$(shell find ./pkg -name '*.go')
 SRC_FILES+=$(shell find ./api -name '*.go')
@@ -220,30 +246,36 @@ else
   GIT_VERSION?=$(shell git describe --tags --dirty --always --abbrev=12)
 endif
 
+# To update the Envoy Gateway version, see "Updating the bundled version of
+# Envoy Gateway" in docs/common_tasks.md.
 ENVOY_GATEWAY_HELM_CHART ?= oci://docker.io/envoyproxy/gateway-helm
-ENVOY_GATEWAY_VERSION ?= v1.1.2
+ENVOY_GATEWAY_VERSION ?= v1.3.2
 ENVOY_GATEWAY_PREFIX ?= tigera-gateway-api
 ENVOY_GATEWAY_NAMESPACE ?= tigera-gateway
 ENVOY_GATEWAY_RESOURCES = pkg/render/gateway_api_resources.yaml
 
-$(ENVOY_GATEWAY_RESOURCES): hack/bin/helm-$(BUILDARCH)
+$(ENVOY_GATEWAY_RESOURCES): $(HACK_BIN)/helm-$(BUILDARCH)
 	echo "---" > $@
 	echo "apiVersion: v1" >> $@
 	echo "kind: Namespace" >> $@
 	echo "metadata:" >> $@
 	echo "  name: $(ENVOY_GATEWAY_NAMESPACE)" >> $@
-	hack/bin/helm-$(BUILDARCH) template $(ENVOY_GATEWAY_PREFIX) $(ENVOY_GATEWAY_HELM_CHART) \
+	$(HELM_BUILDARCH_BINARY) template $(ENVOY_GATEWAY_PREFIX) $(ENVOY_GATEWAY_HELM_CHART) \
 		--version $(ENVOY_GATEWAY_VERSION) \
 		-n $(ENVOY_GATEWAY_NAMESPACE) \
 		--include-crds \
 	>> $@
 
-hack/bin/helm-$(BUILDARCH):
-	mkdir -p hack/bin
-	curl -sSf -L --retry 5 -o hack/bin/helm3.tar.gz https://get.helm.sh/helm-v3.11.3-linux-$(BUILDARCH).tar.gz
-	tar -zxvf hack/bin/helm3.tar.gz -C hack/bin linux-$(BUILDARCH)/helm
-	mv hack/bin/linux-$(BUILDARCH)/helm hack/bin/helm-$(BUILDARCH)
-	rmdir hack/bin/linux-$(BUILDARCH)
+$(HELM_BUILDARCH_BINARY): $(HACK_BIN) $(HELM_BUILDARCH_VERSIONED_BINARY)
+	$(info ░▒▓ symlink $(HELM_BUILDARCH_VERSIONED_BINARY) -> $(HELM_BUILDARCH_BINARY))
+	@ln -sf helm-$(BUILDARCH)-$(HELM3_VERSION) $(HACK_BIN)/helm-$(BUILDARCH)
+
+$(HELM_BUILDARCH_VERSIONED_BINARY): $(HACK_BIN)
+	$(info ░▒▓ Downloading helm3 $(HELM3_VERSION) for $(BUILDARCH) to $(HELM_BUILDARCH_VERSIONED_BINARY))
+	@rm -f $(HELM_BUILDARCH_VERSIONED_BINARY)
+	@curl -fsSL --retry 5 $(HELM3_URL) | tar --extract --gzip -C $(HACK_BIN) --strip-components=1 $(NATIVE_OS)-$(BUILDARCH)/helm -O > $(HELM_BUILDARCH_VERSIONED_BINARY)
+	@chmod a+x $(HELM_BUILDARCH_VERSIONED_BINARY)
+
 
 build: $(BINDIR)/operator-$(ARCH)
 $(BINDIR)/operator-$(ARCH): $(SRC_FILES) $(ENVOY_GATEWAY_RESOURCES)
@@ -351,6 +383,9 @@ KUBECONTROLLERS_IMAGE := calico/kube-controllers
 TYPHA_IMAGE := calico/typha
 CSI_IMAGE := calico/csi
 NODE_DRIVER_REGISTRAR_IMAGE := calico/node-driver-registrar
+GOLDMANE_IMAGE := calico/goldmane
+WHISKER_IMAGE := calico/whisker
+WHISKER_BACKEND_IMAGE := calico/whisker-backend
 
 .PHONY: calico-node.tar
 calico-node.tar:
@@ -392,6 +427,21 @@ calico-node-driver-registrar.tar:
 	docker pull $(FV_IMAGE_REGISTRY)/$(NODE_DRIVER_REGISTRAR_IMAGE):$(VERSION_TAG)
 	docker save --output $@ $(NODE_DRIVER_REGISTRAR_IMAGE):$(VERSION_TAG)
 
+.PHONY: calico-goldmane.tar
+calico-goldmane.tar:
+	docker pull $(FV_IMAGE_REGISTRY)/$(GOLDMANE_IMAGE):$(VERSION_TAG)
+	docker save --output $@ $(GOLDMANE_IMAGE):$(VERSION_TAG)
+
+.PHONY: calico-goldmane.tar
+calico-whisker.tar:
+	docker pull $(FV_IMAGE_REGISTRY)/$(WHISKER_IMAGE):$(VERSION_TAG)
+	docker save --output $@ $(WHISKER_IMAGE):$(VERSION_TAG)
+
+.PHONY: calico-goldmane.tar
+calico-whisker-backend.tar:
+	docker pull $(FV_IMAGE_REGISTRY)/$(WHISKER_BACKEND_IMAGE):$(VERSION_TAG)
+	docker save --output $@ $(WHISKER_BACKEND_IMAGE):$(VERSION_TAG)
+
 IMAGE_TARS := calico-node.tar \
 	calico-apiserver.tar \
 	calico-cni.tar \
@@ -399,7 +449,10 @@ IMAGE_TARS := calico-node.tar \
 	calico-kube-controllers.tar \
 	calico-typha.tar \
 	calico-csi.tar \
-	calico-node-driver-registrar.tar
+	calico-node-driver-registrar.tar \
+	calico-goldmane.tar \
+	calico-whisker.tar \
+	calico-whisker-backend.tar
 
 load-container-images: ./test/load_images_on_kind_cluster.sh $(IMAGE_TARS)
 	# Load the latest tar files onto the currently running kind cluster.
@@ -501,11 +554,23 @@ endif
 ###############################################################################
 # Release
 ###############################################################################
-## Determines if we are on a tag and if so builds a release.
-maybe-build-release:
-	./hack/maybe-build-release.sh
+VERSION_REGEX := ^v[0-9]+\.[0-9]+\.[0-9]+$$
+release-tag: var-require-all-RELEASE_TAG-GITHUB_TOKEN
+	$(eval VALID_TAG := $(shell echo $(RELEASE_TAG) | grep -Eq "$(VERSION_REGEX)" && echo true))
+	$(if $(VALID_TAG),,$(error $(RELEASE_TAG) is not a valid version. Please use a version in the format vX.Y.Z))
 
-release-notes: var-require-all-VERSION-GITHUB_TOKEN clean
+# Skip releasing if the image already exists.
+	@if !$(MAKE) VERSION=$(RELEASE_TAG) release-check-image-exists; then \
+		echo "Images for $(RELEASE_TAG) already exists"; \
+		exit 0; \
+	fi
+
+	$(MAKE) release VERSION=$(RELEASE_TAG)
+	$(MAKE) release-publish-images VERSION=$(RELEASE_TAG)
+	$(MAKE) release-github VERSION=$(RELEASE_TAG)
+
+
+release-notes: var-require-all-VERSION-GITHUB_TOKEN
 	@docker build -t tigera/release-notes -f build/Dockerfile.release-notes .
 	@docker run --rm -v $(CURDIR):/workdir -e	GITHUB_TOKEN=$(GITHUB_TOKEN) -e VERSION=$(VERSION) tigera/release-notes
 
@@ -552,26 +617,10 @@ release-publish-images: release-prereqs release-check-image-exists
 	# Push images.
 	$(MAKE) push-all push-manifests push-non-manifests RELEASE=true IMAGETAG=$(VERSION)
 
-## Pushes a github release and release artifacts produced by `make release-build`.
-release-publish: release-prereqs
-	# Push the git tag.
-	git push origin $(VERSION)
-
-	$(MAKE) release-publish-images IMAGETAG=$(VERSION)
-	$(MAKE) release-github
-
-	@echo "Finalize the GitHub release based on the pushed tag."
-	@echo ""
-	@echo "  https://$(PACKAGE_NAME)/releases/tag/$(VERSION)"
-	@echo ""
-	@echo "If this is the latest stable release, then run the following to push 'latest' images."
-	@echo ""
-	@echo "  make VERSION=$(VERSION) release-publish-latest"
-	@echo ""
-
-release-github: hack/bin/gh release-notes
+release-github: release-notes hack/bin/gh
 	@echo "Creating github release for $(VERSION)"
 	hack/bin/gh release create $(VERSION) --title $(VERSION) --draft --notes-file $(VERSION)-release-notes.md
+	@echo "$(VERSION) GitHub release created in draft state. Please review and publish: https://github.com/tigera/operator/releases/tag/$(VERSION) ."
 
 GITHUB_CLI_VERSION?=2.62.0
 hack/bin/gh:
@@ -580,6 +629,15 @@ hack/bin/gh:
 	tar -zxvf hack/bin/gh.tgz -C hack/bin/ gh_$(GITHUB_CLI_VERSION)_linux_amd64/bin/gh --strip-components=2
 	chmod +x $@
 	rm hack/bin/gh.tgz
+
+hack/bin/release-from: $(shell find ./hack/release-from -type f)
+	mkdir -p hack/bin
+	$(CONTAINERIZED) $(CALICO_BUILD) \
+	sh -c '$(GIT_CONFIG_SSH) \
+	go build -buildvcs=false -o hack/bin/release-from ./hack/release-from'
+
+release-from: hack/bin/release-from var-require-all-VERSION-OPERATOR_BASE_VERSION var-require-one-of-EE_IMAGES_VERSIONS-OS_IMAGES_VERSIONS
+	hack/bin/release-from
 
 # release-prereqs checks that the environment is configured properly to create a release.
 release-prereqs:
@@ -639,18 +697,21 @@ release-prep/set-pr-labels:
 ###############################################################################
 # Utilities
 ###############################################################################
-OPERATOR_SDK_VERSION=v1.0.1
+.PHONY: operator-sdk
 OPERATOR_SDK_BARE=hack/bin/operator-sdk
 OPERATOR_SDK=$(OPERATOR_SDK_BARE)-$(OPERATOR_SDK_VERSION)
-$(OPERATOR_SDK):
-	mkdir -p hack/bin
-	curl --fail -L -o $@ \
-		https://github.com/operator-framework/operator-sdk/releases/download/${OPERATOR_SDK_VERSION}/operator-sdk-${OPERATOR_SDK_VERSION}-x86_64-linux-gnu
-	chmod +x $@
 
-.PHONY: $(OPERATOR_SDK_BARE)
+operator-sdk: $(OPERATOR_SDK_BARE)
+
+$(OPERATOR_SDK):
+	$(info ░▒▓ Downloading operator-sdk to $(OPERATOR_SDK))
+	@mkdir -p hack/bin
+	@curl -fsSL -o $@ $(OPERATOR_SDK_URL)
+	@chmod +x $@
+
 $(OPERATOR_SDK_BARE): $(OPERATOR_SDK)
-	ln -f -s operator-sdk-$(OPERATOR_SDK_VERSION) $(OPERATOR_SDK_BARE)
+	$(info ░▒▓ Linking $(OPERATOR_SDK) to $(OPERATOR_SDK_BARE))
+	@ln -f -s operator-sdk-$(OPERATOR_SDK_VERSION) $(OPERATOR_SDK_BARE)
 
 ## Generating code after API changes.
 gen-files: manifests generate
@@ -698,6 +759,11 @@ define copy_crds
 		$(eval product := $(2))
 	@cp $(dir)/libcalico-go/config/crd/* pkg/crds/$(product)/ && echo "Copied $(product) CRDs"
 endef
+define copy_eck_crds
+    $(eval dir := $(1))
+		$(eval product := $(2))
+	@cp $(dir)/charts/tigera-operator/crds/eck/* pkg/crds/$(product)/ && echo "Copied $(product) ECK CRDs"
+endef
 
 .PHONY: read-libcalico-version read-libcalico-enterprise-version
 .PHONY: update-calico-crds update-enterprise-crds
@@ -710,7 +776,7 @@ DEFAULT_OS_CRDS_DIR?=.crds/calico
 read-libcalico-calico-version:
 	$(eval CALICO_BRANCH := $(shell $(CONTAINERIZED) $(CALICO_BUILD) \
 	bash -c '$(GIT_CONFIG_SSH) \
-	yq r config/calico_versions.yml components.libcalico-go.version'))
+	yq -e ".components.libcalico-go.version" config/calico_versions.yml'))
 	if [ -z "$(CALICO_BRANCH)" ]; then echo "libcalico branch not defined"; exit 1; fi
 
 update-calico-crds: fetch-calico-crds
@@ -728,11 +794,12 @@ DEFAULT_EE_CRDS_DIR=.crds/enterprise
 read-libcalico-enterprise-version:
 	$(eval CALICO_ENTERPRISE_BRANCH := $(shell $(CONTAINERIZED) $(CALICO_BUILD) \
 	bash -c '$(GIT_CONFIG_SSH) \
-	yq r config/enterprise_versions.yml components.libcalico-go.version'))
+	yq -e ".components.libcalico-go.version" config/enterprise_versions.yml'))
 	if [ -z "$(CALICO_ENTERPRISE_BRANCH)" ]; then echo "libcalico enterprise branch not defined"; exit 1; fi
 
 update-enterprise-crds: fetch-enterprise-crds
 	$(call copy_crds,$(ENTERPRISE_CRDS_DIR),"enterprise")
+	$(call copy_eck_crds,$(ENTERPRISE_CRDS_DIR),"enterprise")
 
 prepare-for-enterprise-crds:
 	$(call prep_local_crds,"enterprise")
@@ -766,6 +833,7 @@ prepull-image:
 get-digest: prepull-image
 	@echo Getting operator image digest...
 	$(eval OPERATOR_IMAGE_INSPECT=$(shell sh -c "docker image inspect $(IMAGE_REGISTRY)/$(BUILD_IMAGE):v$(VERSION) | base64 -w 0"))
+	$(eval OPERATOR_MANIFEST_INSPECT=$(shell sh -c "docker manifest inspect $(IMAGE_REGISTRY)/$(BUILD_IMAGE):v$(VERSION) | base64 -w 0"))
 
 .PHONY: help
 ## Display this help text
@@ -810,6 +878,7 @@ deploy: manifests kustomize
 manifests:
 	$(DOCKER_RUN) sh -c 'controller-gen crd paths="./api/..." output:crd:artifacts:config=config/crd/bases'
 	for x in $$(find config/crd/bases/*); do sed -i -e '/creationTimestamp: null/d' -e '/^---/d' -e '/^\s*$$/d' $$x; done
+	@docker run --rm --user $(id -u):$(id -g) -v $(CURDIR)/pkg/crds/operator/:/work/crds/operator/ tmknom/prettier --write --parser=yaml /work
 
 # Run go fmt against code
 fmt:
@@ -822,6 +891,9 @@ vet:
 	$(CONTAINERIZED) $(CALICO_BUILD) \
 	sh -c '$(GIT_CONFIG_SSH) \
 	go vet ./...'
+
+mod-tidy:
+	$(DOCKER_RUN) sh -c 'go mod tidy'
 
 # Generate code
 # We use the upstream latest release of controller-gen as this is compatible with golang 1.19+ and we have no need
@@ -842,17 +914,13 @@ GO_GET_CONTAINER=docker run --rm \
 		$(EXTRA_DOCKER_ARGS) \
 		$(CALICO_BUILD)
 
-KUSTOMIZE=$(BINDIR)/kustomize
-# download kustomize if necessary
-$(BINDIR)/kustomize:
-	mkdir -p $(BINDIR)
-	$(GO_GET_CONTAINER) \
-		sh -c '$(GIT_CONFIG_SSH) \
-		set -e ;\
-		TMP_DIR=$$(mktemp -d) ;\
-		cd $$TMP_DIR ;\
-		go mod init tmp ;\
-		go get sigs.k8s.io/kustomize/kustomize/v3@v3.5.4 '
+.PHONY: kustomize
+KUSTOMIZE = $(HACK_BIN)/kustomize
+kustomize: $(KUSTOMIZE)
+$(KUSTOMIZE): $(HACK_BIN)
+	$(info ░▒▓ Downloading kustomize $(KUSTOMIZE_VERSION) to $(KUSTOMIZE))
+	@curl -fsSL $(KUSTOMIZE_DOWNLOAD_URL) | tar -C $(HACK_BIN) --extract --gzip kustomize
+	@chmod a+x $(KUSTOMIZE)
 
 
 # Options for 'bundle-build'
@@ -864,8 +932,9 @@ BUNDLE_DEFAULT_CHANNEL := --default-channel=$(DEFAULT_CHANNEL)
 endif
 BUNDLE_METADATA_OPTS ?= $(BUNDLE_CHANNELS) $(BUNDLE_DEFAULT_CHANNEL)
 
-BUNDLE_CRD_DIR ?= $(BUILD_DIR)/bundle/$(VERSION)/crds
-BUNDLE_DEPLOY_DIR ?= $(BUILD_DIR)/bundle/$(VERSION)/deploy
+BUNDLE_BASE_DIR ?= $(BUILD_DIR)/bundle/$(VERSION)
+BUNDLE_CRD_DIR ?= $(BUNDLE_BASE_DIR)/crds
+BUNDLE_DEPLOY_DIR ?= $(BUNDLE_BASE_DIR)/deploy
 
 ## Create an operator bundle image.
 # E.g., make bundle VERSION=1.13.1 PREV_VERSION=1.13.0 CHANNELS=release-v1.13 DEFAULT_CHANNEL=release-v1.13
@@ -877,7 +946,7 @@ bundle-crd-clean:
 	git checkout -- config/crd/bases
 
 .PHONY: bundle-validate
-bundle-validate:
+bundle-validate: $(OPERATOR_SDK_BARE)
 	$(OPERATOR_SDK_BARE) bundle validate bundle/$(VERSION)
 
 .PHONY: bundle-manifests
@@ -893,19 +962,19 @@ endif
 
 .PHONY: bundle-generate
 bundle-generate: manifests $(KUSTOMIZE) $(OPERATOR_SDK_BARE) bundle-manifests
-	$(KUSTOMIZE) build config/manifests \
-	| $(OPERATOR_SDK_BARE) generate bundle \
+	$(OPERATOR_SDK_BARE) generate bundle \
 		--crds-dir $(BUNDLE_CRD_DIR) \
 		--deploy-dir $(BUNDLE_DEPLOY_DIR) \
 		--version $(VERSION) \
 		--verbose \
 		--manifests \
+		--package tigera-operator \
 		--metadata $(BUNDLE_METADATA_OPTS)
 
 # Update a generated bundle so that it can be certified.
 .PHONY: update-bundle
 update-bundle: $(OPERATOR_SDK_BARE) get-digest
-	$(eval EXTRA_DOCKER_ARGS += -e OPERATOR_IMAGE_INSPECT="$(OPERATOR_IMAGE_INSPECT)" -e VERSION=$(VERSION) -e PREV_VERSION=$(PREV_VERSION))
+	$(eval EXTRA_DOCKER_ARGS += -e OPERATOR_IMAGE_INSPECT="$(OPERATOR_IMAGE_INSPECT)" -e OPERATOR_MANIFEST_INSPECT="$(OPERATOR_MANIFEST_INSPECT)" -e VERSION=$(VERSION) -e PREV_VERSION=$(PREV_VERSION))
 	$(CONTAINERIZED) $(CALICO_BUILD) hack/gen-bundle/update-bundle.sh
 
 # Build the bundle image.

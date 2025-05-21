@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@ import (
 
 	v1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
+	"k8s.io/client-go/kubernetes"
 )
 
 // AddOptions are passed to controllers when added to the controller manager. They
@@ -32,6 +33,15 @@ type AddOptions struct {
 	KubernetesVersion   *common.VersionInfo
 	ManageCRDs          bool
 	ShutdownContext     context.Context
+
+	// Nameservers contains the nameservers configured for the operator. Most pods do not need explicit
+	// nameservers specified, as they will use the default nameservers configured in the cluster. However, any pods
+	// that must function prior to cluster DNS being available (e.g., the operator itself and calico/node)
+	// may need to have the nameservers explicitly set if configured to access the Kubernetes API via a domain name.
+	Nameservers []string
+
+	// Kubernetes clientset used by controllers to create watchers and informers.
+	K8sClientset *kubernetes.Clientset
 
 	// Whether or not the operator is running in multi-tenant mode.
 	// When true, this means some CRDs are installed as namespace scoped

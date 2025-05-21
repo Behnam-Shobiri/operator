@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -92,6 +92,8 @@ var _ = Describe("ManagementClusterConnection controller tests", func() {
 		mockStatus.On("OnCRFound").Return()
 		mockStatus.On("ReadyToMonitor")
 		mockStatus.On("SetMetaData", mock.Anything).Return()
+		mockStatus.On("OnCRNotFound").Return()
+
 		Expect(c.Create(ctx, &operatorv1.Monitor{
 			ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure"},
 		}))
@@ -103,6 +105,8 @@ var _ = Describe("ManagementClusterConnection controller tests", func() {
 				Namespace: render.GuardianNamespace,
 			},
 		}
+
+		Expect(c.Create(ctx, &v1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: render.GuardianNamespace}}))
 		certificateManager, err := certificatemanager.Create(c, nil, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
 		Expect(c.Create(ctx, certificateManager.KeyPair().Secret(common.OperatorNamespace()))) // Persist the root-ca in the operator namespace.
@@ -126,6 +130,9 @@ var _ = Describe("ManagementClusterConnection controller tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 		err = c.Create(ctx, queryServerSecret.Secret(common.OperatorNamespace()))
 		Expect(err).NotTo(HaveOccurred())
+
+		trustedBundle := certificateManager.CreateTrustedBundle()
+		Expect(c.Create(ctx, trustedBundle.ConfigMap(render.GuardianNamespace))).NotTo(HaveOccurred())
 
 		By("applying the required prerequisites")
 		// Create a ManagementClusterConnection in the k8s client.
@@ -171,6 +178,40 @@ var _ = Describe("ManagementClusterConnection controller tests", func() {
 		})
 	})
 
+	Context("guardian finalizer", func() {
+		It("should be added and removed from the Installation CR", func() {
+			By("reconciling with the required prerequisites")
+			err := c.Get(ctx, client.ObjectKey{Name: render.GuardianDeploymentName, Namespace: render.GuardianNamespace}, dpl)
+			Expect(err).To(HaveOccurred())
+			_, err = r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ToNot(HaveOccurred())
+			err = c.Get(ctx, client.ObjectKey{Name: render.GuardianDeploymentName, Namespace: render.GuardianNamespace}, dpl)
+			// Verifying that there is a deployment is enough for the purpose of this test. More detailed testing will be done
+			// in the render package.
+			Expect(err).NotTo(HaveOccurred())
+			Expect(dpl.Labels["k8s-app"]).To(Equal(render.GuardianName))
+
+			By("verifying that the installation cr has a guardian finalizer")
+			install := &operatorv1.Installation{ObjectMeta: metav1.ObjectMeta{Name: "default"}}
+			Expect(test.GetResource(c, install)).To(BeNil())
+			Expect(install.ObjectMeta.Finalizers).To(ContainElement(render.GuardianFinalizer))
+
+			By("not removing the guardian finalizer when the management cluster connection is deleted and the guardian deployment is still present.")
+			Expect(c.Delete(ctx, cfg)).NotTo(HaveOccurred())
+			_, err = r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(test.GetResource(c, install)).To(BeNil())
+			Expect(install.ObjectMeta.Finalizers).To(ContainElement(render.GuardianFinalizer))
+
+			By("removing the guardian finalizer when the management cluster connection is deleted and the guardian deployment is deleted.")
+			Expect(c.Delete(ctx, dpl)).NotTo(HaveOccurred())
+			_, err = r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(test.GetResource(c, install)).To(BeNil())
+			Expect(install.ObjectMeta.Finalizers).To(Not(ContainElement(render.GuardianFinalizer)))
+		})
+	})
+
 	Context("image reconciliation", func() {
 		It("should use builtin images", func() {
 			r = clusterconnection.NewReconcilerWithShims(c, clientScheme, mockStatus, operatorv1.ProviderNone, ready)
@@ -186,12 +227,13 @@ var _ = Describe("ManagementClusterConnection controller tests", func() {
 			}
 			Expect(test.GetResource(c, &d)).To(BeNil())
 			Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
-			dexC := test.GetContainer(d.Spec.Template.Spec.Containers, render.GuardianDeploymentName)
+			dexC := test.GetContainer(d.Spec.Template.Spec.Containers, render.GuardianContainerName)
 			Expect(dexC).ToNot(BeNil())
 			Expect(dexC.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s:%s",
 					components.ComponentGuardian.Image,
 					components.ComponentGuardian.Version)))
+
 		})
 		It("should use images from imageset", func() {
 			Expect(c.Create(ctx, &operatorv1.ImageSet{
@@ -217,7 +259,7 @@ var _ = Describe("ManagementClusterConnection controller tests", func() {
 			}
 			Expect(test.GetResource(c, &d)).To(BeNil())
 			Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
-			apiserver := test.GetContainer(d.Spec.Template.Spec.Containers, render.GuardianDeploymentName)
+			apiserver := test.GetContainer(d.Spec.Template.Spec.Containers, render.GuardianContainerName)
 			Expect(apiserver).ToNot(BeNil())
 			Expect(apiserver.Image).To(Equal(
 				fmt.Sprintf("some.registry.org/%s@%s",
@@ -299,20 +341,16 @@ var _ = Describe("ManagementClusterConnection controller tests", func() {
 				Expect(policies.Items[1].Name).To(Equal("allow-tigera.guardian-access"))
 			})
 
-			It("should degrade and wait when tier is ready, but license is not sufficient", func() {
+			It("should omit allow-tigera policy when tier is ready, but license is not sufficient", func() {
 				licenseKey.Status.Features = []string{common.TiersFeature}
 				Expect(c.Update(ctx, licenseKey)).NotTo(HaveOccurred())
 
-				mockStatus = &status.MockStatus{}
-				mockStatus.On("Run").Return()
-				mockStatus.On("OnCRFound").Return()
-				mockStatus.On("SetDegraded", operatorv1.ResourceReadError, "Feature is not active - License does not support feature: egress-access-control", mock.Anything, mock.Anything).Return()
-				mockStatus.On("SetMetaData", mock.Anything).Return()
-
-				r = clusterconnection.NewReconcilerWithShims(c, clientScheme, mockStatus, operatorv1.ProviderNone, ready)
 				_, err := r.Reconcile(ctx, reconcile.Request{})
 				Expect(err).ShouldNot(HaveOccurred())
-				mockStatus.AssertExpectations(GinkgoT())
+
+				policies := v3.NetworkPolicyList{}
+				Expect(c.List(ctx, &policies)).ToNot(HaveOccurred())
+				Expect(policies.Items).To(HaveLen(0))
 			})
 
 			It("should degrade and wait when tier and license are ready, but tier watch is not ready", func() {
@@ -387,7 +425,7 @@ var _ = Describe("ManagementClusterConnection controller tests", func() {
 
 						// Set the deployment to be unavailable. We need to recreate the deployment otherwise the status update is ignored.
 						gd := appsv1.Deployment{}
-						err = c.Get(ctx, client.ObjectKey{Name: "tigera-guardian", Namespace: "tigera-guardian"}, &gd)
+						err = c.Get(ctx, client.ObjectKey{Name: render.GuardianDeploymentName, Namespace: render.GuardianNamespace}, &gd)
 						Expect(err).NotTo(HaveOccurred())
 						err = c.Delete(ctx, &gd)
 						Expect(err).NotTo(HaveOccurred())
@@ -478,7 +516,7 @@ var _ = Describe("ManagementClusterConnection controller tests", func() {
 
 			// Get the deployment and validate the env vars.
 			gd := appsv1.Deployment{}
-			err = c.Get(ctx, client.ObjectKey{Name: "tigera-guardian", Namespace: "tigera-guardian"}, &gd)
+			err = c.Get(ctx, client.ObjectKey{Name: render.GuardianDeploymentName, Namespace: render.GuardianNamespace}, &gd)
 			Expect(err).NotTo(HaveOccurred())
 
 			var expectedEnvVars []v1.EnvVar
@@ -711,16 +749,16 @@ var _ = Describe("ManagementClusterConnection controller tests", func() {
 func createPodWithProxy(ctx context.Context, c client.Client, config *test.ProxyConfig, lowercase bool, replicaNum int) {
 	pod := v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "tigera-guardian" + strconv.Itoa(replicaNum),
-			Namespace: "tigera-guardian",
+			Name:      render.GuardianDeploymentName + strconv.Itoa(replicaNum),
+			Namespace: render.GuardianNamespace,
 			Labels: map[string]string{
-				"k8s-app":                "tigera-guardian",
-				"app.kubernetes.io/name": "tigera-guardian",
+				"k8s-app":                render.GuardianDeploymentName,
+				"app.kubernetes.io/name": render.GuardianDeploymentName,
 			},
 		},
 		Spec: v1.PodSpec{
 			Containers: []v1.Container{{
-				Name: "tigera-guardian",
+				Name: render.GuardianDeploymentName,
 				Env:  []v1.EnvVar{},
 			}},
 		},

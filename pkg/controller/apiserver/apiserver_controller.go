@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +24,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -72,16 +71,10 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 
 	// Established deferred watches against the v3 API that should succeed after the Enterprise API Server becomes available.
 	if opts.EnterpriseCRDExists {
-		k8sClient, err := kubernetes.NewForConfig(mgr.GetConfig())
-		if err != nil {
-			log.Error(err, "Failed to establish a connection to k8s")
-			return err
-		}
-
 		// Watch for changes to Tier, as its status is used as input to determine whether network policy should be reconciled by this controller.
-		go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, k8sClient, log, r.tierWatchReady)
+		go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, opts.K8sClientset, log, r.tierWatchReady)
 
-		go utils.WaitToAddNetworkPolicyWatches(c, k8sClient, log, []types.NamespacedName{
+		go utils.WaitToAddNetworkPolicyWatches(c, opts.K8sClientset, log, []types.NamespacedName{
 			{Name: render.APIServerPolicyName, Namespace: rmeta.APIServerNamespace(operatorv1.TigeraSecureEnterprise)},
 		})
 	}
@@ -220,7 +213,7 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 		if errors.IsNotFound(err) {
 			reqLogger.Info("APIServer config not found")
 			r.status.OnCRNotFound()
-			return reconcile.Result{}, maintainInstallationFinalizer(ctx, r.client, nil)
+			return reconcile.Result{}, r.maintainFinalizer(ctx, nil)
 		}
 		r.status.SetDegraded(operatorv1.ResourceReadError, fmt.Sprintf("An error occurred when querying the APIServer resource: %s", msg), err, reqLogger)
 		return reconcile.Result{}, err
@@ -376,33 +369,30 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 			return reconcile.Result{}, err
 		}
 
-		if authenticationCR != nil && authenticationCR.Status.State != operatorv1.TigeraStatusReady {
-			r.status.SetDegraded(operatorv1.ResourceNotReady,
-				fmt.Sprintf("Authentication is not ready authenticationCR status: %s", authenticationCR.Status.State),
-				nil, reqLogger)
-			return reconcile.Result{}, nil
-		} else if authenticationCR != nil && !utils.IsDexDisabled(authenticationCR) {
-			// Do not include DEX TLS Secret Name if authentication CR does not have type Dex
-			secret := render.DexTLSSecretName
-			certificate, err := certificateManager.GetCertificate(r.client, secret, common.OperatorNamespace())
-			if err != nil {
-				r.status.SetDegraded(operatorv1.CertificateError, fmt.Sprintf("Failed to retrieve %s", secret),
-					err, reqLogger)
-				return reconcile.Result{}, err
-			} else if certificate == nil {
-				reqLogger.Info(fmt.Sprintf("Waiting for secret '%s' to become available", secret))
-				r.status.SetDegraded(operatorv1.ResourceNotReady,
-					fmt.Sprintf("Waiting for secret '%s' to become available", secret),
-					nil, reqLogger)
-				return reconcile.Result{}, nil
+		if authenticationCR != nil && authenticationCR.Status.State == operatorv1.TigeraStatusReady {
+			if utils.DexEnabled(authenticationCR) {
+				// Do not include DEX TLS Secret Name if authentication CR does not have type Dex
+				secret := render.DexTLSSecretName
+				certificate, err := certificateManager.GetCertificate(r.client, secret, common.OperatorNamespace())
+				if err != nil {
+					r.status.SetDegraded(operatorv1.CertificateError, fmt.Sprintf("Failed to retrieve %s", secret),
+						err, reqLogger)
+					return reconcile.Result{}, err
+				} else if certificate == nil {
+					reqLogger.Info(fmt.Sprintf("Waiting for secret '%s' to become available", secret))
+					r.status.SetDegraded(operatorv1.ResourceNotReady,
+						fmt.Sprintf("Waiting for secret '%s' to become available", secret),
+						nil, reqLogger)
+					return reconcile.Result{}, nil
+				}
+				trustedBundle.AddCertificates(certificate)
 			}
-			trustedBundle.AddCertificates(certificate)
-		}
 
-		keyValidatorConfig, err = utils.GetKeyValidatorConfig(ctx, r.client, authenticationCR, r.clusterDomain)
-		if err != nil {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get KeyValidator Config", err, reqLogger)
-			return reconcile.Result{}, err
+			keyValidatorConfig, err = utils.GetKeyValidatorConfig(ctx, r.client, authenticationCR, r.clusterDomain)
+			if err != nil {
+				r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get KeyValidator Config", err, reqLogger)
+				return reconcile.Result{}, err
+			}
 		}
 	}
 
@@ -413,7 +403,7 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 	}
 
 	// API server exists and configuration is valid - maintain a Finalizer on the installation.
-	if err := maintainInstallationFinalizer(ctx, r.client, instance); err != nil {
+	if err := r.maintainFinalizer(ctx, instance); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error setting finalizer on Installation", err, reqLogger)
 		return reconcile.Result{}, err
 	}
@@ -505,44 +495,16 @@ func validateAPIServerResource(instance *operatorv1.APIServer) error {
 	return nil
 }
 
-// maintainInstallationFinalizer manages this controller's finalizer on the Installation resource.
+// maintainFinalizer manages this controller's finalizer on the Installation resource.
 // We add a finalizer to the Installation when the API server has been installed, and only remove that finalizer when
 // the API server has been deleted and its pods have stopped running. This allows for a graceful cleanup of API server resources
 // prior to the CNI plugin being removed.
-func maintainInstallationFinalizer(ctx context.Context, c client.Client, apiserver *operatorv1.APIServer) error {
-	// Get the Installation.
-	installation := &operatorv1.Installation{}
-	if err := c.Get(ctx, utils.DefaultInstanceKey, installation); err != nil {
-		if errors.IsNotFound(err) {
-			log.V(1).Info("Installation config not found")
-			return nil
-		}
-		log.Error(err, "An error occurred when querying the Installation resource")
+func (r *ReconcileAPIServer) maintainFinalizer(ctx context.Context, apiserver client.Object) error {
+	// These objects require graceful termination before the CNI plugin is torn down.
+	_, spec, err := utils.GetInstallation(context.Background(), r.client)
+	if err != nil {
 		return err
 	}
-	patchFrom := client.MergeFrom(installation.DeepCopy())
-
-	// Determine the correct finalizers to apply to the Installation. If the APIServer exists, we should apply
-	// a finalizer. Otherwise, if the API server namespace doesn't exist we should remove it. This ensures the finalizer
-	// is always present so long as the resources managed by this controller exist in the cluster.
-	if apiserver != nil {
-		// Add a finalizer indicating that the API server is still running.
-		utils.SetInstallationFinalizer(installation, render.APIServerFinalizer)
-	} else {
-		// Check if the API server namespace exists, and remove the finalizer if not. Gating this on Namespace removal
-		// in the best way to approximate that all API server related resources have been removed.
-		l := &corev1.Namespace{}
-		err := c.Get(ctx, types.NamespacedName{Name: rmeta.APIServerNamespace(installation.Spec.Variant)}, l)
-		if err != nil && !errors.IsNotFound(err) {
-			return err
-		} else if errors.IsNotFound(err) {
-			log.Info("API server Namespace does not exist, removing finalizer", "finalizer", render.APIServerFinalizer)
-			utils.RemoveInstallationFinalizer(installation, render.APIServerFinalizer)
-		} else {
-			log.Info("API server Namespace is still present, waiting for termination")
-		}
-	}
-
-	// Update the installation with any finalizer changes.
-	return c.Patch(ctx, installation, patchFrom)
+	apiServerNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: rmeta.APIServerNamespace(spec.Variant)}}
+	return utils.MaintainInstallationFinalizer(ctx, r.client, apiserver, render.APIServerFinalizer, apiServerNamespace)
 }

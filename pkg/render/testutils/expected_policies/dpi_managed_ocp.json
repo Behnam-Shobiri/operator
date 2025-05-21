@@ -48,8 +48,8 @@
         "protocol": "TCP",
         "destination": {
           "services": {
-            "namespace": "tigera-guardian",
-            "name": "tigera-guardian"
+            "namespace": "calico-system",
+            "name": "guardian"
           }
         }
       }

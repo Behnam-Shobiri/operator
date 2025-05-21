@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -49,14 +49,21 @@ import (
 )
 
 const (
-	managerPort                  = 9443
-	managerTargetPort            = 9443
-	ManagerServiceName           = "tigera-manager"
-	ManagerDeploymentName        = "tigera-manager"
-	ManagerNamespace             = "tigera-manager"
-	ManagerServiceAccount        = "tigera-manager"
-	ManagerClusterRole           = "tigera-manager-role"
-	ManagerClusterRoleBinding    = "tigera-manager-binding"
+	managerPort           = 9443
+	managerTargetPort     = 9443
+	ManagerServiceName    = "tigera-manager"
+	ManagerDeploymentName = "tigera-manager"
+	ManagerNamespace      = "tigera-manager"
+	ManagerServiceAccount = "tigera-manager"
+
+	// Default manager RBAC resources.
+	ManagerClusterRole        = "tigera-manager-role"
+	ManagerClusterRoleBinding = "tigera-manager-binding"
+
+	// Manager RBAC resources for Calico managed clusters.
+	ManagerManagedCalicoClusterRole        = "tigera-manager-managed-calico"
+	ManagerManagedCalicoClusterRoleBinding = "tigera-manager-managed-calico"
+
 	ManagerTLSSecretName         = "manager-tls"
 	ManagerInternalTLSSecretName = "internal-manager-tls"
 	ManagerPolicyName            = networkpolicy.TigeraComponentPolicyPrefix + "manager-access"
@@ -158,9 +165,15 @@ type ManagerConfiguration struct {
 	ComplianceLicenseActive bool
 	ComplianceNamespace     string
 
-	Namespace         string
-	TruthNamespace    string
+	Namespace      string
+	TruthNamespace string
+
+	// Single namespace to which RBAC should be bound, in single-tenant systems.
+	// List of all tenant namespaces, in a multi-tenant system.
 	BindingNamespaces []string
+
+	// List of namespaces for Tenants who manage Calico OSS clusters, in a multi-tenant system.
+	OSSTenantNamespaces []string
 
 	// Whether to run the rendered components in multi-tenant, single-tenant, or zero-tenant mode
 	Tenant          *operatorv1.Tenant
@@ -174,7 +187,7 @@ type managerComponent struct {
 	tlsSecrets     []*corev1.Secret
 	tlsAnnotations map[string]string
 	managerImage   string
-	proxyImage     string
+	voltronImage   string
 	uiAPIsImage    string
 }
 
@@ -189,7 +202,7 @@ func (c *managerComponent) ResolveImages(is *operatorv1.ImageSet) error {
 		errMsgs = append(errMsgs, err.Error())
 	}
 
-	c.proxyImage, err = components.GetReference(components.ComponentManagerProxy, reg, path, prefix, is)
+	c.voltronImage, err = components.GetReference(components.ComponentManagerProxy, reg, path, prefix, is)
 	if err != nil {
 		errMsgs = append(errMsgs, err.Error())
 	}
@@ -229,7 +242,7 @@ func (c *managerComponent) Objects() ([]client.Object, []client.Object) {
 	}
 
 	objs = append(objs,
-		managerClusterRoleBinding(c.cfg.BindingNamespaces),
+		managerClusterRoleBinding(c.cfg.Tenant, c.cfg.BindingNamespaces, c.cfg.OSSTenantNamespaces),
 		managerClusterRole(false, c.cfg.Installation.KubernetesProvider, c.cfg.Tenant),
 	)
 
@@ -516,7 +529,7 @@ func (c *managerComponent) voltronContainer() corev1.Container {
 		{Name: "VOLTRON_INTERNAL_HTTPS_KEY", Value: intKeyPath},
 		{Name: "VOLTRON_INTERNAL_HTTPS_CERT", Value: intCertPath},
 		{Name: "VOLTRON_ENABLE_MULTI_CLUSTER_MANAGEMENT", Value: strconv.FormatBool(c.cfg.ManagementCluster != nil)},
-		{Name: "VOLTRON_ENABLE_NONCLUSTER_HOST_LOG_INGESTION", Value: strconv.FormatBool(c.cfg.NonClusterHost != nil)},
+		{Name: "VOLTRON_ENABLE_NONCLUSTER_HOST", Value: strconv.FormatBool(c.cfg.NonClusterHost != nil)},
 		{Name: "VOLTRON_TUNNEL_PORT", Value: defaultTunnelVoltronPort},
 		{Name: "VOLTRON_DEFAULT_FORWARD_SERVER", Value: defaultForwardServer},
 		{Name: "VOLTRON_ENABLE_COMPLIANCE", Value: strconv.FormatBool(c.cfg.ComplianceLicenseActive)},
@@ -567,6 +580,12 @@ func (c *managerComponent) voltronContainer() corev1.Container {
 			env = append(env, corev1.EnvVar{Name: "VOLTRON_TENANT_NAMESPACE", Value: c.cfg.Tenant.Namespace})
 			linseedEndpointEnv = corev1.EnvVar{Name: "VOLTRON_LINSEED_ENDPOINT", Value: fmt.Sprintf("https://tigera-linseed.%s.svc", c.cfg.Tenant.Namespace)}
 		}
+
+		if c.cfg.Tenant.ManagedClusterIsCalico() {
+			// Enable access to / from Goldmane in Voltron.
+			env = append(env, corev1.EnvVar{Name: "VOLTRON_GOLDMANE_ENABLED", Value: "true"})
+			env = append(env, corev1.EnvVar{Name: "VOLTRON_MANAGED_CLUSTER_SUPPORTS_IMPERSONATION", Value: "false"})
+		}
 	}
 	env = append(env, linseedEndpointEnv)
 
@@ -576,7 +595,7 @@ func (c *managerComponent) voltronContainer() corev1.Container {
 
 	return corev1.Container{
 		Name:            VoltronName,
-		Image:           c.proxyImage,
+		Image:           c.voltronImage,
 		ImagePullPolicy: ImagePullPolicy(),
 		Env:             env,
 		VolumeMounts:    mounts,
@@ -615,6 +634,14 @@ func (c *managerComponent) managerUIAPIsContainer() corev1.Container {
 			// This cluster supports multiple tenants. Point the manager at the correct Linseed instance for this tenant.
 			env = append(env, corev1.EnvVar{Name: "LINSEED_URL", Value: fmt.Sprintf("https://tigera-linseed.%s.svc", c.cfg.Namespace)})
 			env = append(env, corev1.EnvVar{Name: "TENANT_NAMESPACE", Value: c.cfg.Namespace})
+		}
+
+		if c.cfg.Tenant.ManagedClusterIsCalico() {
+			// Calico clusters do not give Guardian impersonation permissions.
+			env = append(env, corev1.EnvVar{Name: "IMPERSONATE", Value: "false"})
+
+			// Calico clusters use Goldmane for policy metrics and stats.
+			env = append(env, corev1.EnvVar{Name: "GOLDMANE_ENABLED", Value: "true"})
 		}
 	}
 
@@ -681,17 +708,30 @@ func managerServiceAccount(ns string) *corev1.ServiceAccount {
 	}
 }
 
-func managerClusterRoleBinding(namespaces []string) client.Object {
-	return rcomponents.ClusterRoleBinding(ManagerClusterRoleBinding, ManagerClusterRole, ManagerServiceAccount, namespaces)
+func managerClusterRoleBinding(tenant *operatorv1.Tenant, namespaces, calicoNamespaces []string) client.Object {
+	// Different tenant types use different permission sets.
+	roleName := ManagerClusterRole
+	bindingName := ManagerClusterRoleBinding
+	chosenNamespaces := namespaces
+	if tenant.ManagedClusterIsCalico() {
+		roleName = ManagerManagedCalicoClusterRole
+		bindingName = ManagerManagedCalicoClusterRoleBinding
+		chosenNamespaces = calicoNamespaces
+	}
+	return rcomponents.ClusterRoleBinding(bindingName, roleName, ManagerServiceAccount, chosenNamespaces)
 }
 
 // managerClusterRole returns a clusterrole that allows authn/authz review requests.
 func managerClusterRole(managedCluster bool, kubernetesProvider operatorv1.Provider, tenant *operatorv1.Tenant) *rbacv1.ClusterRole {
+	// Different tenant types use different permission sets.
+	name := ManagerClusterRole
+	if tenant.ManagedClusterIsCalico() {
+		name = ManagerManagedCalicoClusterRole
+	}
+
 	cr := &rbacv1.ClusterRole{
-		TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: ManagerClusterRole,
-		},
+		TypeMeta:   metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{Name: name},
 		Rules: []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{"authorization.k8s.io"},
@@ -763,6 +803,14 @@ func managerClusterRole(managedCluster bool, kubernetesProvider operatorv1.Provi
 				APIGroups: []string{"networking.k8s.io"},
 				Resources: []string{"networkpolicies"},
 				Verbs:     []string{"get", "list"},
+			},
+			{
+				APIGroups: []string{"policy.networking.k8s.io"},
+				Resources: []string{
+					"adminnetworkpolicies",
+					"baselineadminnetworkpolicies",
+				},
+				Verbs: []string{"list"},
 			},
 			{
 				APIGroups: []string{""},
@@ -837,6 +885,16 @@ func managerClusterRole(managedCluster bool, kubernetesProvider operatorv1.Provi
 				Verbs:     []string{"create"},
 			},
 		)
+
+		if tenant.ManagedClusterIsCalico() {
+			// Voltron needs permissions to write flow logs.
+			cr.Rules = append(cr.Rules,
+				rbacv1.PolicyRule{
+					APIGroups: []string{"linseed.tigera.io"},
+					Resources: []string{"flowlogs"},
+					Verbs:     []string{"create"},
+				})
+		}
 	}
 
 	if kubernetesProvider.IsOpenShift() {
@@ -1045,7 +1103,6 @@ func managerClusterWideTigeraLayer() *v3.UISettings {
 		"tigera-eck-operator",
 		"tigera-elasticsearch",
 		"tigera-fluentd",
-		"tigera-guardian",
 		"tigera-intrusion-detection",
 		"tigera-kibana",
 		"tigera-manager",

@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -209,7 +209,8 @@ func NewElasticsearchKubeControllers(cfg *KubeControllersConfiguration) *kubeCon
 		if cfg.ManagementCluster != nil {
 			enabledControllers = append(enabledControllers, "managedcluster")
 		}
-	} else {
+	} else if !cfg.Tenant.ManagedClusterIsCalico() {
+		// Calico OSS Managed clusters do not need the license controller.
 		enabledControllers = append(enabledControllers, "managedclusterlicensing")
 	}
 
@@ -272,6 +273,7 @@ func (c *kubeControllersComponent) SupportedOSType() rmeta.OSType {
 
 func (c *kubeControllersComponent) Objects() ([]client.Object, []client.Object) {
 	objectsToCreate := []client.Object{}
+	objectsToDelete := []client.Object{}
 
 	if c.kubeControllerAllowTigeraPolicy != nil {
 		objectsToCreate = append(objectsToCreate, c.kubeControllerAllowTigeraPolicy)
@@ -287,13 +289,18 @@ func (c *kubeControllersComponent) Objects() ([]client.Object, []client.Object) 
 		c.controllersServiceAccount(),
 		c.controllersClusterRole(),
 		c.controllersClusterRoleBinding(),
-		c.controllersDeployment(),
 	)
+	if len(c.enabledControllers) > 0 {
+		// There's something to run, so create the deployment.
+		objectsToCreate = append(objectsToCreate, c.controllersDeployment())
+	} else {
+		// No controllers are enabled, so delete the deployment.
+		objectsToDelete = append(objectsToDelete, c.controllersDeployment())
+	}
 
 	if c.cfg.Installation.KubernetesProvider.IsOpenShift() {
 		objectsToCreate = append(objectsToCreate, c.controllersOCPFederationRoleBinding())
 	}
-	objectsToDelete := []client.Object{}
 	if c.cfg.KubeControllersGatewaySecret != nil {
 		objectsToCreate = append(objectsToCreate, secret.ToRuntimeObjects(
 			secret.CopyToNamespace(c.cfg.Namespace, c.cfg.KubeControllersGatewaySecret)...)...)
@@ -392,7 +399,7 @@ func kubeControllersRoleCommonRules(cfg *KubeControllersConfiguration, kubeContr
 			// Needs to manage hostendpoints.
 			APIGroups: []string{"crd.projectcalico.org"},
 			Resources: []string{"hostendpoints"},
-			Verbs:     []string{"get", "list", "create", "update", "delete"},
+			Verbs:     []string{"get", "list", "create", "update", "delete", "watch"},
 		},
 		{
 			// Needs to manipulate kubecontrollersconfiguration, which contains
@@ -400,7 +407,7 @@ func kubeControllersRoleCommonRules(cfg *KubeControllersConfiguration, kubeContr
 			// as well.
 			APIGroups: []string{"crd.projectcalico.org"},
 			Resources: []string{"kubecontrollersconfigurations"},
-			Verbs:     []string{"get", "create", "update", "watch"},
+			Verbs:     []string{"get", "create", "list", "update", "watch"},
 		},
 		{
 			// calico-kube-controllers requires tiers create
@@ -428,6 +435,13 @@ func kubeControllersRoleEnterpriseCommonRules(cfg *KubeControllersConfiguration)
 			APIGroups: []string{""},
 			Resources: []string{"configmaps"},
 			Verbs:     []string{"watch", "list", "get", "update", "create", "delete"},
+		},
+		{
+			// The Federated Services Controller needs access to the remote kubeconfig secret
+			// in order to create a remote syncer.
+			APIGroups: []string{""},
+			Resources: []string{"secrets"},
+			Verbs:     []string{"watch", "list", "get"},
 		},
 		{
 			// Needed to validate the license
@@ -813,6 +827,14 @@ func kubeControllersAllowTigeraPolicy(cfg *KubeControllersConfiguration) *v3.Net
 			Destination: v3.EntityRule{
 				Ports: networkpolicy.Ports(uint16(cfg.MetricsPort)),
 			},
+		})
+	}
+
+	if r, err := cfg.K8sServiceEp.DestinationEntityRule(); r != nil && err == nil {
+		egressRules = append(egressRules, v3.Rule{
+			Action:      v3.Allow,
+			Protocol:    &networkpolicy.TCPProtocol,
+			Destination: *r,
 		})
 	}
 

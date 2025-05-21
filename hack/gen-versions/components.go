@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,6 +29,10 @@ var defaultImages = map[string]string{
 	"calico/kube-controllers":    "calico/kube-controllers",
 	"calico/node":                "calico/node",
 	"calico/node-windows":        "calico/node-windows",
+	"calico/goldmane":            "calico/goldmane",
+	"calico/guardian":            "calico/guardian",
+	"calico/whisker":             "calico/whisker",
+	"calico/whisker-backend":     "calico/whisker-backend",
 	"calicoctl":                  "calico/ctl",
 	"flannel":                    "coreos/flannel",
 	"flexvol":                    "calico/pod2daemon-flexvol",
@@ -48,6 +52,12 @@ var defaultImages = map[string]string{
 	"tigera-cni-windows":         "tigera/cni-windows",
 	"calico/apiserver":           "calico/apiserver",
 	"tigera/linseed":             "tigera/linseed",
+	"calico/envoy-gateway":       "calico/envoy-gateway",
+	"calico/envoy-proxy":         "calico/envoy-proxy",
+	"calico/envoy-ratelimit":     "calico/envoy-ratelimit",
+	"tigera/envoy-gateway":       "tigera/envoy-gateway",
+	"tigera/envoy-proxy":         "tigera/envoy-proxy",
+	"tigera/envoy-ratelimit":     "tigera/envoy-ratelimit",
 }
 
 var ignoredImages = map[string]struct{}{

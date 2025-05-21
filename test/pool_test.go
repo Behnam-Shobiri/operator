@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2024-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -49,13 +49,13 @@ var _ = Describe("IPPool FV tests", func() {
 	var operatorDone chan struct{}
 
 	BeforeEach(func() {
-		c, shutdownContext, cancel, mgr = setupManager(ManageCRDsDisable, false)
+		c, shutdownContext, cancel, mgr = setupManager(ManageCRDsDisable, SingleTenant, EnterpriseCRDsExist)
 
 		By("Cleaning up resources before the test")
 		cleanupResources(c)
 
 		By("Verifying CRDs are installed")
-		verifyCRDsExist(c)
+		verifyCRDsExist(c, operator.TigeraSecureEnterprise)
 
 		By("Creating the tigera-operator namespace, if it doesn't exist")
 		ns := &corev1.Namespace{
@@ -142,7 +142,7 @@ var _ = Describe("IPPool FV tests", func() {
 		Expect(ipPools.Items[0].Spec.Disabled).To(Equal(false))
 		Expect(ipPools.Items[0].Spec.BlockSize).To(Equal(26))
 		Expect(ipPools.Items[0].Spec.NodeSelector).To(Equal("all()"))
-		Expect(ipPools.Items[0].Spec.AssignmentMode).To(Equal(crdv1.Automatic))
+		Expect(ipPools.Items[0].Spec.AssignmentMode).To(Equal(operator.AssignmentModeAutomatic))
 
 		// Verify that a default IPv6 pool was created.
 		Expect(ipPools.Items[1].Name).To(Equal("default-ipv6-ippool"))
@@ -151,7 +151,7 @@ var _ = Describe("IPPool FV tests", func() {
 		Expect(ipPools.Items[1].Spec.Disabled).To(Equal(false))
 		Expect(ipPools.Items[1].Spec.BlockSize).To(Equal(122))
 		Expect(ipPools.Items[1].Spec.NodeSelector).To(Equal("all()"))
-		Expect(ipPools.Items[1].Spec.AssignmentMode).To(Equal(crdv1.Automatic))
+		Expect(ipPools.Items[1].Spec.AssignmentMode).To(Equal(operator.AssignmentModeAutomatic))
 
 		// Expect the default pools to be marked as managed by the operator.
 		for _, p := range ipPools.Items {
@@ -192,7 +192,7 @@ var _ = Describe("IPPool FV tests", func() {
 		Expect(ipPools.Items[0].Spec.BlockSize).To(Equal(26))
 		Expect(ipPools.Items[0].Spec.NodeSelector).To(Equal("all()"))
 		Expect(ipPools.Items[0].Labels).To(HaveLen(1))
-		Expect(ipPools.Items[0].Spec.AssignmentMode).To(Equal(crdv1.Automatic))
+		Expect(ipPools.Items[0].Spec.AssignmentMode).To(Equal(operator.AssignmentModeAutomatic))
 	})
 
 	It("should assume ownership of legacy default IP pools", func() {
@@ -212,7 +212,7 @@ var _ = Describe("IPPool FV tests", func() {
 					crdv1.IPPoolAllowedUseWorkload,
 					crdv1.IPPoolAllowedUseTunnel,
 				},
-				AssignmentMode: crdv1.Automatic,
+				AssignmentMode: operator.AssignmentModeAutomatic,
 			},
 		}
 		Expect(c.Create(context.Background(), &ipPool)).To(Succeed())
@@ -287,7 +287,7 @@ var _ = Describe("IPPool FV tests", func() {
 		Expect(v3Pools.Items[0].Spec.NodeSelector).To(Equal("all()"))
 		Expect(v3Pools.Items[0].Spec.IPIPMode).To(Equal(v3.IPIPMode(v3.IPIPModeAlways)))
 		Expect(v3Pools.Items[0].Spec.VXLANMode).To(Equal(v3.VXLANMode(v3.VXLANModeNever)))
-		Expect(ipPools.Items[0].Spec.AssignmentMode).To(Equal(crdv1.Automatic))
+		Expect(ipPools.Items[0].Spec.AssignmentMode).To(Equal(operator.AssignmentModeAutomatic))
 	})
 
 	// This test verifies that the IP pool controller doesn't assume ownership of IP pools that may exist in the

@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -147,6 +147,7 @@ var _ = Describe("Rendering tests", func() {
 	one := intstr.FromInt(1)
 	miMode := operatorv1.MultiInterfaceModeNone
 	k8sServiceEp := k8sapi.ServiceEndpoint{}
+	defaultCNIConfDir, defaultCNIBinDir := "/etc/cni/net.d", "/opt/cni/bin"
 
 	BeforeEach(func() {
 		// Initialize a default instance to use. Each test can override this to its
@@ -157,6 +158,8 @@ var _ = Describe("Rendering tests", func() {
 				IPAM: &operatorv1.IPAMSpec{
 					Type: operatorv1.IPAMPluginCalico,
 				},
+				BinDir:  &defaultCNIBinDir,
+				ConfDir: &defaultCNIConfDir,
 			},
 			CalicoNetwork: &operatorv1.CalicoNetworkSpec{
 				IPPools:            []operatorv1.IPPool{{CIDR: "192.168.1.0/16"}},
@@ -443,14 +446,19 @@ func getTyphaNodeTLS(cli client.Client, certificateManager certificatemanager.Ce
 	typhaKeyPair, err := certificateManager.GetOrCreateKeyPair(cli, render.TyphaTLSSecretName, common.OperatorNamespace(), []string{render.FelixCommonName})
 	Expect(err).NotTo(HaveOccurred())
 
+	typhaNonClusterHostKeyPair, err := certificateManager.GetOrCreateKeyPair(cli, render.TyphaTLSSecretName+render.TyphaNonClusterHostSuffix, common.OperatorNamespace(), []string{render.FelixCommonName + render.TyphaNonClusterHostSuffix})
+	Expect(err).NotTo(HaveOccurred())
+
 	trustedBundle := certificateManager.CreateTrustedBundle(nodeKeyPair, typhaKeyPair)
 
-	typhaNodeTLS := &render.TyphaNodeTLS{
-		TyphaSecret:   typhaKeyPair,
-		NodeSecret:    nodeKeyPair,
-		TrustedBundle: trustedBundle,
+	return &render.TyphaNodeTLS{
+		TrustedBundle:             trustedBundle,
+		TyphaSecret:               typhaKeyPair,
+		TyphaSecretNonClusterHost: typhaNonClusterHostKeyPair,
+		TyphaCommonName:           render.TyphaCommonName,
+		NodeSecret:                nodeKeyPair,
+		NodeCommonName:            render.FelixCommonName,
 	}
-	return typhaNodeTLS
 }
 
 func componentCount(components []render.Component) int {

@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,7 +26,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/kubernetes"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -70,15 +69,9 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		return err
 	}
 
-	k8sClient, err := kubernetes.NewForConfig(mgr.GetConfig())
-	if err != nil {
-		log.Error(err, "Failed to establish a connection to k8s")
-		return err
-	}
+	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, opts.K8sClientset, log, nil)
 
-	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, k8sClient, log, nil)
-
-	go utils.WaitToAddNetworkPolicyWatches(c, k8sClient, log, []types.NamespacedName{
+	go utils.WaitToAddNetworkPolicyWatches(c, opts.K8sClientset, log, []types.NamespacedName{
 		{Name: tiers.ClusterDNSPolicyName, Namespace: "openshift-dns"},
 		{Name: tiers.ClusterDNSPolicyName, Namespace: "kube-system"},
 	})
@@ -190,7 +183,6 @@ func (r *ReconcileTiers) prepareTiersConfig(ctx context.Context, reqLogger logr.
 	// well-known list of namespaces that contain product code.
 	namespaces := []string{
 		common.CalicoNamespace,
-		render.GuardianNamespace,
 		render.ComplianceNamespace,
 		render.DexNamespace,
 		render.ElasticsearchNamespace,
@@ -207,7 +199,7 @@ func (r *ReconcileTiers) prepareTiersConfig(ctx context.Context, reqLogger logr.
 	}
 	if r.multiTenant {
 		// For multi-tenant clusters, we need to include well-known namespaces as well as per-tenant namespaces.
-		tenantNamespaces, err := utils.TenantNamespaces(ctx, r.client)
+		tenantNamespaces, err := utils.TenantNamespaces(ctx, r.client, nil)
 		if err != nil {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying tenant namespaces", err, reqLogger)
 			return nil, &reconcile.Result{RequeueAfter: utils.StandardRetry}

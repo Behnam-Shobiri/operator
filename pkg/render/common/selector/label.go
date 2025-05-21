@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,31 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package embed
+package selector
 
-import (
-	"testing"
+import metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/stretchr/testify/require"
+const (
+	OpenShiftDNSDaemonsetLabel = "dns.operator.openshift.io/daemonset-dns"
+	K8sNameLabel               = "app.kubernetes.io/name"
+	CalicoNameLabel            = "projectcalico.org/name"
 )
 
-func TestEmbed(t *testing.T) {
-	for _, fileName := range []string{
-		// bare FS embed as sub. coreruleset prefix stripped
-		"tigera.conf",
-	} {
-		_, err := FS.Open(fileName)
-		require.NoError(t, err)
-	}
-}
-
-func TestEmbedAsMap(t *testing.T) {
-	fileMap, err := AsMap()
-	require.NoError(t, err)
-	for _, fileName := range []string{
-		"tigera.conf",
-	} {
-		_, ok := fileMap[fileName]
-		require.True(t, ok)
+func PodLabelSelector(name string) *metav1.LabelSelector {
+	return &metav1.LabelSelector{
+		MatchLabels: map[string]string{
+			K8sNameLabel: name,
+		},
 	}
 }

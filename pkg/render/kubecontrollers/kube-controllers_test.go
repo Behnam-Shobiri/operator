@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,10 +25,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apiserver/pkg/authentication/serviceaccount"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
@@ -180,7 +178,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 
 		// Image override results in correct image.
 		Expect(ds.Spec.Template.Spec.Containers[0].Image).To(Equal(
-			fmt.Sprintf("test-reg/%s:%s", components.ComponentCalicoKubeControllers.Image, components.ComponentCalicoKubeControllers.Version),
+			fmt.Sprintf("test-reg/%s%s:%s", components.CalicoImagePath, components.ComponentCalicoKubeControllers.Image, components.ComponentCalicoKubeControllers.Version),
 		))
 
 		// Verify env
@@ -255,7 +253,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		Expect(len(dp.Spec.Template.Spec.Volumes)).To(Equal(1))
 
 		clusterRole := rtest.GetResource(resources, kubecontrollers.KubeControllerRole, "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
-		Expect(clusterRole.Rules).To(HaveLen(21))
+		Expect(clusterRole.Rules).To(HaveLen(22))
 
 		ms := rtest.GetResource(resources, kubecontrollers.KubeControllerMetrics, common.CalicoNamespace, "", "v1", "Service").(*corev1.Service)
 		Expect(ms.Spec.ClusterIP).To(Equal("None"), "metrics service should be headless")
@@ -368,6 +366,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 			{name: kubecontrollers.KubeControllerServiceAccount, ns: common.CalicoNamespace, group: "", version: "v1", kind: "ServiceAccount"},
 			{name: kubecontrollers.KubeControllerRole, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole"},
 			{name: kubecontrollers.KubeControllerRoleBinding, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
+			{name: kubecontrollers.ManagedClustersWatchRoleBindingName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
 			{name: kubecontrollers.KubeController, ns: common.CalicoNamespace, group: "apps", version: "v1", kind: "Deployment"},
 			{name: kubecontrollers.KubeControllerMetrics, ns: common.CalicoNamespace, group: "", version: "v1", kind: "Service"},
 		}
@@ -507,6 +506,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 			{name: "calico-kube-controllers", ns: common.CalicoNamespace, group: "", version: "v1", kind: "ServiceAccount"},
 			{name: kubecontrollers.EsKubeControllerRole, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole"},
 			{name: kubecontrollers.EsKubeControllerRoleBinding, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
+			{name: kubecontrollers.ManagedClustersWatchRoleBindingName, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
 			{name: kubecontrollers.EsKubeController, ns: common.CalicoNamespace, group: "apps", version: "v1", kind: "Deployment"},
 			{name: kubecontrollers.ElasticsearchKubeControllersUserSecret, ns: common.CalicoNamespace, group: "", version: "v1", kind: "Secret"},
 			{name: kubecontrollers.EsKubeControllerMetrics, ns: common.CalicoNamespace, group: "", version: "v1", kind: "Service"},
@@ -564,6 +564,15 @@ var _ = Describe("kube-controllers rendering tests", func() {
 				Resources: []string{"secrets"},
 				Verbs:     []string{"watch", "list", "get"},
 			}))
+		roleBindingWatch := rtest.GetResource(resources, kubecontrollers.ManagedClustersWatchRoleBindingName, "", "rbac.authorization.k8s.io", "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
+		Expect(roleBindingWatch.RoleRef.Name).To(Equal(render.ManagedClustersWatchClusterRoleName))
+		Expect(roleBindingWatch.Subjects).To(ConsistOf([]rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      kubecontrollers.KubeControllerServiceAccount,
+				Namespace: common.CalicoNamespace,
+			},
+		}))
 	})
 
 	It("should include a ControlPlaneNodeSelector when specified", func() {
@@ -696,9 +705,10 @@ var _ = Describe("kube-controllers rendering tests", func() {
 		for _, container := range deployment.Spec.Template.Spec.Containers {
 			if container.Name == kubecontrollers.EsKubeController {
 				for _, env := range container.Env {
-					if env.Name == "OIDC_AUTH_USERNAME_PREFIX" {
+					switch env.Name {
+					case "OIDC_AUTH_USERNAME_PREFIX":
 						usernamePrefix = env.Value
-					} else if env.Name == "OIDC_AUTH_GROUP_PREFIX" {
+					case "OIDC_AUTH_GROUP_PREFIX":
 						groupPrefix = env.Value
 					}
 				}
@@ -1011,7 +1021,7 @@ var _ = Describe("kube-controllers rendering tests", func() {
 	})
 
 	Context("kube-controllers allow-tigera rendering", func() {
-		policyName := types.NamespacedName{Name: "allow-tigera.kube-controller-access", Namespace: "calico-system"}
+		policyName := types.NamespacedName{Name: "allow-tigera.kube-controller-access", Namespace: common.CalicoNamespace}
 
 		DescribeTable("should render allow-tigera policy",
 			func(scenario testutils.AllowTigeraScenario) {
@@ -1061,11 +1071,10 @@ var _ = Describe("kube-controllers rendering tests", func() {
 
 			Expect(len(zeroedPolicy.Spec.Ingress)).To(Equal(len(baselinePolicy.Spec.Ingress) - 1))
 		})
-
 	})
 
 	Context("es-kube-controllers allow-tigera rendering", func() {
-		policyName := types.NamespacedName{Name: "allow-tigera.es-kube-controller-access", Namespace: "calico-system"}
+		policyName := types.NamespacedName{Name: "allow-tigera.es-kube-controller-access", Namespace: common.CalicoNamespace}
 
 		getExpectedPolicy := func(scenario testutils.AllowTigeraScenario) *v3.NetworkPolicy {
 			if scenario.ManagedCluster {
@@ -1146,208 +1155,5 @@ var _ = Describe("kube-controllers rendering tests", func() {
 				Domains: []string{"k8shost"},
 			},
 		}))
-	})
-
-	Context("multi-tenant rendering", func() {
-		//var installation *operatorv1.InstallationSpec
-		var tenant *operatorv1.Tenant
-		var tenantCfg kubecontrollers.KubeControllersConfiguration
-		var instance *operatorv1.InstallationSpec
-
-		BeforeEach(func() {
-			tenant = &operatorv1.Tenant{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test-tenant",
-					Namespace: "test-tenant-ns",
-				},
-				Spec: operatorv1.TenantSpec{
-					ID:      "test-tenant",
-					Indices: []operatorv1.Index{},
-				},
-			}
-
-			miMode := operatorv1.MultiInterfaceModeNone
-			instance = &operatorv1.InstallationSpec{
-				CalicoNetwork: &operatorv1.CalicoNetworkSpec{
-					IPPools:            []operatorv1.IPPool{{CIDR: "192.168.1.0/16"}},
-					MultiInterfaceMode: &miMode,
-				},
-				Variant:  operatorv1.TigeraSecureEnterprise,
-				Registry: "test-reg/",
-			}
-
-			certificateManager, err := certificatemanager.Create(cli, nil, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
-			Expect(err).NotTo(HaveOccurred())
-
-			tenantCfg = kubecontrollers.KubeControllersConfiguration{
-				K8sServiceEp:                 k8sServiceEp,
-				Installation:                 instance,
-				ClusterDomain:                dns.DefaultClusterDomain,
-				MetricsPort:                  9094,
-				TrustedBundle:                certificateManager.CreateTrustedBundle(),
-				Namespace:                    tenant.Namespace,
-				BindingNamespaces:            []string{tenant.Namespace},
-				LogStorageExists:             true,
-				ManagementCluster:            &operatorv1.ManagementCluster{},
-				KubeControllersGatewaySecret: nil,
-				Tenant:                       tenant,
-			}
-		})
-
-		It("should render all resources", func() {
-			expectedResources := []struct {
-				name    string
-				ns      string
-				group   string
-				version string
-				kind    string
-			}{
-				{name: kubecontrollers.EsKubeControllerNetworkPolicyName, ns: tenant.Namespace, group: "projectcalico.org", version: "v3", kind: "NetworkPolicy"},
-				{name: kubecontrollers.MultiTenantManagedClustersAccessRoleBindingName, ns: tenant.Namespace, group: "rbac.authorization.k8s.io", version: "v1", kind: "RoleBinding"},
-				{name: kubecontrollers.KubeControllerServiceAccount, ns: tenant.Namespace, group: "", version: "v1", kind: "ServiceAccount"},
-				{name: kubecontrollers.EsKubeControllerRole, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRole"},
-				{name: kubecontrollers.EsKubeControllerRoleBinding, ns: "", group: "rbac.authorization.k8s.io", version: "v1", kind: "ClusterRoleBinding"},
-				{name: kubecontrollers.EsKubeController, ns: tenant.Namespace, group: "apps", version: "v1", kind: "Deployment"},
-				{name: kubecontrollers.EsKubeControllerMetrics, ns: tenant.Namespace, group: "", version: "v1", kind: "Service"},
-			}
-
-			component := kubecontrollers.NewElasticsearchKubeControllers(&tenantCfg)
-			resources, _ := component.Objects()
-			Expect(len(resources)).To(Equal(len(expectedResources)))
-
-			// Should render the correct resources.
-			i := 0
-			for _, expectedRes := range expectedResources {
-				rtest.ExpectResourceTypeAndObjectMetadata(resources[i], expectedRes.name, expectedRes.ns, expectedRes.group, expectedRes.version, expectedRes.kind)
-				i++
-			}
-		})
-
-		It("should render all multi-tenant environment variables", func() {
-			component := kubecontrollers.NewElasticsearchKubeControllers(&tenantCfg)
-			Expect(component.ResolveImages(nil)).To(BeNil())
-			resources, _ := component.Objects()
-
-			// The Deployment should have the correct configuration.
-			dp := rtest.GetResource(resources, kubecontrollers.EsKubeController, tenant.Namespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
-
-			envs := dp.Spec.Template.Spec.Containers[0].Env
-			Expect(envs).To(ContainElements(
-				corev1.EnvVar{
-					Name:  "ENABLED_CONTROLLERS",
-					Value: "managedclusterlicensing",
-				},
-				corev1.EnvVar{
-					Name:  "TENANT_NAMESPACE",
-					Value: tenant.Namespace,
-				},
-				corev1.EnvVar{
-					Name:  "TENANT_ID",
-					Value: tenant.Spec.ID,
-				},
-				corev1.EnvVar{
-					Name:  "MULTI_CLUSTER_FORWARDING_ENDPOINT",
-					Value: fmt.Sprintf("https://tigera-manager.%s.svc:9443", tenant.Namespace),
-				},
-				corev1.EnvVar{
-					Name:  "KUBE_CONTROLLERS_CONFIG_NAME",
-					Value: "elasticsearch",
-				},
-				corev1.EnvVar{
-					Name:  "DISABLE_KUBE_CONTROLLERS_CONFIG_API",
-					Value: "true",
-				},
-			),
-			)
-		})
-
-		It("should enable multi-tenant RBAC", func() {
-			component := kubecontrollers.NewElasticsearchKubeControllers(&tenantCfg)
-			resources, _ := component.Objects()
-
-			cr := rtest.GetResource(resources, kubecontrollers.EsKubeControllerRole, "", rbacv1.GroupName, "v1", "ClusterRole").(*rbacv1.ClusterRole)
-			expectedRules := []rbacv1.PolicyRule{
-				{
-					APIGroups:     []string{""},
-					Resources:     []string{"serviceaccounts"},
-					Verbs:         []string{"impersonate"},
-					ResourceNames: []string{kubecontrollers.KubeControllerServiceAccount},
-				},
-				{
-					APIGroups: []string{""},
-					Resources: []string{"groups"},
-					Verbs:     []string{"impersonate"},
-					ResourceNames: []string{
-						serviceaccount.AllServiceAccountsGroup,
-						"system:authenticated",
-						fmt.Sprintf("%s%s", serviceaccount.ServiceAccountGroupPrefix, common.CalicoNamespace),
-					},
-				},
-				{
-					APIGroups: []string{"projectcalico.org"},
-					Resources: []string{"managedclusters"},
-					Verbs:     []string{"watch", "list", "get"},
-				},
-			}
-			Expect(cr.Rules).To(ContainElements(expectedRules))
-
-			clusterRoleBinding := rtest.GetResource(resources, kubecontrollers.EsKubeControllerRole,
-				"", rbacv1.GroupName, "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
-			Expect(clusterRoleBinding.RoleRef.Name).To(Equal(kubecontrollers.EsKubeControllerRole))
-			Expect(clusterRoleBinding.Subjects).To(ConsistOf([]rbacv1.Subject{
-				{
-					Kind:      "ServiceAccount",
-					Name:      kubecontrollers.KubeControllerServiceAccount,
-					Namespace: tenant.Namespace,
-				},
-			}))
-
-			managedClusterAccessRoleBinding := rtest.GetResource(resources,
-				kubecontrollers.MultiTenantManagedClustersAccessRoleBindingName,
-				tenant.Namespace, rbacv1.GroupName, "v1", "RoleBinding").(*rbacv1.RoleBinding)
-			Expect(managedClusterAccessRoleBinding.RoleRef.Name).To(Equal(render.MultiTenantManagedClustersAccessClusterRoleName))
-			Expect(managedClusterAccessRoleBinding.Subjects).To(ConsistOf([]rbacv1.Subject{
-				{
-					Kind:      "ServiceAccount",
-					Name:      kubecontrollers.KubeControllerServiceAccount,
-					Namespace: common.CalicoNamespace,
-				},
-			}))
-		})
-
-		It("should override resource request with the value from TenantSpec's esKubeControllerDeployment when available", func() {
-			overwrites := corev1.ResourceRequirements{
-				Limits: corev1.ResourceList{
-					"cpu":     resource.MustParse("2"),
-					"memory":  resource.MustParse("300Mi"),
-					"storage": resource.MustParse("20Gi"),
-				},
-				Requests: corev1.ResourceList{
-					"cpu":     resource.MustParse("1"),
-					"memory":  resource.MustParse("150Mi"),
-					"storage": resource.MustParse("10Gi"),
-				},
-			}
-			esKubeControllerDeployment := &operatorv1.CalicoKubeControllersDeployment{
-				Spec: &operatorv1.CalicoKubeControllersDeploymentSpec{
-					Template: &operatorv1.CalicoKubeControllersDeploymentPodTemplateSpec{
-						Spec: &operatorv1.CalicoKubeControllersDeploymentPodSpec{
-							Containers: []operatorv1.CalicoKubeControllersDeploymentContainer{{
-								Name:      "es-calico-kube-controllers",
-								Resources: &overwrites,
-							}},
-						},
-					},
-				},
-			}
-			tenantCfg.Tenant.Spec.ESKubeControllerDeployment = esKubeControllerDeployment
-			component := kubecontrollers.NewElasticsearchKubeControllers(&tenantCfg)
-			resources, _ := component.Objects()
-
-			d := rtest.GetResource(resources, kubecontrollers.EsKubeController, tenantCfg.Namespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
-			Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
-			Expect(d.Spec.Template.Spec.Containers[0].Name).To(Equal("es-calico-kube-controllers"))
-			Expect(d.Spec.Template.Spec.Containers[0].Resources).To(Equal(overwrites))
-		})
 	})
 })

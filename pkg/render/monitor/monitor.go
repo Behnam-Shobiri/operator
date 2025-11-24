@@ -35,6 +35,7 @@ import (
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
+	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/common/authentication"
 	rcomponents "github.com/tigera/operator/pkg/render/common/components"
@@ -471,12 +472,13 @@ func (mc *monitorComponent) alertmanagerService() *corev1.Service {
 }
 
 func (mc *monitorComponent) prometheus() *monitoringv1.Prometheus {
+	sc := securitycontext.NewNonRootContext()
 	var initContainers []corev1.Container
 	if mc.cfg.ServerTLSSecret.UseCertificateManagement() {
-		initContainers = append(initContainers, mc.cfg.ServerTLSSecret.InitContainer(common.TigeraPrometheusNamespace))
+		initContainers = append(initContainers, mc.cfg.ServerTLSSecret.InitContainer(common.TigeraPrometheusNamespace, sc))
 	}
 	if mc.cfg.ClientTLSSecret.UseCertificateManagement() {
-		initContainers = append(initContainers, mc.cfg.ClientTLSSecret.InitContainer(common.TigeraPrometheusNamespace))
+		initContainers = append(initContainers, mc.cfg.ClientTLSSecret.InitContainer(common.TigeraPrometheusNamespace, sc))
 	}
 	env := []corev1.EnvVar{
 		{
@@ -542,6 +544,7 @@ func (mc *monitorComponent) prometheus() *monitoringv1.Prometheus {
 		},
 		Spec: monitoringv1.PrometheusSpec{
 			CommonPrometheusFields: monitoringv1.CommonPrometheusFields{
+				ReloadStrategy: ptr.ToPtr(monitoringv1.ProcessSignalReloadStrategyType),
 				PodMetadata: &monitoringv1.EmbeddedObjectMetadata{
 					Labels: map[string]string{
 						"k8s-app": TigeraPrometheusObjectName,
@@ -577,7 +580,7 @@ func (mc *monitorComponent) prometheus() *monitoringv1.Prometheus {
 								},
 							},
 						},
-						SecurityContext: securitycontext.NewNonRootContext(),
+						SecurityContext: sc,
 					},
 				},
 				Image:            &mc.prometheusImage,
@@ -657,7 +660,7 @@ func (mc *monitorComponent) prometheusClusterRole() *rbacv1.ClusterRole {
 		{
 			APIGroups:     []string{""},
 			Resources:     []string{"services/proxy"},
-			ResourceNames: []string{"https:tigera-api:8080"},
+			ResourceNames: []string{"https:calico-api:8080"},
 			Verbs:         []string{"get"},
 		},
 		{
@@ -943,7 +946,7 @@ func (mc *monitorComponent) serviceMonitorFluentd() *monitoringv1.ServiceMonitor
 }
 
 func (mc *monitorComponent) serviceMonitorQueryServer() *monitoringv1.ServiceMonitor {
-	serverName := render.ProjectCalicoAPIServerServiceName(mc.cfg.Installation.Variant)
+	serverName := render.APIServerServiceName
 	return &monitoringv1.ServiceMonitor{
 		TypeMeta: metav1.TypeMeta{Kind: monitoringv1.ServiceMonitorsKind, APIVersion: MonitoringAPIVersion},
 		ObjectMeta: metav1.ObjectMeta{
@@ -1361,7 +1364,7 @@ func (mc *monitorComponent) externalPrometheusRole() client.Object {
 				APIGroups: []string{""},
 				Resources: []string{"services/proxy"},
 				ResourceNames: []string{
-					"https:tigera-api:8080", "calico-node-prometheus:9090",
+					"https:calico-api:8080", "calico-node-prometheus:9090",
 				},
 				Verbs: []string{"get", "create"},
 			},
@@ -1474,7 +1477,7 @@ func (mc *monitorComponent) externalServiceMonitor() (client.Object, bool) {
 		// permissions to the service account. But if the user does not want to use our defaults, it can change the
 		// bearerTokenSecret to one of their choosing. In that case, it is up to the user to provide the required access.
 		// See also api/v1/monitor_types.go.
-		if ep.BearerTokenSecret.LocalObjectReference.Name == TigeraExternalPrometheus {
+		if ep.BearerTokenSecret.Name == TigeraExternalPrometheus {
 			needsRBAC = true
 		}
 	}

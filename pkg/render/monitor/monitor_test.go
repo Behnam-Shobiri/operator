@@ -126,7 +126,6 @@ var _ = Describe("monitor rendering tests", func() {
 	})
 
 	It("Should render Prometheus resources with resources requests and limits", func() {
-
 		prometheusResources := corev1.ResourceRequirements{
 			Limits: corev1.ResourceList{
 				"cpu":    k8sresource.MustParse("1"),
@@ -151,10 +150,11 @@ var _ = Describe("monitor rendering tests", func() {
 		cfg.Monitor.Prometheus = &operatorv1.Prometheus{
 			PrometheusSpec: &operatorv1.PrometheusSpec{
 				CommonPrometheusFields: &operatorv1.CommonPrometheusFields{
-					Containers: []operatorv1.PrometheusContainer{{
-						Name:      "authn-proxy",
-						Resources: &prometheusResources,
-					},
+					Containers: []operatorv1.PrometheusContainer{
+						{
+							Name:      "authn-proxy",
+							Resources: &prometheusResources,
+						},
 					},
 					Resources: prometheusResources,
 				},
@@ -186,7 +186,6 @@ var _ = Describe("monitor rendering tests", func() {
 		alertmanagerObj, ok := rtest.GetResource(toCreate, monitor.CalicoNodeAlertmanager, common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.AlertmanagersKind).(*monitoringv1.Alertmanager)
 		Expect(ok).To(BeTrue())
 		Expect(alertmanagerObj.Spec.Resources).To(Equal(alertManagerResources))
-
 	})
 
 	It("Should render Prometheus resource Specs correctly", func() {
@@ -317,7 +316,7 @@ var _ = Describe("monitor rendering tests", func() {
 		alertmanagerObj, ok := rtest.GetResource(toCreate, monitor.CalicoNodeAlertmanager, common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.AlertmanagersKind).(*monitoringv1.Alertmanager)
 		Expect(ok).To(BeTrue())
 		alertmanagerCom := components.ComponentPrometheusAlertmanager
-		Expect(*alertmanagerObj.Spec.Image).To(Equal(fmt.Sprintf("%s%s:%s", components.TigeraRegistry, alertmanagerCom.Image, alertmanagerCom.Version)))
+		Expect(*alertmanagerObj.Spec.Image).To(Equal(fmt.Sprintf("%s%s%s:%s", components.TigeraRegistry, components.TigeraImagePath, alertmanagerCom.Image, alertmanagerCom.Version)))
 		Expect(*alertmanagerObj.Spec.Replicas).To(Equal(int32(3)))
 		Expect(alertmanagerObj.Spec.Version).To(Equal(components.ComponentCoreOSAlertmanager.Version))
 		Expect(*alertmanagerObj.Spec.SecurityContext.RunAsGroup).To(BeEquivalentTo(10001))
@@ -348,7 +347,7 @@ var _ = Describe("monitor rendering tests", func() {
 		prometheusObj, ok := rtest.GetResource(toCreate, monitor.CalicoNodePrometheus, common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.PrometheusesKind).(*monitoringv1.Prometheus)
 		Expect(ok).To(BeTrue())
 		prometheusCom := components.ComponentPrometheus
-		Expect(*prometheusObj.Spec.Image).To(Equal(fmt.Sprintf("%s%s:%s", components.TigeraRegistry, prometheusCom.Image, prometheusCom.Version)))
+		Expect(*prometheusObj.Spec.Image).To(Equal(fmt.Sprintf("%s%s%s:%s", components.TigeraRegistry, components.TigeraImagePath, prometheusCom.Image, prometheusCom.Version)))
 		Expect(prometheusObj.Spec.ServiceAccountName).To(Equal("prometheus"))
 		Expect(prometheusObj.Spec.ServiceMonitorSelector.MatchLabels["team"]).To(Equal("network-operators"))
 		Expect(prometheusObj.Spec.PodMonitorSelector.MatchLabels["team"]).To(Equal("network-operators"))
@@ -362,6 +361,7 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(*prometheusObj.Spec.Alerting.Alertmanagers[0].Namespace).To(Equal("tigera-prometheus"))
 		Expect(prometheusObj.Spec.Alerting.Alertmanagers[0].Port).To(Equal(intstr.FromString("web")))
 		Expect(prometheusObj.Spec.Alerting.Alertmanagers[0].Scheme).To(Equal("HTTP"))
+		Expect(*prometheusObj.Spec.ReloadStrategy).To(BeEquivalentTo(monitoringv1.ProcessSignalReloadStrategyType))
 		Expect(*prometheusObj.Spec.SecurityContext.RunAsGroup).To(BeEquivalentTo(10001))
 		Expect(*prometheusObj.Spec.SecurityContext.RunAsNonRoot).To(BeTrue())
 		Expect(*prometheusObj.Spec.SecurityContext.RunAsUser).To(BeEquivalentTo(10001))
@@ -420,7 +420,7 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(prometheusClusterRoleObj.Rules[2].Resources).To(HaveLen(1))
 		Expect(prometheusClusterRoleObj.Rules[2].Resources[0]).To(Equal("services/proxy"))
 		Expect(prometheusClusterRoleObj.Rules[2].ResourceNames).To(HaveLen(1))
-		Expect(prometheusClusterRoleObj.Rules[2].ResourceNames[0]).To(Equal("https:tigera-api:8080"))
+		Expect(prometheusClusterRoleObj.Rules[2].ResourceNames[0]).To(Equal("https:calico-api:8080"))
 		Expect(prometheusClusterRoleObj.Rules[2].Verbs).To(HaveLen(1))
 		Expect(prometheusClusterRoleObj.Rules[2].Verbs[0]).To(Equal("get"))
 		Expect(prometheusClusterRoleObj.Rules[3].NonResourceURLs).To(HaveLen(1))
@@ -494,9 +494,11 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(servicemonitorObj.Spec.Selector.MatchLabels).To(HaveLen(0))
 		Expect(servicemonitorObj.Spec.Selector.MatchExpressions).To(HaveLen(1))
 		Expect(servicemonitorObj.Spec.Selector.MatchExpressions).To(ConsistOf([]metav1.LabelSelectorRequirement{
-			{Key: "k8s-app",
+			{
+				Key:      "k8s-app",
 				Operator: metav1.LabelSelectorOpIn,
-				Values:   []string{"calico-node", "calico-node-windows"}},
+				Values:   []string{"calico-node", "calico-node-windows"},
+			},
 		}))
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames).To(HaveLen(1))
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames[0]).To(Equal("calico-system"))
@@ -545,12 +547,12 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(servicemonitorObj.Spec.Endpoints[0].ScrapeTimeout).To(BeEquivalentTo("5s"))
 		Expect(servicemonitorObj.Spec.Endpoints[0].Scheme).To(Equal("https"))
 
-		servicemonitorObj, ok = rtest.GetResource(toCreate, "tigera-api", common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind).(*monitoringv1.ServiceMonitor)
+		servicemonitorObj, ok = rtest.GetResource(toCreate, "calico-api", common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.ServiceMonitorsKind).(*monitoringv1.ServiceMonitor)
 		Expect(ok).To(BeTrue())
 		Expect(servicemonitorObj.Spec.Selector.MatchLabels).To(HaveLen(1))
-		Expect(servicemonitorObj.Spec.Selector.MatchLabels["k8s-app"]).To(Equal("tigera-api"))
+		Expect(servicemonitorObj.Spec.Selector.MatchLabels["k8s-app"]).To(Equal("calico-api"))
 		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames).To(HaveLen(1))
-		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames[0]).To(Equal("tigera-system"))
+		Expect(servicemonitorObj.Spec.NamespaceSelector.MatchNames[0]).To(Equal("calico-system"))
 		Expect(servicemonitorObj.Spec.Endpoints).To(HaveLen(1))
 		Expect(servicemonitorObj.Spec.Endpoints[0].HonorLabels).To(BeTrue())
 		Expect(servicemonitorObj.Spec.Endpoints[0].Interval).To(BeEquivalentTo("5s"))
@@ -664,9 +666,7 @@ var _ = Describe("monitor rendering tests", func() {
 			},
 		}
 
-		dexCfg := render.NewDexKeyValidatorConfig(authentication,
-			nil,
-			dns.DefaultClusterDomain)
+		dexCfg := render.NewDexKeyValidatorConfig(authentication, dns.DefaultClusterDomain)
 		cfg.KeyValidatorConfig = dexCfg
 		cfg.ServerTLSSecret = prometheusKeyPair
 		component := monitor.Monitor(cfg)
@@ -682,7 +682,7 @@ var _ = Describe("monitor rendering tests", func() {
 		prometheusObj, ok := rtest.GetResource(toCreate, monitor.CalicoNodePrometheus, common.TigeraPrometheusNamespace, "monitoring.coreos.com", "v1", monitoringv1.PrometheusesKind).(*monitoringv1.Prometheus)
 		Expect(ok).To(BeTrue())
 		prometheusCom := components.ComponentPrometheus
-		Expect(*prometheusObj.Spec.Image).To(Equal(fmt.Sprintf("%s%s:%s", components.TigeraRegistry, prometheusCom.Image, prometheusCom.Version)))
+		Expect(*prometheusObj.Spec.Image).To(Equal(fmt.Sprintf("%s%s%s:%s", components.TigeraRegistry, components.TigeraImagePath, prometheusCom.Image, prometheusCom.Version)))
 		Expect(prometheusObj.Spec.Containers).To(HaveLen(1))
 		proxy := prometheusObj.Spec.Containers[0]
 		Expect(proxy.Env).To(ConsistOf([]corev1.EnvVar{
@@ -785,15 +785,16 @@ var _ = Describe("monitor rendering tests", func() {
 		}
 
 		getExpectedPolicy := func(name types.NamespacedName, scenario testutils.AllowTigeraScenario) *v3.NetworkPolicy {
-			if name.Name == "allow-tigera.calico-node-alertmanager" {
+			switch name.Name {
+			case "allow-tigera.calico-node-alertmanager":
 				return testutils.SelectPolicyByProvider(scenario, expectedAlertmanagerPolicy, expectedAlertmanagerPolicyForOpenshift)
-			} else if name.Name == "allow-tigera.calico-node-alertmanager-mesh" {
+			case "allow-tigera.calico-node-alertmanager-mesh":
 				return testutils.SelectPolicyByProvider(scenario, expectedAlertmanagerMeshPolicy, expectedAlertmanagerMeshPolicyForOpenshift)
-			} else if name.Name == "allow-tigera.prometheus" {
+			case "allow-tigera.prometheus":
 				return testutils.SelectPolicyByProvider(scenario, expectedPrometheusPolicy, expectedPrometheusPolicyForOpenshift)
-			} else if name.Name == "allow-tigera.tigera-prometheus-api" {
+			case "allow-tigera.tigera-prometheus-api":
 				return testutils.SelectPolicyByProvider(scenario, expectedPrometheusApiPolicy, expectedPrometheusApiPolicyForOpenshift)
-			} else if name.Name == "allow-tigera.prometheus-operator" {
+			case "allow-tigera.prometheus-operator":
 				return testutils.SelectPolicyByProvider(scenario, expectedPrometheusOperatorPolicy, expectedPrometheusOperatorPolicyOpenshift)
 			}
 
@@ -975,7 +976,6 @@ var _ = Describe("monitor rendering tests", func() {
 		Expect(servicemonitorObj.Spec.Endpoints[2].Port).To(Equal("felix-metrics-port"))
 		Expect(servicemonitorObj.Spec.Endpoints[2].ScrapeTimeout).To(BeEquivalentTo("5s"))
 		Expect(servicemonitorObj.Spec.Endpoints[2].Scheme).To(Equal("http"))
-
 	})
 })
 
@@ -1005,7 +1005,7 @@ func expectedBaseResources() []client.Object {
 		&monitoringv1.ServiceMonitor{ObjectMeta: metav1.ObjectMeta{Name: "calico-node-monitor", Namespace: common.TigeraPrometheusNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceMonitor", APIVersion: "monitoring.coreos.com/v1"}},
 		&monitoringv1.ServiceMonitor{ObjectMeta: metav1.ObjectMeta{Name: "elasticsearch-metrics", Namespace: common.TigeraPrometheusNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceMonitor", APIVersion: "monitoring.coreos.com/v1"}},
 		&monitoringv1.ServiceMonitor{ObjectMeta: metav1.ObjectMeta{Name: "fluentd-metrics", Namespace: common.TigeraPrometheusNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceMonitor", APIVersion: "monitoring.coreos.com/v1"}},
-		&monitoringv1.ServiceMonitor{ObjectMeta: metav1.ObjectMeta{Name: "tigera-api", Namespace: common.TigeraPrometheusNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceMonitor", APIVersion: "monitoring.coreos.com/v1"}},
+		&monitoringv1.ServiceMonitor{ObjectMeta: metav1.ObjectMeta{Name: "calico-api", Namespace: common.TigeraPrometheusNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceMonitor", APIVersion: "monitoring.coreos.com/v1"}},
 		&monitoringv1.ServiceMonitor{ObjectMeta: metav1.ObjectMeta{Name: "calico-kube-controllers-metrics", Namespace: common.TigeraPrometheusNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceMonitor", APIVersion: "monitoring.coreos.com/v1"}},
 		&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: common.TigeraPrometheusNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 	}

@@ -69,7 +69,7 @@ func AddWindowsController(mgr manager.Manager, opts options.AddOptions) error {
 
 	c, err := ctrlruntime.NewController("tigera-windows-controller", mgr, controller.Options{Reconciler: ri})
 	if err != nil {
-		return fmt.Errorf("Failed to create tigera-windows-controller: %w", err)
+		return fmt.Errorf("failed to create tigera-windows-controller: %w", err)
 	}
 
 	// Watch for changes to primary resource Installation
@@ -208,7 +208,7 @@ func newWindowsReconciler(mgr manager.Manager, opts options.AddOptions) (*Reconc
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileWindows) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	reqLogger := logw.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
-	reqLogger.Info("Reconciling Installation.operator.tigera.io")
+	reqLogger.V(2).Info("Reconciling Installation.operator.tigera.io")
 
 	// Get the installation object if it exists so that we can save the original
 	// status before we merge/fill that object with other values.

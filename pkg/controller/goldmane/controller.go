@@ -148,7 +148,7 @@ type Reconciler struct {
 // remove the work from the queue.
 func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
-	reqLogger.Info("Reconciling Goldmane")
+	reqLogger.V(2).Info("Reconciling Goldmane")
 
 	goldmaneCR, err := utils.GetIfExists[operatorv1.Goldmane](ctx, utils.DefaultInstanceKey, r.cli)
 	if err != nil {
@@ -156,7 +156,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 		return reconcile.Result{}, err
 	} else if goldmaneCR == nil {
 		r.status.OnCRNotFound()
-		return reconcile.Result{}, r.maintainFinalizer(ctx, nil)
+		f, err := r.maintainFinalizer(ctx, nil)
+		// If the finalizer is still set, then requeue so we aren't dependent on the periodic reconcile to check and remove the finalizer
+		if f {
+			return reconcile.Result{RequeueAfter: utils.FinalizerRemovalRetry}, nil
+		} else {
+			return reconcile.Result{}, err
+		}
 	}
 	r.status.OnCRFound()
 	// SetMetaData in the TigeraStatus such as observedGenerations.
@@ -194,13 +200,19 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 		return reconcile.Result{}, err
 	}
 
+	nodeCA, err := certificateManager.GetCertificate(r.cli, render.NodeTLSSecretName, common.OperatorNamespace())
+	if err != nil {
+		r.status.SetDegraded(operatorv1.ResourceCreateError, "Error creating TLS certificate", err, log)
+		return reconcile.Result{}, err
+	}
+
 	trustedBundle, err := certificateManager.CreateNamedTrustedBundleFromSecrets(goldmane.GoldmaneDeploymentName, r.cli,
 		common.OperatorNamespace(), false,
 		whisker.WhiskerBackendKeyPairSecret, render.VoltronLinseedPublicCert)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the trusted bundle", err, reqLogger)
 	}
-	trustedBundle.AddCertificates(keyPair)
+	trustedBundle.AddCertificates(keyPair, nodeCA)
 
 	certComponent := rcertificatemanagement.CertificateManagement(&rcertificatemanagement.Config{
 		Namespace:       goldmane.GoldmaneNamespace,
@@ -212,7 +224,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 		TrustedBundle: trustedBundle,
 	})
 
-	if err := r.maintainFinalizer(ctx, goldmaneCR); err != nil {
+	if _, err := r.maintainFinalizer(ctx, goldmaneCR); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error setting finalizer on Installation", err, reqLogger)
 		return reconcile.Result{}, err
 	}
@@ -248,7 +260,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 	return reconcile.Result{}, nil
 }
 
-func (r *Reconciler) maintainFinalizer(ctx context.Context, goldmaneCr client.Object) error {
+func (r *Reconciler) maintainFinalizer(ctx context.Context, goldmaneCr client.Object) (bool, error) {
 	// These objects require graceful termination before the CNI plugin is torn down.
 	goldmaneDeployment := &v1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: common.CalicoNamespace, Name: goldmane.GoldmaneDeploymentName}}
 	return utils.MaintainInstallationFinalizer(ctx, r.cli, goldmaneCr, render.GoldmaneFinalizer, goldmaneDeployment)

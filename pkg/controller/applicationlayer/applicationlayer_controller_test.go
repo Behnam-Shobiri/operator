@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -119,7 +119,6 @@ var _ = Describe("Application layer controller tests", func() {
 			mockStatus.On("AddCronJobs", mock.Anything)
 			mockStatus.On("OnCRNotFound").Return()
 			mockStatus.On("ClearDegraded")
-			mockStatus.On("SetDegraded", "Waiting for LicenseKeyAPI to be ready", "").Return().Maybe()
 			mockStatus.On("ReadyToMonitor")
 			mockStatus.On("SetMetaData", mock.Anything).Return()
 			Expect(c.Create(ctx, installation)).NotTo(HaveOccurred())
@@ -239,7 +238,6 @@ var _ = Describe("Application layer controller tests", func() {
 			mockStatus.On("AddCronJobs", mock.Anything)
 			mockStatus.On("OnCRNotFound").Return()
 			mockStatus.On("ClearDegraded")
-			mockStatus.On("SetDegraded", "Waiting for LicenseKeyAPI to be ready", "").Return().Maybe()
 			mockStatus.On("ReadyToMonitor")
 			mockStatus.On("SetMetaData", mock.Anything).Return()
 			Expect(c.Create(ctx, installation)).NotTo(HaveOccurred())
@@ -271,12 +269,14 @@ var _ = Describe("Application layer controller tests", func() {
 
 			proxy := ds.Spec.Template.Spec.Containers[0]
 			Expect(proxy).ToNot(BeNil())
-			Expect(proxy.Image).To(Equal(fmt.Sprintf("some.registry.org/%s:%s",
+			Expect(proxy.Image).To(Equal(fmt.Sprintf("some.registry.org/%s%s:%s",
+				components.TigeraImagePath,
 				components.ComponentEnvoyProxy.Image, components.ComponentEnvoyProxy.Version)))
 
 			l7collector := ds.Spec.Template.Spec.Containers[1]
 			Expect(l7collector).ToNot(BeNil())
-			Expect(l7collector.Image).To(Equal(fmt.Sprintf("some.registry.org/%s:%s",
+			Expect(l7collector.Image).To(Equal(fmt.Sprintf("some.registry.org/%s%s:%s",
+				components.TigeraImagePath,
 				components.ComponentL7Collector.Image, components.ComponentL7Collector.Version)))
 
 			By("ensuring that felix configuration updated to enabled")
@@ -314,7 +314,6 @@ var _ = Describe("Application layer controller tests", func() {
 			mockStatus.On("AddCronJobs", mock.Anything)
 			mockStatus.On("OnCRNotFound").Return()
 			mockStatus.On("ClearDegraded")
-			mockStatus.On("SetDegraded", "Waiting for LicenseKeyAPI to be ready", "").Return().Maybe()
 			mockStatus.On("ReadyToMonitor")
 			mockStatus.On("SetMetaData", mock.Anything).Return()
 			Expect(c.Create(ctx, installation)).NotTo(HaveOccurred())

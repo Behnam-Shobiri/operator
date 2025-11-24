@@ -26,6 +26,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
+
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
@@ -58,7 +59,9 @@ const (
 )
 
 var (
-	TyphaTLSSecretName   = "typha-certs"
+	TyphaTLSSecretName               = "typha-certs"
+	TyphaTLSSecretNameNonClusterHost = TyphaTLSSecretName + TyphaNonClusterHostSuffix
+
 	TyphaCAConfigMapName = "typha-ca"
 	TyphaCABundleName    = "caBundle"
 )
@@ -235,10 +238,14 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 				Verbs:     []string{"watch", "list"},
 			},
 			{
-				// For enforcing admin network policies.
+				// For enforcing k8s cluster network policies.
 				APIGroups: []string{"policy.networking.k8s.io"},
-				Resources: []string{"adminnetworkpolicies", "baselineadminnetworkpolicies"},
-				Verbs:     []string{"watch", "list"},
+				Resources: []string{
+					"clusternetworkpolicies",
+					"adminnetworkpolicies",
+					"baselineadminnetworkpolicies",
+				},
+				Verbs: []string{"watch", "list"},
 			},
 			{
 				// Metadata from these are used in conjunction with network policy.
@@ -387,11 +394,13 @@ func (c *typhaComponent) typhaDeployment() []client.Object {
 	//   so we shouldn't get a "thundering herd".
 	maxSurge := intstr.FromString("100%")
 
+	typhaContainer := c.typhaContainer()
+
 	annotations := c.cfg.TLS.TrustedBundle.HashAnnotations()
 	annotations[c.cfg.TLS.TyphaSecret.HashAnnotationKey()] = c.cfg.TLS.TyphaSecret.HashAnnotationValue()
 	var initContainers []corev1.Container
 	if c.cfg.TLS.TyphaSecret.UseCertificateManagement() {
-		initContainers = append(initContainers, c.cfg.TLS.TyphaSecret.InitContainer(common.CalicoNamespace))
+		initContainers = append(initContainers, c.cfg.TLS.TyphaSecret.InitContainer(common.CalicoNamespace, typhaContainer.SecurityContext))
 	}
 
 	// Include annotation for prometheus scraping configuration.
@@ -436,7 +445,7 @@ func (c *typhaComponent) typhaDeployment() []client.Object {
 					TerminationGracePeriodSeconds: &terminationGracePeriod,
 					HostNetwork:                   true,
 					InitContainers:                initContainers,
-					Containers:                    []corev1.Container{c.typhaContainer()},
+					Containers:                    []corev1.Container{typhaContainer},
 					Volumes:                       c.volumes(),
 				},
 			},
@@ -459,6 +468,9 @@ func (c *typhaComponent) typhaDeployment() []client.Object {
 		// Create a separate deployment to handle non-cluster host requests.
 		deployNonClusterHost := deploy.DeepCopy()
 		deployNonClusterHost.Name += TyphaNonClusterHostSuffix
+		// Replace Typha secret annotation for NonClusterHost deployment.
+		delete(deployNonClusterHost.Spec.Template.Annotations, c.cfg.TLS.TyphaSecret.HashAnnotationKey())
+		deployNonClusterHost.Spec.Template.Annotations[c.cfg.TLS.TyphaSecretNonClusterHost.HashAnnotationKey()] = c.cfg.TLS.TyphaSecretNonClusterHost.HashAnnotationValue()
 		// Remove the affinity and use pod network
 		deployNonClusterHost.Spec.Template.Spec.Affinity = nil
 		deployNonClusterHost.Spec.Template.Spec.HostNetwork = false
@@ -636,21 +648,28 @@ func (c *typhaComponent) typhaEnvVars(typhaSecret certificatemanagement.KeyPairI
 	return typhaEnv
 }
 
-func (c *typhaComponent) typhaEnvVarsNonClusterHost() []corev1.EnvVar {
-	envVars := c.typhaEnvVars(c.cfg.TLS.TyphaSecretNonClusterHost)
-	// Update Typha client common name for non-cluster host.
-	typhaClientCommonName := c.cfg.TLS.NodeCommonName + TyphaNonClusterHostSuffix
+func replaceOrAppendEnvVar(envVars []corev1.EnvVar, key, value string) []corev1.EnvVar {
 	found := false
-	for i, envVar := range envVars {
-		if envVar.Name == "TYPHA_CLIENTCN" {
-			envVars[i].Value = typhaClientCommonName
+	for i := range envVars {
+		if envVars[i].Name == key {
+			envVars[i].Value = value
 			found = true
-			break
 		}
 	}
-	if !found {
-		envVars = append(envVars, corev1.EnvVar{Name: "TYPHA_CLIENTCN", Value: typhaClientCommonName})
+
+	if !found && value != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: key, Value: value})
 	}
+	return envVars
+}
+
+func (c *typhaComponent) typhaEnvVarsNonClusterHost() []corev1.EnvVar {
+	// Update Typha client common name or URISAN for non-cluster hosts.
+	// At least one of TYPHA_CLIENTCN or TYPHA_CLIENTURISAN must be set.
+	envVars := c.typhaEnvVars(c.cfg.TLS.TyphaSecretNonClusterHost)
+	envVars = replaceOrAppendEnvVar(envVars, "TYPHA_CLIENTCN", c.cfg.TLS.NodeNonClusterHostCommonName)
+	envVars = replaceOrAppendEnvVar(envVars, "TYPHA_CLIENTURISAN", c.cfg.TLS.NodeNonClusterHostURISAN)
+
 	// Tell the health aggregator to listen on all interfaces.
 	envVars = append(envVars, corev1.EnvVar{Name: "TYPHA_HEALTHHOST", Value: "0.0.0.0"})
 	return envVars

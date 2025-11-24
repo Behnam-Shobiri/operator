@@ -87,6 +87,7 @@ func (c *component) ResolveImages(is *operatorv1.ImageSet) error {
 	prefix := c.config.Installation.ImagePrefix
 
 	if c.config.OSType != c.SupportedOSType() {
+		//nolint:staticcheck // Ignore ST1005 error strings should not be capitalized
 		return fmt.Errorf("Egress Gateway is supported only on %s", c.SupportedOSType())
 	}
 
@@ -100,7 +101,6 @@ func (c *component) SupportedOSType() rmeta.OSType {
 }
 
 func (c *component) Objects() ([]client.Object, []client.Object) {
-
 	var objectsToCreate []client.Object
 	objectsToCreate = append(objectsToCreate, c.egwOperatorSecretsRoleBinding())
 	objectsToCreate = append(objectsToCreate, secret.ToRuntimeObjects(c.egwPullSecrets()...)...)
@@ -125,11 +125,11 @@ func (c *component) Objects() ([]client.Object, []client.Object) {
 
 func (c *component) egwOperatorSecretsRoleBinding() *rbacv1.RoleBinding {
 	operatorSecretRB := render.CreateOperatorSecretsRoleBinding(c.config.EgressGW.Namespace)
-	operatorSecretRB.ObjectMeta.Labels = common.MapExistsOrInitialize(operatorSecretRB.ObjectMeta.Labels)
+	operatorSecretRB.Labels = common.MapExistsOrInitialize(operatorSecretRB.Labels)
 	// The tigera-operator-secrets RoleBinding is shared across all EGW CRs in this namespace.
 	// As such, we mark it as having multiple owners so that we maintain multiple owner references
 	// when creating the rolebinding so that it will only be GC'd when all of its owners have been deleted.
-	operatorSecretRB.ObjectMeta.Labels[common.MultipleOwnersLabel] = "true"
+	operatorSecretRB.Labels[common.MultipleOwnersLabel] = "true"
 	return operatorSecretRB
 }
 
@@ -146,7 +146,6 @@ func (c *component) egwDeployment() *appsv1.Deployment {
 			Labels:    c.config.EgressGW.Spec.Template.Metadata.Labels,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: c.config.EgressGW.Spec.Replicas,
 			Selector: &metav1.LabelSelector{MatchLabels: c.config.EgressGW.Spec.Template.Metadata.Labels},
 			Template: *c.deploymentPodTemplate(),
 		},
@@ -302,11 +301,16 @@ func (c *component) egwEnvVars() []corev1.EnvVar {
 func (c *component) egwInitEnvVars() []corev1.EnvVar {
 	egressPodIp := &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}
 	egressPodIps := &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIPs"}}
+	dataplane := "iptables"
+	if c.config.Installation.IsNftables() {
+		dataplane = "nftables"
+	}
 	envVar := []corev1.EnvVar{
 		{Name: "EGRESS_VXLAN_VNI", Value: fmt.Sprintf("%d", c.config.VXLANVNI)},
 		{Name: "EGRESS_VXLAN_PORT", Value: fmt.Sprintf("%d", c.config.VXLANPort)},
 		{Name: "EGRESS_POD_IP", ValueFrom: egressPodIp},
 		{Name: "EGRESS_POD_IPS", ValueFrom: egressPodIps},
+		{Name: "DATAPLANE", Value: dataplane},
 	}
 	if c.config.IptablesBackend != "" {
 		envVar = append(envVar, corev1.EnvVar{Name: "IPTABLES_BACKEND", Value: c.config.IptablesBackend})
@@ -319,11 +323,11 @@ func (c *component) egwPullSecrets() []*corev1.Secret {
 	for _, secret := range c.config.PullSecrets {
 		x := secret.DeepCopy()
 		x.ObjectMeta = metav1.ObjectMeta{Name: secret.Name, Namespace: c.config.EgressGW.Namespace}
-		x.ObjectMeta.Labels = common.MapExistsOrInitialize(x.ObjectMeta.Labels)
+		x.Labels = common.MapExistsOrInitialize(x.Labels)
 		// Each pull secret is shared across all of the EGW deployments in this namespace.
 		// As such, we mark it as having multiple owners so that we maintain multiple owner references
 		// when creating the secret so that it will only be GC'd when all of its owners have been deleted.
-		x.ObjectMeta.Labels[common.MultipleOwnersLabel] = "true"
+		x.Labels[common.MultipleOwnersLabel] = "true"
 		secrets = append(secrets, x)
 	}
 	return secrets

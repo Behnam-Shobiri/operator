@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,14 +22,15 @@ import (
 	"regexp"
 	"strings"
 
+	//nolint:staticcheck // Ignore ST1001 error strings should not be capitalized
 	. "github.com/onsi/gomega"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/tls"
+	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -205,7 +206,7 @@ func GetGlobalResource(resources []client.Object, name, group, version, kind str
 	return nil
 }
 
-func GetContainer(containers []v1.Container, name string) *v1.Container {
+func GetContainer(containers []corev1.Container, name string) *corev1.Container {
 	for _, container := range containers {
 		if container.Name == name {
 			return &container
@@ -242,7 +243,7 @@ func ExpectGlobalAlertTemplateToBePopulated(resource runtime.Object) {
 	}
 }
 
-func ExpectEnv(env []v1.EnvVar, key, value string) {
+func ExpectEnv(env []corev1.EnvVar, key, value string) {
 	for _, e := range env {
 		if e.Name == key {
 			Expect(e.Value).To(Equal(value))
@@ -252,7 +253,7 @@ func ExpectEnv(env []v1.EnvVar, key, value string) {
 	Expect(false).To(BeTrue(), fmt.Sprintf("Missing expected environment variable %s", key))
 }
 
-func ExpectVolumeMount(vms []v1.VolumeMount, name, path string) {
+func ExpectVolumeMount(vms []corev1.VolumeMount, name, path string) {
 	for _, vm := range vms {
 		if vm.Name == name {
 			Expect(vm.MountPath).To(Equal(path))
@@ -298,7 +299,7 @@ func CreateCertSecretWithContent(name, namespace string, keyContent []byte, crtC
 }
 
 func ExpectBundleContents(bundle *corev1.ConfigMap, secrets ...types.NamespacedName) {
-	ExpectWithOffset(1, bundle.Data).To(HaveKey("tigera-ca-bundle.crt"), fmt.Sprintf("Bundle: %+v", bundle))
+	ExpectWithOffset(1, bundle.Data).To(HaveKey(certificatemanagement.TrustedCertConfigMapKeyName), fmt.Sprintf("Bundle: %+v", bundle))
 
 	// Go through and build up all of the secret names from within the bundle.
 	// Keep a list of all the certificates in the bundle in case we need to error it out.
@@ -308,7 +309,7 @@ func ExpectBundleContents(bundle *corev1.ConfigMap, secrets ...types.NamespacedN
 	// the following pattern:
 	// # certificate name: <namespace>/<name>
 	re := regexp.MustCompile(`# certificate name: ([^\s]*)\/([^\s\n]*)`)
-	matches := re.FindAllStringSubmatch(bundle.Data["tigera-ca-bundle.crt"], -1)
+	matches := re.FindAllStringSubmatch(bundle.Data[certificatemanagement.TrustedCertConfigMapKeyName], -1)
 
 	// Go through each match and add it to the list of certs in the bundle.
 	for _, match := range matches {

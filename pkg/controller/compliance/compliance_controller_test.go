@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -86,7 +86,6 @@ var _ = Describe("Compliance controller tests", func() {
 		mockStatus.On("OnCRFound").Return()
 		mockStatus.On("AddCertificateSigningRequests", mock.Anything).Return()
 		mockStatus.On("ClearDegraded")
-		mockStatus.On("SetDegraded", "Waiting for LicenseKeyAPI to be ready", "").Return().Maybe()
 		mockStatus.On("ReadyToMonitor")
 		mockStatus.On("SetMetaData", mock.Anything).Return()
 
@@ -107,6 +106,9 @@ var _ = Describe("Compliance controller tests", func() {
 			Spec: operatorv1.InstallationSpec{
 				Variant:  operatorv1.TigeraSecureEnterprise,
 				Registry: "some.registry.org/",
+				ImagePullSecrets: []corev1.LocalObjectReference{{
+					Name: "tigera-pull-secret",
+				}},
 			},
 			Status: operatorv1.InstallationStatus{
 				Variant: operatorv1.TigeraSecureEnterprise,
@@ -126,6 +128,7 @@ var _ = Describe("Compliance controller tests", func() {
 		Expect(c.Create(ctx, &operatorv1.APIServer{ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure"}, Status: operatorv1.APIServerStatus{State: operatorv1.TigeraStatusReady}})).NotTo(HaveOccurred())
 		Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
 		Expect(c.Create(ctx, &v3.LicenseKey{ObjectMeta: metav1.ObjectMeta{Name: "default"}, Status: v3.LicenseKeyStatus{Features: []string{common.ComplianceFeature}}})).NotTo(HaveOccurred())
+		Expect(c.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tigera-pull-secret", Namespace: common.OperatorNamespace()}})).NotTo(HaveOccurred())
 
 		certificateManager, err := certificatemanager.Create(c, nil, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
@@ -155,7 +158,7 @@ var _ = Describe("Compliance controller tests", func() {
 		By("reconciling when clustertype is Standalone")
 		result, err := r.Reconcile(ctx, reconcile.Request{})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.Requeue).NotTo(BeTrue())
+		Expect(result.RequeueAfter > 0).NotTo(BeTrue())
 
 		dpl := appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{},
@@ -193,7 +196,7 @@ var _ = Describe("Compliance controller tests", func() {
 		By("reconciling when clustertype is Standalone")
 		result, err := r.Reconcile(ctx, reconcile.Request{})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.Requeue).NotTo(BeTrue())
+		Expect(result.RequeueAfter > 0).NotTo(BeTrue())
 
 		By("replacing the server certs with user-supplied certs")
 		Expect(c.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
@@ -222,7 +225,7 @@ var _ = Describe("Compliance controller tests", func() {
 		By("checking that an error occurred and the cert didn't change")
 		result, err = r.Reconcile(ctx, reconcile.Request{})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.Requeue).NotTo(BeTrue())
+		Expect(result.RequeueAfter > 0).NotTo(BeTrue())
 		assertExpectedCertDNSNames(c, oldDNSNames...)
 	})
 
@@ -230,7 +233,7 @@ var _ = Describe("Compliance controller tests", func() {
 		By("reconciling when clustertype is Standalone")
 		result, err := r.Reconcile(ctx, reconcile.Request{})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.Requeue).NotTo(BeTrue())
+		Expect(result.RequeueAfter > 0).NotTo(BeTrue())
 
 		By("replacing the server certs with ones that include the expected DNS names")
 		Expect(c.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
@@ -259,7 +262,7 @@ var _ = Describe("Compliance controller tests", func() {
 		By("checking that an error occurred and the cert didn't change")
 		result, err = r.Reconcile(ctx, reconcile.Request{})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.Requeue).NotTo(BeTrue())
+		Expect(result.RequeueAfter > 0).NotTo(BeTrue())
 		assertExpectedCertDNSNames(c, dnsNames...)
 	})
 
@@ -296,7 +299,7 @@ var _ = Describe("Compliance controller tests", func() {
 		By("reconciling when clustertype is Standalone")
 		result, err := r.Reconcile(ctx, reconcile.Request{})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.Requeue).NotTo(BeTrue())
+		Expect(result.RequeueAfter > 0).NotTo(BeTrue())
 
 		By("creating a compliance-server deployment")
 		dpl := appsv1.Deployment{
@@ -379,6 +382,45 @@ var _ = Describe("Compliance controller tests", func() {
 		Expect(crb.Subjects).To(HaveLen(1))
 	})
 
+	It("create namespace, operator secrets role and pull secrets", func() {
+		result, err := r.Reconcile(ctx, reconcile.Request{})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.RequeueAfter).To(Equal(0 * time.Second))
+
+		// Expect namespace to be created
+		namespace := corev1.Namespace{
+			TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+		}
+		Expect(c.Get(ctx, client.ObjectKey{
+			Name: render.ComplianceNamespace,
+		}, &namespace)).NotTo(HaveOccurred())
+		Expect(namespace.Labels["pod-security.kubernetes.io/enforce"]).To(Equal("privileged"))
+		Expect(namespace.Labels["pod-security.kubernetes.io/enforce-version"]).To(Equal("latest"))
+
+		// Expect operator rolebinding to be created
+		rb := rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{},
+		}
+		Expect(c.Get(ctx, client.ObjectKey{
+			Name:      render.TigeraOperatorSecrets,
+			Namespace: render.ComplianceNamespace,
+		}, &rb)).NotTo(HaveOccurred())
+		Expect(rb.OwnerReferences).To(HaveLen(1))
+		Expect(rb.OwnerReferences[0].Kind).To(Equal("Compliance"))
+
+		// Expect pull secrets to be created
+		pullSecrets := corev1.Secret{
+			TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+		}
+		Expect(c.Get(ctx, client.ObjectKey{
+			Name:      "tigera-pull-secret",
+			Namespace: render.ComplianceNamespace,
+		}, &pullSecrets)).NotTo(HaveOccurred())
+		Expect(pullSecrets.OwnerReferences).To(HaveLen(1))
+		pullSecret := pullSecrets.OwnerReferences[0]
+		Expect(pullSecret.Kind).To(Equal("Compliance"))
+	})
+
 	Context("image reconciliation", func() {
 		It("should use builtin images", func() {
 			_, err := r.Reconcile(ctx, reconcile.Request{})
@@ -401,7 +443,8 @@ var _ = Describe("Compliance controller tests", func() {
 			controller := test.GetContainer(d.Spec.Template.Spec.Containers, render.ComplianceControllerName)
 			Expect(controller).ToNot(BeNil())
 			Expect(controller.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s:%s",
+				fmt.Sprintf("some.registry.org/%s%s:%s",
+					components.TigeraImagePath,
 					components.ComponentComplianceController.Image,
 					components.ComponentComplianceController.Version)))
 
@@ -417,7 +460,8 @@ var _ = Describe("Compliance controller tests", func() {
 			reporter := test.GetContainer(pt.Template.Spec.Containers, "reporter")
 			Expect(reporter).ToNot(BeNil())
 			Expect(reporter.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s:%s",
+				fmt.Sprintf("some.registry.org/%s%s:%s",
+					components.TigeraImagePath,
 					components.ComponentComplianceReporter.Image,
 					components.ComponentComplianceReporter.Version)))
 
@@ -433,7 +477,8 @@ var _ = Describe("Compliance controller tests", func() {
 			snap := test.GetContainer(d.Spec.Template.Spec.Containers, render.ComplianceSnapshotterName)
 			Expect(snap).ToNot(BeNil())
 			Expect(snap.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s:%s",
+				fmt.Sprintf("some.registry.org/%s%s:%s",
+					components.TigeraImagePath,
 					components.ComponentComplianceSnapshotter.Image,
 					components.ComponentComplianceSnapshotter.Version)))
 
@@ -449,7 +494,8 @@ var _ = Describe("Compliance controller tests", func() {
 			bench := test.GetContainer(ds.Spec.Template.Spec.Containers, "compliance-benchmarker")
 			Expect(bench).ToNot(BeNil())
 			Expect(bench.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s:%s",
+				fmt.Sprintf("some.registry.org/%s%s:%s",
+					components.TigeraImagePath,
 					components.ComponentComplianceBenchmarker.Image,
 					components.ComponentComplianceBenchmarker.Version)))
 
@@ -465,7 +511,8 @@ var _ = Describe("Compliance controller tests", func() {
 			server := test.GetContainer(d.Spec.Template.Spec.Containers, render.ComplianceServerName)
 			Expect(server).ToNot(BeNil())
 			Expect(server.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s:%s",
+				fmt.Sprintf("some.registry.org/%s%s:%s",
+					components.TigeraImagePath,
 					components.ComponentComplianceServer.Image,
 					components.ComponentComplianceServer.Version)))
 		})
@@ -499,7 +546,8 @@ var _ = Describe("Compliance controller tests", func() {
 			controller := test.GetContainer(d.Spec.Template.Spec.Containers, render.ComplianceControllerName)
 			Expect(controller).ToNot(BeNil())
 			Expect(controller.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s@%s",
+				fmt.Sprintf("some.registry.org/%s%s@%s",
+					components.TigeraImagePath,
 					components.ComponentComplianceController.Image,
 					"sha256:controllerhash")))
 
@@ -515,7 +563,8 @@ var _ = Describe("Compliance controller tests", func() {
 			reporter := test.GetContainer(pt.Template.Spec.Containers, "reporter")
 			Expect(reporter).ToNot(BeNil())
 			Expect(reporter.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s@%s",
+				fmt.Sprintf("some.registry.org/%s%s@%s",
+					components.TigeraImagePath,
 					components.ComponentComplianceReporter.Image,
 					"sha256:reporterhash")))
 
@@ -531,7 +580,8 @@ var _ = Describe("Compliance controller tests", func() {
 			snap := test.GetContainer(d.Spec.Template.Spec.Containers, render.ComplianceSnapshotterName)
 			Expect(snap).ToNot(BeNil())
 			Expect(snap.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s@%s",
+				fmt.Sprintf("some.registry.org/%s%s@%s",
+					components.TigeraImagePath,
 					components.ComponentComplianceSnapshotter.Image,
 					"sha256:snapshotterhash")))
 
@@ -547,7 +597,8 @@ var _ = Describe("Compliance controller tests", func() {
 			bench := test.GetContainer(ds.Spec.Template.Spec.Containers, "compliance-benchmarker")
 			Expect(bench).ToNot(BeNil())
 			Expect(bench.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s@%s",
+				fmt.Sprintf("some.registry.org/%s%s@%s",
+					components.TigeraImagePath,
 					components.ComponentComplianceBenchmarker.Image,
 					"sha256:benchmarkerhash")))
 
@@ -563,7 +614,8 @@ var _ = Describe("Compliance controller tests", func() {
 			server := test.GetContainer(d.Spec.Template.Spec.Containers, render.ComplianceServerName)
 			Expect(server).ToNot(BeNil())
 			Expect(server.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s@%s",
+				fmt.Sprintf("some.registry.org/%s%s@%s",
+					components.TigeraImagePath,
 					components.ComponentComplianceServer.Image,
 					"sha256:serverhash")))
 		})
@@ -964,6 +1016,64 @@ var _ = Describe("Compliance controller tests", func() {
 
 			err = test.GetResource(c, &tenantBServiceAccount)
 			Expect(err).ShouldNot(HaveOccurred())
+		})
+
+		It("create operator secrets role and pull secrets", func() {
+			// Create the Tenant resources for tenant-a
+			tenantA := &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "default",
+					Namespace: tenantANamespace,
+				},
+				Spec: operatorv1.TenantSpec{ID: "tenant-a"},
+			}
+			Expect(c.Create(ctx, tenantA)).NotTo(HaveOccurred())
+
+			certificateManagerTenantA, err := certificatemanager.Create(c, nil, dns.DefaultClusterDomain, tenantANamespace, certificatemanager.AllowCACreation(), certificatemanager.WithTenant(tenantA))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, certificateManagerTenantA.KeyPair().Secret(tenantANamespace)))
+			trustedBundleWithSystemCAsTenantA, err := certificateManagerTenantA.CreateMultiTenantTrustedBundleWithSystemRootCertificates()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, trustedBundleWithSystemCAsTenantA.ConfigMap(tenantANamespace))).NotTo(HaveOccurred())
+
+			linseedTLSTenantA, err := certificateManagerTenantA.GetOrCreateKeyPair(c, render.TigeraLinseedSecret, tenantANamespace, []string{render.TigeraLinseedSecret})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, linseedTLSTenantA.Secret(tenantANamespace))).NotTo(HaveOccurred())
+
+			Expect(c.Create(ctx, &operatorv1.Compliance{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "tigera-secure",
+					Namespace: tenantANamespace,
+				},
+			})).NotTo(HaveOccurred())
+
+			result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: tenantANamespace}})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(0 * time.Second))
+
+			// Expect operator role binding to be created
+			rb := rbacv1.RoleBinding{
+				ObjectMeta: metav1.ObjectMeta{},
+			}
+			Expect(c.Get(ctx, client.ObjectKey{
+				Name:      render.TigeraOperatorSecrets,
+				Namespace: tenantANamespace,
+			}, &rb)).NotTo(HaveOccurred())
+			Expect(rb.OwnerReferences).To(HaveLen(1))
+			ownerRoleBinding := rb.OwnerReferences[0]
+			Expect(ownerRoleBinding.Kind).To(Equal("Tenant"))
+
+			// Expect pull secrets to be created
+			pullSecrets := corev1.Secret{
+				TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+			}
+			Expect(c.Get(ctx, client.ObjectKey{
+				Name:      "tigera-pull-secret",
+				Namespace: tenantANamespace,
+			}, &pullSecrets)).NotTo(HaveOccurred())
+			Expect(pullSecrets.OwnerReferences).To(HaveLen(1))
+			ownerPullSecrets := pullSecrets.OwnerReferences[0]
+			Expect(ownerPullSecrets.Kind).To(Equal("Tenant"))
 		})
 	})
 })

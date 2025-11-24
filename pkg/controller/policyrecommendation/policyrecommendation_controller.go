@@ -340,12 +340,12 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 	}
 
 	// Create a component handler to manage the rendered component.
-	handler := utils.NewComponentHandler(log, r.client, r.scheme, policyRecommendation)
+	defaultHandler := utils.NewComponentHandler(log, r.client, r.scheme, policyRecommendation)
 
 	// Determine the namespaces to which we must bind the cluster role.
 	// For multi-tenant, the cluster role will be bind to the service account in the tenant namespace
-	// For single-tenant or zero-tenant, the cluster role will be bind to the service account in the tigera-policy-recommendation
-	// namespace
+	// For single-tenant or zero-tenant, the cluster role will be bind to the tigera-policy-recommendation service account
+	// in the calico-system namespace
 	bindNamespaces, err := helper.TenantNamespaces(r.client)
 	if err != nil {
 		return reconcile.Result{}, err
@@ -398,10 +398,23 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 		certificateManager.AddToStatusManager(r.status, helper.InstallNamespace())
 
 		if !r.multiTenant {
-			// Zero-tenant and single tenant setups install resources inside tigera-policy-recommendation namespace. Thus,
-			// we need to create a tigera-ca-bundle inside this namespace in order to allow communication with Linseed
-			trustedBundleRW = certificateManager.CreateTrustedBundle(managerInternalTLSSecret, linseedCertificate)
+			// Zero-tenant and single tenant setups install resources inside calico-system namespace. Thus,
+			// we need to create a tigera-ca-bundle (named policy-recommendation-ca-bundle) inside this namespace in order to allow communication with Linseed
+			trustedBundleRW, err = certificateManager.CreateNamedTrustedBundleFromSecrets(ResourceName, r.client,
+				helper.TruthNamespace(), false)
+			if err != nil {
+				// CreateNamedTrustedBundleFromSecrets panics if it encounters an error during creation,
+				// so the only error returned here would be from trying to retrieve the certificate.
+				r.status.SetDegraded(operatorv1.CertificateReadError, "Unable to fetch the trusted bundle", err, logc)
+				return reconcile.Result{}, err
+			}
+
+			// Multi-tenant setups need to use the config map that was created by pkg/controller/secrets/tenant_controller.go
+			// in the tenant namespace. This parameter will be set only for non multitenant.
+			trustedBundleRW.AddCertificates(managerInternalTLSSecret)
+			trustedBundleRW.AddCertificates(linseedCertificate)
 			trustedBundleRO = trustedBundleRW.(certificatemanagement.TrustedBundleRO)
+
 		} else {
 			// Multi-tenant setups need to load the bundle the created by pkg/controller/secrets/tenant_controller.go
 			trustedBundleRO, err = certificateManager.LoadTrustedBundle(ctx, r.client, helper.InstallNamespace())
@@ -419,8 +432,8 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 				KeyPairOptions: []rcertificatemanagement.KeyPairOption{
 					rcertificatemanagement.NewKeyPairOption(policyRecommendationKeyPair, true, true),
 				},
-				// Zero and single tenant setups need to create tigera-ca-bundle configmap because we install resources
-				// in namespace tigera-policy-recommendation
+				// Zero and single tenant setups need to create tigera-ca-bundle (named policy-recommendation-ca-bundle) configmap because we install resources
+				// in namespace calico-system
 				// Multi-tenant setups need to use the config map that was created by pkg/controller/secrets/tenant_controller.go
 				// in the tenant namespace. This parameter needs to be nil in this case
 				TrustedBundle: trustedBundleRW,
@@ -460,8 +473,9 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 
 	// Prepend PolicyRecommendation before certificate creation
 	components = append([]render.Component{component}, components...)
+
 	for _, cmp := range components {
-		if err := handler.CreateOrUpdateOrDelete(context.Background(), cmp, r.status); err != nil {
+		if err := defaultHandler.CreateOrUpdateOrDelete(context.Background(), cmp, r.status); err != nil {
 			r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating resource", err, logc)
 			return reconcile.Result{}, err
 		}
@@ -506,7 +520,7 @@ func (r *ReconcilePolicyRecommendation) createDefaultPolicyRecommendationScope(c
 		prs = &v3.PolicyRecommendationScope{}
 	}
 
-	prs.ObjectMeta.Name = "default"
+	prs.Name = "default"
 	prs.Spec.NamespaceSpec.RecStatus = "Disabled"
 	prs.Spec.NamespaceSpec.Selector = "!(projectcalico.org/name starts with 'tigera-') && !(projectcalico.org/name starts with 'calico-') && !(projectcalico.org/name starts with 'kube-')"
 	if r.provider.IsOpenShift() {

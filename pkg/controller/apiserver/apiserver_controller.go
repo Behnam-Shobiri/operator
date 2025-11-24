@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 
+	v1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -49,7 +50,6 @@ import (
 	"github.com/tigera/operator/pkg/render"
 	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
 	"github.com/tigera/operator/pkg/render/common/authentication"
-	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/monitor"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
@@ -75,7 +75,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, opts.K8sClientset, log, r.tierWatchReady)
 
 		go utils.WaitToAddNetworkPolicyWatches(c, opts.K8sClientset, log, []types.NamespacedName{
-			{Name: render.APIServerPolicyName, Namespace: rmeta.APIServerNamespace(operatorv1.TigeraSecureEnterprise)},
+			{Name: render.APIServerPolicyName, Namespace: render.APIServerNamespace},
 		})
 	}
 
@@ -136,7 +136,7 @@ func add(c ctrlruntime.Controller, r *ReconcileAPIServer) error {
 			return fmt.Errorf("apiserver-controller failed to watch primary resource: %v", err)
 		}
 
-		for _, namespace := range []string{common.OperatorNamespace(), rmeta.APIServerNamespace(operatorv1.TigeraSecureEnterprise)} {
+		for _, namespace := range []string{common.OperatorNamespace(), render.APIServerNamespace} {
 			for _, secretName := range []string{render.VoltronTunnelSecretName, render.ManagerTLSSecretName} {
 				if err = utils.AddSecretsWatch(c, secretName, namespace); err != nil {
 					return fmt.Errorf("apiserver-controller failed to watch the Secret resource: %v", err)
@@ -153,28 +153,42 @@ func add(c ctrlruntime.Controller, r *ReconcileAPIServer) error {
 	}
 
 	// Watch for the namespace(s) managed by this controller.
-	if err = c.WatchObject(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: rmeta.APIServerNamespace(operatorv1.Calico)}}, &handler.EnqueueRequestForObject{}); err != nil {
-		return fmt.Errorf("apiserver-controller failed to watch resource: %w", err)
-	}
-	if err = c.WatchObject(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: rmeta.APIServerNamespace(operatorv1.TigeraSecureEnterprise)}}, &handler.EnqueueRequestForObject{}); err != nil {
+	if err = c.WatchObject(&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: render.APIServerNamespace}}, &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("apiserver-controller failed to watch resource: %w", err)
 	}
 
 	for _, secretName := range []string{
-		"calico-apiserver-certs", "tigera-apiserver-certs",
-		certificatemanagement.CASecretName, render.DexTLSSecretName, monitor.PrometheusClientTLSSecretName,
+		"calico-apiserver-certs",
+		certificatemanagement.CASecretName,
+		render.DexTLSSecretName,
+		monitor.PrometheusClientTLSSecretName,
 	} {
 		if err = utils.AddSecretsWatch(c, secretName, common.OperatorNamespace()); err != nil {
 			return fmt.Errorf("apiserver-controller failed to watch the Secret resource: %v", err)
 		}
 	}
 
+	// Watch for changes to objects created by this controller.
+	if err = utils.AddDeploymentWatch(c, "tigera-apiserver", "calico-system"); err != nil {
+		return fmt.Errorf("apiserver-controller failed to watch Deployment: %w", err)
+	}
+	if err = utils.AddDeploymentWatch(c, "calico-apiserver", "calico-apiserver"); err != nil {
+		return fmt.Errorf("apiserver-controller failed to watch Deployment: %w", err)
+	}
+
 	if err = imageset.AddImageSetWatch(c); err != nil {
 		return fmt.Errorf("apiserver-controller failed to watch ImageSet: %w", err)
 	}
+
 	// Watch for changes to TigeraStatus.
 	if err = utils.AddTigeraStatusWatch(c, ResourceName); err != nil {
 		return fmt.Errorf("apiserver-controller failed to watch apiserver Tigerastatus: %w", err)
+	}
+
+	// Perform periodic reconciliation. This acts as a backstop to catch reconcile issues,
+	// and also makes sure we spot when things change that might not trigger a reconciliation.
+	if err = utils.AddPeriodicReconcile(c, utils.PeriodicReconcileTime, &handler.EnqueueRequestForObject{}); err != nil {
+		return fmt.Errorf("apiserver-controller failed to create periodic reconcile watch: %w", err)
 	}
 
 	log.V(5).Info("Controller created and Watches setup")
@@ -206,14 +220,20 @@ type ReconcileAPIServer struct {
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
-	reqLogger.Info("Reconciling APIServer")
+	reqLogger.V(2).Info("Reconciling APIServer")
 
 	instance, msg, err := utils.GetAPIServer(ctx, r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			reqLogger.Info("APIServer config not found")
 			r.status.OnCRNotFound()
-			return reconcile.Result{}, r.maintainFinalizer(ctx, nil)
+			f, err := r.maintainFinalizer(ctx, nil)
+			// If the finalizer is still set, then requeue so we aren't dependent on the periodic reconcile to check and remove the finalizer
+			if f {
+				return reconcile.Result{RequeueAfter: utils.FinalizerRemovalRetry}, nil
+			} else {
+				return reconcile.Result{}, err
+			}
 		}
 		r.status.SetDegraded(operatorv1.ResourceReadError, fmt.Sprintf("An error occurred when querying the APIServer resource: %s", msg), err, reqLogger)
 		return reconcile.Result{}, err
@@ -258,7 +278,6 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for Installation Variant to be set", nil, reqLogger)
 		return reconcile.Result{}, nil
 	}
-	ns := rmeta.APIServerNamespace(installationSpec.Variant)
 
 	certificateManager, err := certificatemanager.Create(r.client, installationSpec, r.clusterDomain, common.OperatorNamespace())
 	if err != nil {
@@ -266,15 +285,24 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 		return reconcile.Result{}, err
 	}
 
-	// We need separate certificates for OSS vs Enterprise.
-	secretName := render.ProjectCalicoAPIServerTLSSecretName(installationSpec.Variant)
-	tlsSecret, err := certificateManager.GetOrCreateKeyPair(r.client, secretName, common.OperatorNamespace(), dns.GetServiceDNSNames(render.ProjectCalicoAPIServerServiceName(installationSpec.Variant), rmeta.APIServerNamespace(installationSpec.Variant), r.clusterDomain))
+	secretName := render.CalicoAPIServerTLSSecretName
+	tlsSecret, err := certificateManager.GetOrCreateKeyPair(r.client, secretName, common.OperatorNamespace(), dns.GetServiceDNSNames(render.APIServerServiceName, render.APIServerNamespace, r.clusterDomain))
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to get or create tls key pair", err, reqLogger)
 		return reconcile.Result{}, err
 	}
 
-	certificateManager.AddToStatusManager(r.status, ns)
+	// Since apiserver and queryserver may have different UID:GID at run-time, we need to produce this secret in separate volumes and with different permissions.
+	var queryServerTLSSecretCertificateManagementOnly certificatemanagement.KeyPairInterface
+	if installationSpec.CertificateManagement != nil {
+		queryServerTLSSecretCertificateManagementOnly, err = certificateManager.GetOrCreateKeyPair(r.client, "query-server-tls", common.OperatorNamespace(), dns.GetServiceDNSNames(render.APIServerServiceName, render.APIServerNamespace, r.clusterDomain))
+		if err != nil {
+			r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to get or create tls key pair", err, reqLogger)
+			return reconcile.Result{}, err
+		}
+	}
+
+	certificateManager.AddToStatusManager(r.status, render.APIServerNamespace)
 
 	pullSecrets, err := utils.GetNetworkingPullSecrets(installationSpec, r.client)
 	if err != nil {
@@ -290,8 +318,15 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 	var managementClusterConnection *operatorv1.ManagementClusterConnection
 	var keyValidatorConfig authentication.KeyValidatorConfig
 	includeV3NetworkPolicy := false
+
 	if installationSpec.Variant == operatorv1.TigeraSecureEnterprise {
-		trustedBundle = certificateManager.CreateTrustedBundle()
+		trustedBundle, err = certificateManager.CreateNamedTrustedBundleFromSecrets(render.APIServerResourceName, r.client,
+			common.OperatorNamespace(), false)
+		if err != nil {
+			r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the trusted bundle", err, reqLogger)
+			return reconcile.Result{}, err
+		}
+
 		applicationLayer, err = utils.GetApplicationLayer(ctx, r.client)
 		if err != nil {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Error reading ApplicationLayer", err, reqLogger)
@@ -321,7 +356,7 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 		if managementCluster != nil && managementCluster.Spec.TLS != nil && !r.multiTenant {
 			// The secret that contains the CA x509 certificate to create client certificates for the managed cluster
 			// is created by the Manager controller in tigera-operator namespace. We will read this secret and make
-			// sure it is available in the same namespace as the API server (tigera-system)
+			// sure it is available in the same namespace as the API server (calico-system)
 			// This secret is only created for a management cluster in a multi-cluster setup for a single tenant.
 			// Other cluster types do not require this secret. (Standalone configuration do not need it and multi-tenant
 			// configuration create secrets inside the tenant namespaces)
@@ -403,7 +438,7 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 	}
 
 	// API server exists and configuration is valid - maintain a Finalizer on the installation.
-	if err := r.maintainFinalizer(ctx, instance); err != nil {
+	if _, err := r.maintainFinalizer(ctx, instance); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error setting finalizer on Installation", err, reqLogger)
 		return reconcile.Result{}, err
 	}
@@ -429,25 +464,10 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 		MultiTenant:                 r.multiTenant,
 		KeyValidatorConfig:          keyValidatorConfig,
 		KubernetesVersion:           r.kubernetesVersion,
+		QueryServerTLSKeyPairCertificateManagementOnly: queryServerTLSSecretCertificateManagementOnly,
 	}
 
-	component, err := render.APIServer(&apiServerCfg)
-	if err != nil {
-		r.status.SetDegraded(operatorv1.ResourceRenderingError, "Error rendering APIServer", err, reqLogger)
-		return reconcile.Result{}, err
-	}
-	components := []render.Component{
-		component,
-		rcertificatemanagement.CertificateManagement(&rcertificatemanagement.Config{
-			Namespace:       rmeta.APIServerNamespace(installationSpec.Variant),
-			ServiceAccounts: []string{render.APIServerServiceAccountName(installationSpec.Variant)},
-			KeyPairOptions: []rcertificatemanagement.KeyPairOption{
-				rcertificatemanagement.NewKeyPairOption(tlsSecret, true, true),
-				rcertificatemanagement.NewKeyPairOption(tunnelCAKeyPair, false, true),
-			},
-			TrustedBundle: trustedBundle,
-		}),
-	}
+	var components []render.Component
 
 	// v3 NetworkPolicy will fail to reconcile if the API server deployment is unhealthy. In case the API Server
 	// deployment becomes unhealthy and reconciliation of non-NetworkPolicy resources in the apiserver controller
@@ -455,6 +475,25 @@ func (r *ReconcileAPIServer) Reconcile(ctx context.Context, request reconcile.Re
 	if includeV3NetworkPolicy {
 		components = append(components, render.APIServerPolicy(&apiServerCfg))
 	}
+
+	component, err := render.APIServer(&apiServerCfg)
+	if err != nil {
+		r.status.SetDegraded(operatorv1.ResourceRenderingError, "Error rendering APIServer", err, reqLogger)
+		return reconcile.Result{}, err
+	}
+
+	components = append(components,
+		component,
+		rcertificatemanagement.CertificateManagement(&rcertificatemanagement.Config{
+			Namespace:       render.APIServerNamespace,
+			ServiceAccounts: []string{render.APIServerServiceAccountName},
+			KeyPairOptions: []rcertificatemanagement.KeyPairOption{
+				rcertificatemanagement.NewKeyPairOption(tlsSecret, true, true),
+				rcertificatemanagement.NewKeyPairOption(tunnelCAKeyPair, false, true),
+			},
+			TrustedBundle: trustedBundle,
+		}),
+	)
 
 	if err = imageset.ApplyImageSet(ctx, r.client, installationSpec.Variant, components...); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error with images from ImageSet", err, reqLogger)
@@ -499,12 +538,9 @@ func validateAPIServerResource(instance *operatorv1.APIServer) error {
 // We add a finalizer to the Installation when the API server has been installed, and only remove that finalizer when
 // the API server has been deleted and its pods have stopped running. This allows for a graceful cleanup of API server resources
 // prior to the CNI plugin being removed.
-func (r *ReconcileAPIServer) maintainFinalizer(ctx context.Context, apiserver client.Object) error {
+// The bool return value indicates if the finalizer is Set
+func (r *ReconcileAPIServer) maintainFinalizer(ctx context.Context, apiserver client.Object) (bool, error) {
 	// These objects require graceful termination before the CNI plugin is torn down.
-	_, spec, err := utils.GetInstallation(context.Background(), r.client)
-	if err != nil {
-		return err
-	}
-	apiServerNamespace := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: rmeta.APIServerNamespace(spec.Variant)}}
-	return utils.MaintainInstallationFinalizer(ctx, r.client, apiserver, render.APIServerFinalizer, apiServerNamespace)
+	apiServerDeployment := v1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver", Namespace: render.APIServerNamespace}}
+	return utils.MaintainInstallationFinalizer(ctx, r.client, apiserver, render.APIServerFinalizer, &apiServerDeployment)
 }

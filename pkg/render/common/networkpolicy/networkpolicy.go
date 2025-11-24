@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ import (
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	"github.com/tigera/api/pkg/lib/numorstring"
 	operatorv1 "github.com/tigera/operator/api/v1"
-	"github.com/tigera/operator/pkg/render/common/meta"
+	"github.com/tigera/operator/pkg/common"
 )
 
 const (
@@ -282,11 +282,11 @@ func (h *NetworkPolicyHelper) ManagerSourceEntityRule() v3.EntityRule {
 }
 
 func (h *NetworkPolicyHelper) APIServerSourceEntityRule(v operatorv1.ProductVariant) v3.EntityRule {
-	return CreateSourceEntityRule(h.namespace(meta.APIServerNamespace(v)), meta.APIServerDeploymentName(v))
+	return CreateSourceEntityRule(h.namespace("calico-system"), "calico-apiserver")
 }
 
 func (h *NetworkPolicyHelper) PolicyRecommendationSourceEntityRule() v3.EntityRule {
-	return CreateSourceEntityRule(h.namespace("tigera-policy-recommendation"), "tigera-policy-recommendation")
+	return CreateSourceEntityRule(h.namespace(common.CalicoNamespace), "tigera-policy-recommendation")
 }
 
 func (h *NetworkPolicyHelper) ComplianceServerEntityRule() v3.EntityRule {

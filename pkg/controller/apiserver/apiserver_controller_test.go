@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,11 +19,10 @@ import (
 	"fmt"
 	"time"
 
-	kerror "k8s.io/apimachinery/pkg/api/errors"
-
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
+	kerror "k8s.io/apimachinery/pkg/api/errors"
 
 	admregv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -113,7 +112,7 @@ var _ = Describe("apiserver controller tests", func() {
 		Expect(cli.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
 		cryptoCA, err := tls.MakeCA("byo-ca")
 		Expect(err).NotTo(HaveOccurred())
-		apiSecret, err = secret.CreateTLSSecret(cryptoCA, "tigera-apiserver-certs", common.OperatorNamespace(), "key.key", "cert.crt", time.Hour, nil, dns.GetServiceDNSNames(render.ProjectCalicoAPIServerServiceName(operatorv1.TigeraSecureEnterprise), "tigera-system", dns.DefaultClusterDomain)...)
+		apiSecret, err = secret.CreateTLSSecret(cryptoCA, "calico-apiserver-certs", common.OperatorNamespace(), "key.key", "cert.crt", time.Hour, nil, dns.GetServiceDNSNames(render.APIServerServiceName, "calico-system", dns.DefaultClusterDomain)...)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(cli.Create(ctx, &operatorv1.Authentication{
 			ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure"},
@@ -151,11 +150,11 @@ var _ = Describe("apiserver controller tests", func() {
 		mockStatus.On("ClearDegraded")
 		mockStatus.On("AddCertificateSigningRequests", mock.Anything)
 		mockStatus.On("RemoveCertificateSigningRequests", mock.Anything)
+		mockStatus.On("RemoveDeployments", mock.Anything)
 		mockStatus.On("ReadyToMonitor")
 		mockStatus.On("SetMetaData", mock.Anything).Return()
 		mockStatus.On("SetDegraded", operatorv1.ResourceReadError, mock.Anything, mock.Anything, mock.Anything).Return().Maybe()
 		mockStatus.On("SetDegraded", operatorv1.ResourceNotReady, mock.Anything, mock.Anything, mock.Anything).Return().Maybe()
-
 	})
 
 	Context("verify reconciliation", func() {
@@ -177,8 +176,8 @@ var _ = Describe("apiserver controller tests", func() {
 			d := appsv1.Deployment{
 				TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "v1"},
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "tigera-apiserver",
-					Namespace: "tigera-system",
+					Name:      "calico-apiserver",
+					Namespace: "calico-system",
 				},
 			}
 			Expect(test.GetResource(cli, &d)).To(BeNil())
@@ -186,23 +185,25 @@ var _ = Describe("apiserver controller tests", func() {
 			apiserver := test.GetContainer(d.Spec.Template.Spec.Containers, "calico-apiserver")
 			Expect(apiserver).ToNot(BeNil())
 			Expect(apiserver.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s:%s",
+				fmt.Sprintf("some.registry.org/%s%s:%s",
+					components.TigeraImagePath,
 					components.ComponentAPIServer.Image,
 					components.ComponentAPIServer.Version)))
 			qserver := test.GetContainer(d.Spec.Template.Spec.Containers, "tigera-queryserver")
 			Expect(qserver).ToNot(BeNil())
 			Expect(qserver.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s:%s",
+				fmt.Sprintf("some.registry.org/%s%s:%s",
+					components.TigeraImagePath,
 					components.ComponentQueryServer.Image,
 					components.ComponentQueryServer.Version)))
-			Expect(d.Spec.Template.Spec.InitContainers).To(HaveLen(1))
+			Expect(d.Spec.Template.Spec.InitContainers).To(HaveLen(2))
 			csrinit := test.GetContainer(d.Spec.Template.Spec.InitContainers, "calico-apiserver-certs-key-cert-provisioner")
 			Expect(csrinit).ToNot(BeNil())
 			Expect(csrinit.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s:%s",
+				fmt.Sprintf("some.registry.org/%s%s:%s",
+					components.TigeraImagePath,
 					components.ComponentTigeraCSRInitContainer.Image,
 					components.ComponentTigeraCSRInitContainer.Version)))
-
 		})
 		It("should use images from imageset", func() {
 			installation.Spec.CertificateManagement = certificateManagement
@@ -212,8 +213,8 @@ var _ = Describe("apiserver controller tests", func() {
 				ObjectMeta: metav1.ObjectMeta{Name: "enterprise-" + components.EnterpriseRelease},
 				Spec: operatorv1.ImageSetSpec{
 					Images: []operatorv1.Image{
-						{Image: "tigera/cnx-apiserver", Digest: "sha256:apiserverhash"},
-						{Image: "tigera/cnx-queryserver", Digest: "sha256:queryserverhash"},
+						{Image: "tigera/apiserver", Digest: "sha256:apiserverhash"},
+						{Image: "tigera/queryserver", Digest: "sha256:queryserverhash"},
 						{Image: "tigera/key-cert-provisioner", Digest: "sha256:calicocsrinithash"},
 					},
 				},
@@ -233,8 +234,8 @@ var _ = Describe("apiserver controller tests", func() {
 			d := appsv1.Deployment{
 				TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "v1"},
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "tigera-apiserver",
-					Namespace: "tigera-system",
+					Name:      "calico-apiserver",
+					Namespace: "calico-system",
 				},
 			}
 			Expect(test.GetResource(cli, &d)).To(BeNil())
@@ -242,28 +243,30 @@ var _ = Describe("apiserver controller tests", func() {
 			apiserver := test.GetContainer(d.Spec.Template.Spec.Containers, "calico-apiserver")
 			Expect(apiserver).ToNot(BeNil())
 			Expect(apiserver.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s@%s",
+				fmt.Sprintf("some.registry.org/%s%s@%s",
+					components.TigeraImagePath,
 					components.ComponentAPIServer.Image,
 					"sha256:apiserverhash")))
 			qserver := test.GetContainer(d.Spec.Template.Spec.Containers, "tigera-queryserver")
 			Expect(qserver).ToNot(BeNil())
 			Expect(qserver.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s@%s",
+				fmt.Sprintf("some.registry.org/%s%s@%s",
+					components.TigeraImagePath,
 					components.ComponentQueryServer.Image,
 					"sha256:queryserverhash")))
 			csrinit := test.GetContainer(d.Spec.Template.Spec.InitContainers, "calico-apiserver-certs-key-cert-provisioner")
 			Expect(csrinit).ToNot(BeNil())
 			Expect(csrinit.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s@%s",
+				fmt.Sprintf("some.registry.org/%s%s@%s",
+					components.TigeraImagePath,
 					components.ComponentTigeraCSRInitContainer.Image,
 					"sha256:calicocsrinithash")))
-
 		})
 
 		It("should not add OwnerReference to user-supplied apiserver TLS cert secrets", func() {
 			Expect(cli.Create(ctx, installation)).To(BeNil())
 
-			secretName := render.ProjectCalicoAPIServerTLSSecretName(operatorv1.TigeraSecureEnterprise)
+			secretName := render.CalicoAPIServerTLSSecretName
 
 			Expect(cli.Create(ctx, apiSecret)).ShouldNot(HaveOccurred())
 
@@ -282,13 +285,12 @@ var _ = Describe("apiserver controller tests", func() {
 			apiSecret2 := &corev1.Secret{}
 			Expect(cli.Get(ctx, client.ObjectKey{Namespace: common.OperatorNamespace(), Name: secretName}, apiSecret2)).ShouldNot(HaveOccurred())
 			Expect(apiSecret2.GetOwnerReferences()).To(HaveLen(0))
-
 		})
 
 		It("should add OwnerReference apiserver cert operator managed secrets", func() {
 			Expect(cli.Create(ctx, installation)).To(BeNil())
 
-			secretName := "tigera-apiserver-certs"
+			secretName := "calico-apiserver-certs"
 
 			r := ReconcileAPIServer{
 				client:              cli,
@@ -304,7 +306,6 @@ var _ = Describe("apiserver controller tests", func() {
 			secret := &corev1.Secret{}
 			Expect(cli.Get(ctx, client.ObjectKey{Namespace: common.OperatorNamespace(), Name: secretName}, secret)).ShouldNot(HaveOccurred())
 			Expect(secret.GetOwnerReferences()).To(HaveLen(1))
-
 		})
 
 		It("should render allow-tigera policy when tier and tier watch are ready", func() {
@@ -324,7 +325,7 @@ var _ = Describe("apiserver controller tests", func() {
 			policies := v3.NetworkPolicyList{}
 			Expect(cli.List(ctx, &policies)).ToNot(HaveOccurred())
 			Expect(policies.Items).To(HaveLen(1))
-			Expect(policies.Items[0].Name).To(Equal("allow-tigera.cnx-apiserver-access"))
+			Expect(policies.Items[0].Name).To(Equal("allow-tigera.apiserver-access"))
 		})
 
 		It("should omit allow-tigera policy and not degrade when tier is not ready", func() {
@@ -408,7 +409,7 @@ var _ = Describe("apiserver controller tests", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 
 			certSecret := corev1.Secret{}
-			Expect(cli.Get(ctx, client.ObjectKey{Name: "tigera-apiserver-certs", Namespace: "tigera-system"}, &certSecret)).ToNot(HaveOccurred())
+			Expect(cli.Get(ctx, client.ObjectKey{Name: "calico-apiserver-certs", Namespace: "calico-system"}, &certSecret)).ToNot(HaveOccurred())
 		})
 	})
 
@@ -697,11 +698,11 @@ var _ = Describe("apiserver controller tests", func() {
 					TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      render.VoltronTunnelSecretName,
-						Namespace: "tigera-system",
+						Namespace: "calico-system",
 					},
 				}
 
-				// Ensure that the tunnel secret was copied in tigera-system namespace
+				// Ensure that the tunnel secret was copied in calico-system namespace
 				err = test.GetResource(cli, &clusterConnectionInAppNs)
 				Expect(kerror.IsNotFound(err)).Should(BeFalse())
 				Expect(clusterConnectionInAppNs.Data).Should(HaveKeyWithValue("tls.crt", []byte("certvalue")))
@@ -737,15 +738,15 @@ var _ = Describe("apiserver controller tests", func() {
 				deployment := appsv1.Deployment{
 					TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "v1"},
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "tigera-apiserver",
-						Namespace: "tigera-system",
+						Name:      "calico-apiserver",
+						Namespace: "calico-system",
 					},
 				}
 				clusterConnectionInAppNs := corev1.Secret{
 					TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      render.VoltronTunnelSecretName,
-						Namespace: "tigera-system",
+						Namespace: "calico-system",
 					},
 				}
 
@@ -753,7 +754,7 @@ var _ = Describe("apiserver controller tests", func() {
 				err = test.GetResource(cli, &deployment)
 				Expect(kerror.IsNotFound(err)).Should(BeFalse())
 
-				// Ensure that the tunnel secret was copied in tigera-system namespace
+				// Ensure that the tunnel secret was copied in calico-system namespace
 				err = test.GetResource(cli, &clusterConnectionInAppNs)
 				Expect(kerror.IsNotFound(err)).Should(BeFalse())
 			})
@@ -776,15 +777,15 @@ var _ = Describe("apiserver controller tests", func() {
 				deployment := appsv1.Deployment{
 					TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "v1"},
 					ObjectMeta: metav1.ObjectMeta{
-						Name:      "tigera-apiserver",
-						Namespace: "tigera-system",
+						Name:      "calico-apiserver",
+						Namespace: "calico-system",
 					},
 				}
 				clusterConnectionInAppNs := corev1.Secret{
 					TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      render.VoltronTunnelSecretName,
-						Namespace: "tigera-system",
+						Namespace: "calico-system",
 					},
 				}
 
@@ -796,7 +797,6 @@ var _ = Describe("apiserver controller tests", func() {
 				err = test.GetResource(cli, &clusterConnectionInAppNs)
 				Expect(kerror.IsNotFound(err)).Should(BeTrue())
 			})
-
 		})
 	})
 })

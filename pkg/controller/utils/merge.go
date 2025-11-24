@@ -141,6 +141,11 @@ func OverrideInstallationSpec(cfg, override operatorv1.InstallationSpec) operato
 		override.CertificateManagement.DeepCopyInto(inst.CertificateManagement)
 	}
 
+	switch compareFields(inst.TLSCipherSuites, override.TLSCipherSuites) {
+	case BOnlySet, Different:
+		inst.TLSCipherSuites = override.TLSCipherSuites
+	}
+
 	switch compareFields(inst.NonPrivileged, override.NonPrivileged) {
 	case BOnlySet, Different:
 		inst.NonPrivileged = override.NonPrivileged
@@ -301,6 +306,16 @@ func mergeCalicoNetwork(cfg, override *operatorv1.CalicoNetworkSpec) *operatorv1
 	switch compareFields(out.WindowsDataplane, override.WindowsDataplane) {
 	case BOnlySet, Different:
 		out.WindowsDataplane = override.WindowsDataplane
+	}
+
+	switch compareFields(out.BPFNetworkBootstrap, override.BPFNetworkBootstrap) {
+	case BOnlySet, Different:
+		out.BPFNetworkBootstrap = override.BPFNetworkBootstrap
+	}
+
+	switch compareFields(out.KubeProxyManagement, override.KubeProxyManagement) {
+	case BOnlySet, Different:
+		out.KubeProxyManagement = override.KubeProxyManagement
 	}
 
 	switch compareFields(out.NodeAddressAutodetectionV4, override.NodeAddressAutodetectionV4) {

@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -445,8 +445,6 @@ var _ = Describe("LogStorage controller", func() {
 					Status: operatorv1.AuthenticationStatus{State: operatorv1.TigeraStatusReady},
 				})).ToNot(HaveOccurred())
 
-				Expect(cli.Create(ctx, render.CreateDexClientSecret())).ToNot(HaveOccurred())
-
 				Expect(cli.Create(ctx, &storagev1.StorageClass{
 					ObjectMeta: metav1.ObjectMeta{
 						Name: storageClassName,
@@ -865,7 +863,8 @@ var _ = Describe("LogStorage controller", func() {
 					initset := test.GetContainer(escfg.Spec.NodeSets[0].PodTemplate.Spec.InitContainers, "elastic-internal-init-os-settings")
 					Expect(initset).ToNot(BeNil())
 					Expect(initset.Image).To(Equal(
-						fmt.Sprintf("some.registry.org/%s:%s",
+						fmt.Sprintf("some.registry.org/%s%s:%s",
+							components.TigeraImagePath,
 							components.ComponentElasticsearch.Image,
 							components.ComponentElasticsearch.Version)))
 
@@ -877,7 +876,8 @@ var _ = Describe("LogStorage controller", func() {
 					}
 					Expect(test.GetResource(cli, &kb)).To(BeNil())
 					Expect(kb.Spec.Image).To(Equal(
-						fmt.Sprintf("some.registry.org/%s:%s",
+						fmt.Sprintf("some.registry.org/%s%s:%s",
+							components.TigeraImagePath,
 							components.ComponentKibana.Image,
 							components.ComponentKibana.Version)))
 
@@ -893,7 +893,8 @@ var _ = Describe("LogStorage controller", func() {
 					mgr := test.GetContainer(ss.Spec.Template.Spec.Containers, "manager")
 					Expect(mgr).ToNot(BeNil())
 					Expect(mgr.Image).To(Equal(
-						fmt.Sprintf("some.registry.org/%s:%s",
+						fmt.Sprintf("some.registry.org/%s%s:%s",
+							components.TigeraImagePath,
 							components.ComponentElasticsearchOperator.Image,
 							components.ComponentElasticsearchOperator.Version)))
 				})
@@ -949,7 +950,8 @@ var _ = Describe("LogStorage controller", func() {
 					initset := test.GetContainer(escfg.Spec.NodeSets[0].PodTemplate.Spec.InitContainers, "elastic-internal-init-os-settings")
 					Expect(initset).ToNot(BeNil())
 					Expect(initset.Image).To(Equal(
-						fmt.Sprintf("some.registry.org/%s@%s",
+						fmt.Sprintf("some.registry.org/%s%s@%s",
+							components.TigeraImagePath,
 							components.ComponentElasticsearch.Image,
 							"sha256:elasticsearchhash")))
 
@@ -961,7 +963,8 @@ var _ = Describe("LogStorage controller", func() {
 					}
 					Expect(test.GetResource(cli, &kb)).To(BeNil())
 					Expect(kb.Spec.Image).To(Equal(
-						fmt.Sprintf("some.registry.org/%s@%s",
+						fmt.Sprintf("some.registry.org/%s%s@%s",
+							components.TigeraImagePath,
 							components.ComponentKibana.Image,
 							"sha256:kibanahash")))
 
@@ -977,7 +980,8 @@ var _ = Describe("LogStorage controller", func() {
 					mgr := test.GetContainer(ss.Spec.Template.Spec.Containers, "manager")
 					Expect(mgr).ToNot(BeNil())
 					Expect(mgr.Image).To(Equal(
-						fmt.Sprintf("some.registry.org/%s@%s",
+						fmt.Sprintf("some.registry.org/%s%s@%s",
+							components.TigeraImagePath,
 							components.ComponentElasticsearchOperator.Image,
 							"sha256:eckoperatorhash")))
 				})

@@ -388,12 +388,6 @@ If a value other than 'all' is specified, the first CRD with a prefix of the spe
 		log.Error(err, fmt.Sprintf("Couldn't find the cluster domain from the resolv.conf, defaulting to %s", clusterDomain))
 	}
 
-	nameservers, err := dns.Nameservers(dns.DefaultResolveConfPath)
-	if err != nil {
-		log.Error(err, "Couldn't find the nameservers from the resolv.conf")
-	}
-	log.Infof("Found nameservers: %v", nameservers)
-
 	kubernetesVersion, err := common.GetKubernetesVersion(clientset)
 	if err != nil {
 		log.Error(err, "Unable to resolve Kubernetes version, defaulting to v1.18")
@@ -404,7 +398,7 @@ If a value other than 'all' is specified, the first CRD with a prefix of the spe
 	// to make sure that we're not doing so, and exit if we are.
 	badNamespaces := []string{
 		common.CalicoNamespace,
-		"calico-apiserver", "tigera-system",
+		"calico-apiserver",
 		render.ElasticsearchNamespace,
 		render.ComplianceNamespace,
 		render.IntrusionDetectionNamespace,
@@ -441,7 +435,6 @@ If a value other than 'all' is specified, the first CRD with a prefix of the spe
 		DetectedProvider:    provider,
 		EnterpriseCRDExists: enterpriseCRDExists,
 		ClusterDomain:       clusterDomain,
-		Nameservers:         nameservers,
 		KubernetesVersion:   kubernetesVersion,
 		ManageCRDs:          manageCRDs,
 		ShutdownContext:     ctx,
@@ -489,8 +482,14 @@ func setKubernetesServiceEnv(kubeconfigFile string) error {
 	// The kubernetes in-cluster functions don't let you override the apiserver
 	// directly; gotta "pass" it via environment vars.
 	log.Info("Overriding kubernetes api to %s", apiURL)
-	os.Setenv("KUBERNETES_SERVICE_HOST", url.Hostname())
-	os.Setenv("KUBERNETES_SERVICE_PORT", url.Port())
+	err = os.Setenv("KUBERNETES_SERVICE_HOST", url.Hostname())
+	if err != nil {
+		return err
+	}
+	err = os.Setenv("KUBERNETES_SERVICE_PORT", url.Port())
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -527,7 +526,7 @@ func showCRDs(variant operatortigeraiov1.ProductVariant, outputType string) erro
 		}
 		b, err := yaml.Marshal(v)
 		if err != nil {
-			return fmt.Errorf("Failed to Marshal %s: %v", v.Name, err)
+			return fmt.Errorf("failed to Marshal %s: %v", v.Name, err)
 		}
 		if !first {
 			fmt.Println("---")
@@ -539,7 +538,7 @@ func showCRDs(variant operatortigeraiov1.ProductVariant, outputType string) erro
 	}
 	// Indicates nothing was printed so we couldn't find the requested outputType
 	if first {
-		return fmt.Errorf("No CRD matching %s", outputType)
+		return fmt.Errorf("no CRD matching %s", outputType)
 	}
 
 	return nil
@@ -572,7 +571,7 @@ func executePreDeleteHook(ctx context.Context, c client.Client) error {
 	for {
 		select {
 		case <-to:
-			return fmt.Errorf("Timeout waiting for pre-delete hook")
+			return fmt.Errorf("timeout waiting for pre-delete hook")
 		default:
 			if err := c.Get(ctx, utils.DefaultInstanceKey, installation); errors.IsNotFound(err) {
 				// It's gone! We can return.

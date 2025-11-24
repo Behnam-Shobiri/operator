@@ -42,7 +42,6 @@ import (
 	"github.com/tigera/operator/pkg/controller/utils"
 	"github.com/tigera/operator/pkg/ctrlruntime"
 	"github.com/tigera/operator/pkg/render"
-	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/logstorage/eck"
 	"github.com/tigera/operator/pkg/render/logstorage/kibana"
@@ -192,9 +191,7 @@ func (r *ReconcileTiers) prepareTiersConfig(ctx context.Context, reqLogger logr.
 		render.ManagerNamespace,
 		eck.OperatorNamespace,
 		render.PacketCaptureNamespace,
-		render.PolicyRecommendationNamespace,
 		common.TigeraPrometheusNamespace,
-		rmeta.APIServerNamespace(operatorv1.TigeraSecureEnterprise),
 		"tigera-skraper",
 	}
 	if r.multiTenant {

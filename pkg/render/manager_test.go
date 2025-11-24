@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
+	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -77,19 +78,20 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 
 		// Should render the correct resources.
 		expectedResources := []client.Object{
-			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"}},
 			&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera.manager-access", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
 			&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera.default-deny", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
 			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"}},
 			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterRole}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
 			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterRoleBinding}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersWatchRoleBindingName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersUpdateRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersUpdateRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"}},
 			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"}},
 			&v3.UISettingsGroup{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterSettings}, TypeMeta: metav1.TypeMeta{Kind: "UISettingsGroup", APIVersion: "projectcalico.org/v3"}},
 			&v3.UISettingsGroup{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerUserSettings}, TypeMeta: metav1.TypeMeta{Kind: "UISettingsGroup", APIVersion: "projectcalico.org/v3"}},
 			&v3.UISettings{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterSettingsLayerTigera}, TypeMeta: metav1.TypeMeta{Kind: "UISettings", APIVersion: "projectcalico.org/v3"}},
 			&v3.UISettings{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterSettingsViewDefault}, TypeMeta: metav1.TypeMeta{Kind: "UISettings", APIVersion: "projectcalico.org/v3"}},
-			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: render.ManagerNamespace}},
 		}
 		rtest.ExpectResources(resources, expectedResources)
 
@@ -104,13 +106,15 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 		Expect(deployment.Spec.Template.Spec.Volumes[2].Name).To(Equal(render.ManagerInternalTLSSecretName))
 		Expect(deployment.Spec.Template.Spec.Volumes[2].Secret.SecretName).To(Equal(render.ManagerInternalTLSSecretName))
 
-		Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(3))
+		Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(4))
 		uiAPIs := deployment.Spec.Template.Spec.Containers[0]
 		voltron := deployment.Spec.Template.Spec.Containers[1]
-		manager := deployment.Spec.Template.Spec.Containers[2]
+		dashboard := deployment.Spec.Template.Spec.Containers[2]
+		manager := deployment.Spec.Template.Spec.Containers[3]
 
-		Expect(manager.Image).Should(Equal(components.TigeraRegistry + "tigera/cnx-manager:" + components.ComponentManager.Version))
+		Expect(manager.Image).Should(Equal(components.TigeraRegistry + "tigera/manager:" + components.ComponentManager.Version))
 		Expect(uiAPIs.Image).Should(Equal(components.TigeraRegistry + "tigera/ui-apis:" + components.ComponentUIAPIs.Version))
+		Expect(dashboard.Image).Should(Equal(components.TigeraRegistry + "tigera/ui-apis:" + components.ComponentUIAPIs.Version))
 		Expect(voltron.Image).Should(Equal(components.TigeraRegistry + "tigera/voltron:" + components.ComponentManagerProxy.Version))
 
 		// manager container
@@ -164,12 +168,38 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 				Type: corev1.SeccompProfileTypeRuntimeDefault,
 			}))
 
+		dashboardExpectedEnv := []corev1.EnvVar{
+			{Name: "LISTEN_ADDR", Value: fmt.Sprintf("127.0.0.1:%s", render.DashboardAPIPort)},
+			{Name: "LOG_LEVEL", Value: "Info"},
+			{Name: "LINSEED_URL", Value: fmt.Sprintf("https://tigera-linseed.%s.svc.%s", render.ElasticsearchNamespace, clusterDomain)},
+			{Name: "LINSEED_CLIENT_KEY", Value: fmt.Sprintf("/%s/tls.key", render.ManagerInternalTLSSecretName)},
+			{Name: "LINSEED_CLIENT_CERT", Value: fmt.Sprintf("/%s/tls.crt", render.ManagerInternalTLSSecretName)},
+			{Name: "MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: fmt.Sprintf("https://tigera-manager.%s.svc:%s", render.ManagerNamespace, "9443")},
+			{Name: "HEALTH_PORT", Value: render.DashboardAPIHealthPort},
+		}
+		Expect(dashboard.Env).To(Equal(dashboardExpectedEnv))
+
+		Expect(dashboard.VolumeMounts).To(HaveLen(2))
+		Expect(dashboard.VolumeMounts[0].Name).To(Equal("tigera-ca-bundle"))
+		Expect(dashboard.VolumeMounts[0].MountPath).To(Equal("/etc/pki/tls/certs"))
+		Expect(dashboard.VolumeMounts[1].Name).To(Equal(render.ManagerInternalTLSSecretName))
+		Expect(dashboard.VolumeMounts[1].MountPath).To(Equal(fmt.Sprintf("/%s", render.ManagerInternalTLSSecretName)))
+
+		Expect(dashboard.ReadinessProbe).NotTo(BeNil())
+		Expect(dashboard.ReadinessProbe.ProbeHandler.Exec.Command).To(Equal([]string{"/usr/bin/dashboard-api", "-ready"}))
+		Expect(dashboard.LivenessProbe).NotTo(BeNil())
+		Expect(dashboard.LivenessProbe.ProbeHandler.Exec.Command).To(Equal([]string{"/usr/bin/dashboard-api", "-ready"}))
+
+		Expect(dashboard.SecurityContext).NotTo(BeNil())
+		Expect(*dashboard.SecurityContext.AllowPrivilegeEscalation).To(BeFalse())
+		Expect(*dashboard.SecurityContext.RunAsNonRoot).To(BeTrue())
+
 		// voltron container
 		Expect(voltron.Env).To(ContainElements([]corev1.EnvVar{
 			{Name: "VOLTRON_ENABLE_COMPLIANCE", Value: "true"},
 			{Name: "VOLTRON_ENABLE_NONCLUSTER_HOST", Value: "true"},
-			{Name: "VOLTRON_QUERYSERVER_ENDPOINT", Value: "https://tigera-api.tigera-system.svc:8080"},
-			{Name: "VOLTRON_QUERYSERVER_BASE_PATH", Value: "/api/v1/namespaces/tigera-system/services/https:tigera-api:8080/proxy/"},
+			{Name: "VOLTRON_QUERYSERVER_ENDPOINT", Value: "https://calico-api.calico-system.svc:8080"},
+			{Name: "VOLTRON_QUERYSERVER_BASE_PATH", Value: "/api/v1/namespaces/calico-system/services/https:calico-api:8080/proxy/"},
 			{Name: "VOLTRON_QUERYSERVER_CA_BUNDLE_PATH", Value: "/etc/pki/tls/certs/tigera-ca-bundle.crt"},
 		}))
 
@@ -195,11 +225,6 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			&corev1.SeccompProfile{
 				Type: corev1.SeccompProfileTypeRuntimeDefault,
 			}))
-
-		// Check the namespace.
-		ns := rtest.GetResource(resources, "tigera-manager", "", "", "v1", "Namespace").(*corev1.Namespace)
-		Expect(ns.Labels["pod-security.kubernetes.io/enforce"]).To(Equal("restricted"))
-		Expect(ns.Labels["pod-security.kubernetes.io/enforce-version"]).To(Equal("latest"))
 	})
 
 	It("should render toleration on GKE", func() {
@@ -329,6 +354,11 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			},
 			{
 				APIGroups: []string{"projectcalico.org"},
+				Resources: []string{"managedclusters"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"projectcalico.org"},
 				Resources: []string{
 					"felixconfigurations",
 				},
@@ -352,6 +382,7 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			{
 				APIGroups: []string{"policy.networking.k8s.io"},
 				Resources: []string{
+					"clusternetworkpolicies",
 					"adminnetworkpolicies",
 					"baselineadminnetworkpolicies",
 				},
@@ -359,18 +390,18 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			},
 			{
 				APIGroups: []string{""},
-				Resources: []string{"serviceaccounts", "namespaces", "nodes", "events", "services", "pods"},
+				Resources: []string{"serviceaccounts"},
+				Verbs:     []string{"get", "list"},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"namespaces", "nodes", "events", "services", "pods"},
 				Verbs:     []string{"list"},
 			},
 			{
 				APIGroups: []string{"apps"},
 				Resources: []string{"replicasets", "statefulsets", "daemonsets"},
 				Verbs:     []string{"list"},
-			},
-			{
-				APIGroups: []string{"projectcalico.org"},
-				Resources: []string{"managedclusters"},
-				Verbs:     []string{"list", "get", "watch", "update"},
 			},
 			{
 				APIGroups: []string{""},
@@ -381,7 +412,7 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 				APIGroups: []string{""},
 				Resources: []string{"services/proxy"},
 				ResourceNames: []string{
-					"https:tigera-api:8080", "calico-node-prometheus:9090",
+					"https:calico-api:8080", "calico-node-prometheus:9090",
 				},
 				Verbs: []string{"get", "create"},
 			},
@@ -390,12 +421,15 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 				Resources: []string{
 					"flows",
 					"flowlogs",
+					"flowlogs-multi-cluster",
 					"bgplogs",
 					"auditlogs",
 					"dnsflows",
 					"dnslogs",
+					"dnslogs-multi-cluster",
 					"l7flows",
 					"l7logs",
+					"l7logs-multi-cluster",
 					"events",
 					"processes",
 				},
@@ -409,6 +443,32 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 				Verbs: []string{"dismiss", "delete"},
 			},
 		}))
+		roleBindingWatchManagedClusters := rtest.GetResource(resources, render.ManagerManagedClustersWatchRoleBindingName, "", "rbac.authorization.k8s.io", "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
+		Expect(roleBindingWatchManagedClusters.RoleRef.Name).To(Equal(render.ManagedClustersWatchClusterRoleName))
+		Expect(roleBindingWatchManagedClusters.Subjects).To(ConsistOf([]rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      render.ManagerServiceName,
+				Namespace: render.ManagerNamespace,
+			},
+		}))
+		roleUpdateManagedClusters := rtest.GetResource(resources, render.ManagerManagedClustersUpdateRBACName, "", "rbac.authorization.k8s.io", "v1", "ClusterRole").(*rbacv1.ClusterRole)
+		Expect(roleUpdateManagedClusters.Rules).To(ConsistOf([]rbacv1.PolicyRule{
+			{
+				APIGroups: []string{"projectcalico.org"},
+				Resources: []string{"managedclusters"},
+				Verbs:     []string{"update"},
+			}}))
+		roleBindingUpdateManagedClusters := rtest.GetResource(resources, render.ManagerManagedClustersUpdateRBACName, "", "rbac.authorization.k8s.io", "v1", "ClusterRoleBinding").(*rbacv1.ClusterRoleBinding)
+		Expect(roleBindingUpdateManagedClusters.RoleRef.Name).To(Equal(render.ManagerManagedClustersUpdateRBACName))
+		Expect(roleBindingWatchManagedClusters.Subjects).To(ConsistOf([]rbacv1.Subject{
+			{
+				Kind:      "ServiceAccount",
+				Name:      render.ManagerServiceName,
+				Namespace: render.ManagerNamespace,
+			},
+		}))
+
 	})
 
 	It("should set OIDC Authority environment when auth-type is OIDC", func() {
@@ -428,7 +488,7 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			Value:     "https://127.0.0.1/dex",
 			ValueFrom: nil,
 		}
-		Expect(d.Spec.Template.Spec.Containers[2].Env).To(ContainElement(oidcEnvVar))
+		Expect(d.Spec.Template.Spec.Containers[3].Env).To(ContainElement(oidcEnvVar))
 	})
 
 	Describe("public ca bundle", func() {
@@ -501,12 +561,14 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 
 		// Should render the correct resources.
 		expectedResources := []client.Object{
-			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"}},
 			&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera.manager-access", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
 			&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera.default-deny", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
 			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"}},
 			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterRole}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
 			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterRoleBinding}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersWatchRoleBindingName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersUpdateRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersUpdateRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"}},
 			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"}},
 			&v3.UISettingsGroup{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterSettings}, TypeMeta: metav1.TypeMeta{Kind: "UISettingsGroup", APIVersion: "projectcalico.org/v3"}},
@@ -514,13 +576,12 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			&v3.UISettings{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterSettingsLayerTigera}, TypeMeta: metav1.TypeMeta{Kind: "UISettings", APIVersion: "projectcalico.org/v3"}},
 			&v3.UISettings{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterSettingsViewDefault}, TypeMeta: metav1.TypeMeta{Kind: "UISettings", APIVersion: "projectcalico.org/v3"}},
 			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: render.VoltronLinseedPublicCert, Namespace: common.OperatorNamespace()}, TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"}},
-			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: render.ManagerNamespace}},
 		}
 		rtest.ExpectResources(resources, expectedResources)
 
 		By("configuring the manager deployment")
 		deployment := rtest.GetResource(resources, "tigera-manager", render.ManagerNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
-		manager := deployment.Spec.Template.Spec.Containers[2]
+		manager := deployment.Spec.Template.Spec.Containers[3]
 		Expect(manager.Name).To(Equal("tigera-manager"))
 		rtest.ExpectEnv(manager.Env, "ENABLE_MULTI_CLUSTER_MANAGEMENT", "true")
 
@@ -607,6 +668,11 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			},
 			{
 				APIGroups: []string{"projectcalico.org"},
+				Resources: []string{"managedclusters"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
+			{
+				APIGroups: []string{"projectcalico.org"},
 				Resources: []string{
 					"felixconfigurations",
 				},
@@ -630,6 +696,7 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			{
 				APIGroups: []string{"policy.networking.k8s.io"},
 				Resources: []string{
+					"clusternetworkpolicies",
 					"adminnetworkpolicies",
 					"baselineadminnetworkpolicies",
 				},
@@ -637,18 +704,18 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			},
 			{
 				APIGroups: []string{""},
-				Resources: []string{"serviceaccounts", "namespaces", "nodes", "events", "services", "pods"},
+				Resources: []string{"serviceaccounts"},
+				Verbs:     []string{"get", "list"},
+			},
+			{
+				APIGroups: []string{""},
+				Resources: []string{"namespaces", "nodes", "events", "services", "pods"},
 				Verbs:     []string{"list"},
 			},
 			{
 				APIGroups: []string{"apps"},
 				Resources: []string{"replicasets", "statefulsets", "daemonsets"},
 				Verbs:     []string{"list"},
-			},
-			{
-				APIGroups: []string{"projectcalico.org"},
-				Resources: []string{"managedclusters"},
-				Verbs:     []string{"list", "get", "watch", "update"},
 			},
 			{
 				APIGroups: []string{"authentication.k8s.io"},
@@ -664,7 +731,7 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 				APIGroups: []string{""},
 				Resources: []string{"services/proxy"},
 				ResourceNames: []string{
-					"https:tigera-api:8080", "calico-node-prometheus:9090",
+					"https:calico-api:8080", "calico-node-prometheus:9090",
 				},
 				Verbs: []string{"get", "create"},
 			},
@@ -673,12 +740,15 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 				Resources: []string{
 					"flows",
 					"flowlogs",
+					"flowlogs-multi-cluster",
 					"bgplogs",
 					"auditlogs",
 					"dnsflows",
 					"dnslogs",
+					"dnslogs-multi-cluster",
 					"l7flows",
 					"l7logs",
+					"l7logs-multi-cluster",
 					"events",
 					"processes",
 				},
@@ -779,19 +849,20 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 		})
 
 		expectedResources := []client.Object{
-			&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"}},
 			&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera.manager-access", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
 			&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera.default-deny", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
 			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"}},
 			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterRole}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
 			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterRoleBinding}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersWatchRoleBindingName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersUpdateRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersUpdateRBACName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"}},
 			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: "tigera-manager"}, TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"}},
 			&v3.UISettingsGroup{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterSettings}, TypeMeta: metav1.TypeMeta{Kind: "UISettingsGroup", APIVersion: "projectcalico.org/v3"}},
 			&v3.UISettingsGroup{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerUserSettings}, TypeMeta: metav1.TypeMeta{Kind: "UISettingsGroup", APIVersion: "projectcalico.org/v3"}},
 			&v3.UISettings{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterSettingsLayerTigera}, TypeMeta: metav1.TypeMeta{Kind: "UISettings", APIVersion: "projectcalico.org/v3"}},
 			&v3.UISettings{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterSettingsViewDefault}, TypeMeta: metav1.TypeMeta{Kind: "UISettings", APIVersion: "projectcalico.org/v3"}},
-			&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.TigeraOperatorSecrets, Namespace: render.ManagerNamespace}},
 		}
 		rtest.ExpectResources(resources, expectedResources)
 
@@ -842,7 +913,7 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 		deploy, ok := rtest.GetResource(resources, "tigera-manager", render.ManagerNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
 		Expect(ok).To(BeTrue())
 		Expect(deploy.Spec.Template.Spec.Affinity).NotTo(BeNil())
-		Expect(deploy.Spec.Template.Spec.Affinity).To(Equal(podaffinity.NewPodAntiAffinity("tigera-manager", render.ManagerNamespace)))
+		Expect(deploy.Spec.Template.Spec.Affinity).To(Equal(podaffinity.NewPodAntiAffinity("tigera-manager", []string{render.ManagerNamespace})))
 	})
 
 	It("should override container's resource request with the value from Manager CR", func() {
@@ -889,7 +960,7 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 		d, ok := rtest.GetResource(resources, "tigera-manager", render.ManagerNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
 		Expect(ok).To(BeTrue())
 
-		Expect(d.Spec.Template.Spec.Containers).To(HaveLen(3))
+		Expect(d.Spec.Template.Spec.Containers).To(HaveLen(4))
 
 		container := test.GetContainer(d.Spec.Template.Spec.Containers, "tigera-voltron")
 		Expect(container).NotTo(BeNil())
@@ -978,7 +1049,7 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 				policy := testutils.GetAllowTigeraPolicyFromResources(policyName, resources)
 				expectedPolicy := getExpectedPolicy(scenario)
 				if expectedPolicy != nil {
-					// Check fields individuall before checking the entire struct so that we get
+					// Check fields individually before checking the entire struct so that we get
 					// more useful failure messages.
 					Expect(policy.ObjectMeta).To(Equal(expectedPolicy.ObjectMeta))
 					Expect(policy.Spec.Ingress).To(ConsistOf(expectedPolicy.Spec.Ingress))
@@ -995,6 +1066,45 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false}),
 			Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true}),
 		)
+
+		It("should render allow-tigera policy for the non-cluster-host scenario", func() {
+			renderCfg := renderConfig{
+				openshift:               false,
+				oidc:                    false,
+				managementCluster:       nil,
+				installation:            installation,
+				compliance:              compliance,
+				complianceFeatureActive: true,
+				ns:                      render.ManagerNamespace,
+			}
+			resourcesWithoutNonClusterHosts := renderObjects(renderCfg)
+			renderCfg.nonClusterHost = &operatorv1.NonClusterHost{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "tigera-secure",
+				},
+				Spec: operatorv1.NonClusterHostSpec{
+					Endpoint: "https://1.2.3.4:5678",
+				},
+			}
+			resourcesWithNonClusterHosts := renderObjects(renderCfg)
+			policyWithNonClusterHosts := testutils.GetAllowTigeraPolicyFromResources(policyName, resourcesWithNonClusterHosts)
+			policyWithoutNonClusterHosts := testutils.GetAllowTigeraPolicyFromResources(policyName, resourcesWithoutNonClusterHosts)
+
+			// Validate that we have a single egress rule added for the fluentd service.
+			Expect(policyWithoutNonClusterHosts.Spec.Ingress).To(Equal(policyWithNonClusterHosts.Spec.Ingress))
+			Expect(len(policyWithoutNonClusterHosts.Spec.Egress)).To(Equal(len(policyWithNonClusterHosts.Spec.Egress) - 1))
+			Expect(len(policyWithNonClusterHosts.Spec.Egress)).To(Equal(11))
+			Expect(policyWithNonClusterHosts.Spec.Egress[8]).To(Equal(v3.Rule{
+				Action:   v3.Allow,
+				Protocol: &networkpolicy.TCPProtocol,
+				Destination: v3.EntityRule{
+					Services: &v3.ServiceMatch{
+						Namespace: render.LogCollectorNamespace,
+						Name:      render.FluentdInputService,
+					},
+				},
+			}))
+		})
 	})
 
 	Context("multi-tenant rendering", func() {
@@ -1026,6 +1136,9 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: tenantANamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"}},
 				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterRole}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
 				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterRoleBinding}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersWatchRoleBindingName, Namespace: tenantANamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersUpdateRBACName, Namespace: tenantANamespace}, TypeMeta: metav1.TypeMeta{Kind: "Role", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersUpdateRBACName, Namespace: tenantANamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerMultiTenantManagedClustersAccessClusterRoleBindingName, Namespace: tenantANamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: tenantANamespace}, TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"}},
 				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: tenantANamespace}, TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"}},
@@ -1056,6 +1169,9 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: tenantBNamespace}, TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"}},
 				&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterRole}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
 				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerClusterRoleBinding}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersWatchRoleBindingName, Namespace: tenantBNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersUpdateRBACName, Namespace: tenantBNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Role", APIVersion: "rbac.authorization.k8s.io/v1"}},
+				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerManagedClustersUpdateRBACName, Namespace: tenantBNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.ManagerMultiTenantManagedClustersAccessClusterRoleBindingName, Namespace: tenantBNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: tenantBNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"}},
 				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "tigera-manager", Namespace: tenantBNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"}},
@@ -1189,6 +1305,33 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			Expect(uiAPIsEnv).To(ContainElement(corev1.EnvVar{Name: "TENANT_NAMESPACE", Value: tenantANamespace}))
 		})
 
+		It("should render multi-tenant environment variables for connected Calioco clusters", func() {
+			resources := renderObjects(renderConfig{
+				oidc:                    false,
+				managementCluster:       nil,
+				installation:            installation,
+				compliance:              compliance,
+				complianceFeatureActive: true,
+				ns:                      tenantANamespace,
+				tenant: &operatorv1.Tenant{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "tenant",
+						Namespace: tenantANamespace,
+					},
+					Spec: operatorv1.TenantSpec{
+						ID:                    "tenant-a",
+						ManagedClusterVariant: &operatorv1.Calico,
+					},
+				},
+				externalElastic: true,
+			})
+			d := rtest.GetResource(resources, "tigera-manager", tenantANamespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
+			uiAPIsEnv := d.Spec.Template.Spec.Containers[0].Env
+			Expect(uiAPIsEnv).To(ContainElement(corev1.EnvVar{Name: "L7_LOGS_ENABLED", Value: "false"}))
+			Expect(uiAPIsEnv).To(ContainElement(corev1.EnvVar{Name: "DNS_LOGS_ENABLED", Value: "false"}))
+			Expect(uiAPIsEnv).To(ContainElement(corev1.EnvVar{Name: "EVENTS_ENABLED", Value: "false"}))
+		})
+
 		It("should not install UISettings / UISettingsGroups", func() {
 			resources := renderObjects(renderConfig{
 				oidc:                    false,
@@ -1216,7 +1359,7 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			}
 		})
 
-		It("should not install cnx-manager container in manager pod in single-tenant mode", func() {
+		It("should not install manager container in manager pod in single-tenant mode", func() {
 			tenant := &operatorv1.Tenant{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "test-tenant",
@@ -1239,11 +1382,11 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			Expect(len(d.Spec.Template.Spec.Containers)).To(Equal(2))
 			for _, c := range d.Spec.Template.Spec.Containers {
 				Expect(c.Name).NotTo(Equal("tigera-manager"))
-				Expect(c.Image).NotTo(ContainSubstring("cnx-manager"))
+				Expect(c.Image).NotTo(ContainSubstring("manager"))
 			}
 		})
 
-		It("should not install cnx-manager container in manager pod in multi-tenant mode", func() {
+		It("should not install manager container in manager pod in multi-tenant mode", func() {
 			tenant := &operatorv1.Tenant{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "test-tenant",
@@ -1268,8 +1411,28 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 			Expect(len(d.Spec.Template.Spec.Containers)).To(Equal(2))
 			for _, c := range d.Spec.Template.Spec.Containers {
 				Expect(c.Name).NotTo(Equal("tigera-manager"))
-				Expect(c.Image).NotTo(ContainSubstring("cnx-manager"))
+				Expect(c.Image).NotTo(ContainSubstring("manager"))
 			}
+		})
+
+		It("should not render dashboard sidecar", func() {
+			tenant := &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{Name: "tenantA", Namespace: tenantANamespace},
+				Spec:       operatorv1.TenantSpec{ID: "tenant-a"},
+			}
+			resources := renderObjects(renderConfig{
+				oidc:                    false,
+				managementCluster:       nil,
+				installation:            installation,
+				compliance:              compliance,
+				complianceFeatureActive: true,
+				ns:                      tenantANamespace,
+				tenant:                  tenant,
+			})
+
+			deployment := rtest.GetResource(resources, "tigera-manager", tenantANamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
+			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(2))
+			Expect(rtest.GetContainer(deployment.Spec.Template.Spec.Containers, render.DashboardAPIName)).To(BeNil())
 		})
 	})
 
@@ -1346,6 +1509,26 @@ var _ = Describe("Tigera Secure Manager rendering tests", func() {
 				Expect(env.Name).NotTo(Equal("TENANT_NAMESPACE"))
 			}
 		})
+
+		It("should not render dashboard sidecar", func() {
+			tenant := &operatorv1.Tenant{
+				ObjectMeta: metav1.ObjectMeta{Name: "tenantA"},
+				Spec:       operatorv1.TenantSpec{ID: "tenant-a"},
+			}
+			resources := renderObjects(renderConfig{
+				oidc:                    false,
+				managementCluster:       nil,
+				installation:            installation,
+				compliance:              compliance,
+				complianceFeatureActive: true,
+				tenant:                  tenant,
+				ns:                      render.ManagerNamespace,
+			})
+
+			deployment := rtest.GetResource(resources, "tigera-manager", render.ManagerNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
+			Expect(deployment.Spec.Template.Spec.Containers).To(HaveLen(2))
+			Expect(rtest.GetContainer(deployment.Spec.Template.Spec.Containers, render.DashboardAPIName)).To(BeNil())
+		})
 	})
 })
 
@@ -1375,7 +1558,7 @@ func renderObjects(roc renderConfig) []client.Object {
 			},
 		}
 
-		dexCfg = render.NewDexKeyValidatorConfig(authentication, nil, dns.DefaultClusterDomain)
+		dexCfg = render.NewDexKeyValidatorConfig(authentication, dns.DefaultClusterDomain)
 	}
 
 	var tunnelSecret certificatemanagement.KeyPairInterface

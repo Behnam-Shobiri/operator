@@ -17,72 +17,75 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"text/template"
 
 	"gopkg.in/yaml.v2"
 )
 
-var defaultImages = map[string]string{
-	"calico/cni":                 "calico/cni",
-	"calico/cni-windows":         "calico/cni-windows",
-	"calico/dikastes":            "calico/dikastes",
-	"calico/kube-controllers":    "calico/kube-controllers",
-	"calico/node":                "calico/node",
-	"calico/node-windows":        "calico/node-windows",
-	"calico/goldmane":            "calico/goldmane",
-	"calico/guardian":            "calico/guardian",
-	"calico/whisker":             "calico/whisker",
-	"calico/whisker-backend":     "calico/whisker-backend",
-	"calicoctl":                  "calico/ctl",
-	"flannel":                    "coreos/flannel",
-	"flexvol":                    "calico/pod2daemon-flexvol",
-	"calico/csi":                 "calico/csi",
-	"csi-node-driver-registrar":  "calico/node-driver-registrar",
-	"typha":                      "calico/typha",
-	"key-cert-provisioner":       "calico/key-cert-provisioner",
-	"eck-elasticsearch":          "unused/image",
-	"eck-elasticsearch-operator": "unused/image",
-	"eck-kibana":                 "unused/image",
-	"coreos-prometheus":          "unused/image",
-	"coreos-alertmanager":        "unused/image",
-	"guardian":                   "tigera/guardian",
-	"cnx-node":                   "tigera/cnx-node",
-	"cnx-node-windows":           "tigera/cnx-node-windows",
-	"tigera-cni":                 "tigera/cni",
-	"tigera-cni-windows":         "tigera/cni-windows",
-	"calico/apiserver":           "calico/apiserver",
-	"tigera/linseed":             "tigera/linseed",
-	"calico/envoy-gateway":       "calico/envoy-gateway",
-	"calico/envoy-proxy":         "calico/envoy-proxy",
-	"calico/envoy-ratelimit":     "calico/envoy-ratelimit",
-	"tigera/envoy-gateway":       "tigera/envoy-gateway",
-	"tigera/envoy-proxy":         "tigera/envoy-proxy",
-	"tigera/envoy-ratelimit":     "tigera/envoy-ratelimit",
-}
+var (
+	// default images for components that do not specify an image in versions.yml
+	// For now, it includes "calico/<imageName>" as well as "<imageName>" to handle
+	// older versions.yml files that have not been updated to remove the imagePath.
+	defaultImages = map[string]string{
+		"cni":                         "cni",
+		"cni-windows":                 "cni-windows",
+		"dikastes":                    "dikastes",
+		"kube-controllers":            "kube-controllers",
+		"node":                        "node",
+		"node-windows":                "node-windows",
+		"goldmane":                    "goldmane",
+		"guardian":                    "guardian",
+		"whisker":                     "whisker",
+		"whisker-backend":             "whisker-backend",
+		"calicoctl":                   "ctl",
+		"flexvol":                     "pod2daemon-flexvol",
+		"csi":                         "csi",
+		"csi-node-driver-registrar":   "node-driver-registrar",
+		"typha":                       "typha",
+		"key-cert-provisioner":        "key-cert-provisioner",
+		"apiserver":                   "apiserver",
+		"envoy-gateway":               "envoy-gateway",
+		"envoy-proxy":                 "envoy-proxy",
+		"envoy-ratelimit":             "envoy-ratelimit",
+		"eck-elasticsearch":           "unused-image",
+		"eck-elasticsearch-operator":  "unused-image",
+		"eck-kibana":                  "unused-image",
+		"coreos-prometheus":           "unused-image",
+		"coreos-alertmanager":         "unused-image",
+		"tigera-cni":                  "cni",
+		"tigera-cni-windows":          "cni-windows",
+		"linseed":                     "linseed",
+		"gateway-api-envoy-gateway":   "envoy-gateway",
+		"gateway-api-envoy-proxy":     "envoy-proxy",
+		"gateway-api-envoy-ratelimit": "envoy-ratelimit",
+	}
 
-var ignoredImages = map[string]struct{}{
-	"calico":            {},
-	"networking-calico": {},
-	"calico-private":    {},
-	"cnx-manager-proxy": {},
-	"busybox":           {},
-	"calico/api":        {},
-	"libcalico-go":      {},
-}
+	ignoredImages = map[string]struct{}{
+		"calico":            {},
+		"networking-calico": {},
+		"calico-private":    {},
+		"manager-proxy":     {},
+		"busybox":           {},
+		"api":               {},
+		"libcalico-go":      {},
+	}
+)
 
 type Release struct {
 	// Title is the Release version and should match the major.minor.patch of the
 	// Calico or Enterprise version included in the operator.
-	Title      string     `json:"title"`
-	Components Components `json:"components"`
+	Title      string     `yaml:"title"`
+	Components Components `yaml:"components"`
 }
 
 type Components map[string]*Component
 
 type Component struct {
-	Version  string `json:"version"`
-	Registry string `json:"registry"`
-	Image    string `json:"image"`
+	Version   string `yaml:"version"`
+	Registry  string `yaml:"registry"`
+	ImagePath string `yaml:"imagePath"`
+	Image     string `yaml:"image"`
 }
 
 // GetComponents parses a versions.yml file, scrubs the data of known issues,
@@ -97,21 +100,46 @@ func GetComponents(versionsPath string) (Release, error) {
 	cv.Components = make(Components)
 	cv.Title = v.Title
 
-	// add known default images to any components that are missing them.
+	// parse through the components listed in versions.yml to:
+	// - add known default images to any components that are missing them.
+	// - ignore any components that are not actually images.
+	// - validate components are well formed.
 	for key, component := range v.Components {
+		// Ignore components that are not actually images.
 		if _, ignore := ignoredImages[key]; ignore {
 			continue
 		}
 
+		// Add default image if not specified.
 		if component.Image == "" {
 			image := defaultImages[key]
 			if image == "" {
-				return cv, fmt.Errorf("no image nor default image available for component '%s'. "+
-					"Either fill in the 'image' field or update this code with a defaultImage.", key)
+				return cv, fmt.Errorf("image not specified and no default image available for component %q. "+
+					"Either fill in the 'image' field or update this code with a defaultImage. "+
+					"If key contains %q, remove it and try again", key, "calico/")
 			}
 			component.Image = image
 		}
 
+		// Ensure that the component is well formed:
+		// Version must be specified.
+		if component.Version == "" {
+			return cv, fmt.Errorf("no version specified for component %q", key)
+		}
+		// Registry must end with a '/' if specified.
+		if component.Registry != "" && !strings.HasSuffix(component.Registry, "/") {
+			return cv, fmt.Errorf("registry %q specified for component %q must end with a '/'", component.Registry, key)
+		}
+		// Image must not contain any '/' characters - indicating an image path.
+		imageParts := strings.SplitAfterN(component.Image, "/", 2)
+		if len(imageParts) == 2 {
+			if component.ImagePath != "" {
+				return cv, fmt.Errorf("component '%s' has both imagePath and image with a path. "+
+					"Either remove the imagePath field or update the image field to not include a path", key)
+			}
+			component.ImagePath = imageParts[0]
+			component.Image = imageParts[1]
+		}
 		cv.Components[key] = component
 	}
 

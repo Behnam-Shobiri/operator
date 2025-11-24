@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,9 +17,6 @@ package kubecontrollers
 import (
 	"context"
 	"fmt"
-
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/types"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 
@@ -130,6 +127,9 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 				ControlPlaneReplicas: &replicas,
 				Variant:              operatorv1.TigeraSecureEnterprise,
 				Registry:             "some.registry.org/",
+				ImagePullSecrets: []corev1.LocalObjectReference{{
+					Name: "tigera-pull-secret",
+				}},
 			},
 		}
 		Expect(cli.Create(ctx, install)).ShouldNot(HaveOccurred())
@@ -147,6 +147,11 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 		es.Namespace = render.ElasticsearchNamespace
 		es.Status.Phase = esv1.ElasticsearchReadyPhase
 		Expect(cli.Create(ctx, es)).ShouldNot(HaveOccurred())
+
+		pullSecret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "tigera-pull-secret", Namespace: common.OperatorNamespace()},
+		}
+		Expect(cli.Create(ctx, pullSecret)).NotTo(HaveOccurred())
 
 		mockStatus = &status.MockStatus{}
 		mockStatus.On("Run").Return()
@@ -245,6 +250,30 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 			},
 		}
 		Expect(test.GetResource(cli, &dep)).To(BeNil())
+
+		// Expect operator role binding to be created
+		rb := rbacv1.RoleBinding{
+			ObjectMeta: metav1.ObjectMeta{},
+		}
+		Expect(cli.Get(ctx, client.ObjectKey{
+			Name:      render.TigeraOperatorSecrets,
+			Namespace: common.CalicoNamespace,
+		}, &rb)).NotTo(HaveOccurred())
+		Expect(rb.OwnerReferences).To(HaveLen(1))
+		ownerRoleBinding := rb.OwnerReferences[0]
+		Expect(ownerRoleBinding.Kind).To(Equal("LogStorage"))
+
+		// Expect pull secrets to be created
+		pullSecrets := corev1.Secret{
+			TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+		}
+		Expect(cli.Get(ctx, client.ObjectKey{
+			Name:      "tigera-pull-secret",
+			Namespace: common.CalicoNamespace,
+		}, &pullSecrets)).NotTo(HaveOccurred())
+		Expect(pullSecrets.OwnerReferences).To(HaveLen(1))
+		pullSecret := pullSecrets.OwnerReferences[0]
+		Expect(pullSecret.Kind).To(Equal("LogStorage"))
 	})
 
 	It("should use images from ImageSet", func() {
@@ -281,7 +310,7 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 		Expect(test.GetResource(cli, &dep)).To(BeNil())
 		kc := test.GetContainer(dep.Spec.Template.Spec.Containers, kubecontrollers.EsKubeController)
 		Expect(kc).ToNot(BeNil())
-		Expect(kc.Image).To(Equal(fmt.Sprintf("some.registry.org/%s@%s", components.ComponentTigeraKubeControllers.Image, "sha256:kubecontrollershash")))
+		Expect(kc.Image).To(Equal(fmt.Sprintf("some.registry.org/%s%s@%s", components.TigeraImagePath, components.ComponentTigeraKubeControllers.Image, "sha256:kubecontrollershash")))
 	})
 
 	Context("External ES mode", func() {
@@ -339,96 +368,18 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 				},
 			}
 			Expect(test.GetResource(cli, &dep)).To(BeNil())
-		})
-	})
 
-	Context("Multi-tenant", func() {
-		var (
-			tenantNS string
-			tenant   *operatorv1.Tenant
-		)
-
-		BeforeEach(func() {
-			tenantNS = "tenant-namespace"
-			Expect(cli.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: tenantNS}})).ShouldNot(HaveOccurred())
-
-			// Create the Tenant object.
-			tenant = &operatorv1.Tenant{}
-			tenant.Name = "default"
-			tenant.Namespace = tenantNS
-			tenant.Spec.ID = "test-tenant-id"
-			tenant.Spec.Indices = []operatorv1.Index{}
-			Expect(cli.Create(ctx, tenant)).ShouldNot(HaveOccurred())
-
-			// Create a CA secret for the test, and create its KeyPair.
-			opts := []certificatemanager.Option{
-				certificatemanager.AllowCACreation(),
-				certificatemanager.WithTenant(tenant),
+			// Expect pull secrets to be created
+			pullSecrets := corev1.Secret{
+				TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
 			}
-			cm, err := certificatemanager.Create(cli, &install.Spec, dns.DefaultClusterDomain, tenantNS, opts...)
-			Expect(err).ShouldNot(HaveOccurred())
-			Expect(cli.Create(ctx, cm.KeyPair().Secret(tenantNS))).ShouldNot(HaveOccurred())
-			bundle := cm.CreateTrustedBundle()
-			Expect(cli.Create(ctx, bundle.ConfigMap(tenantNS))).ShouldNot(HaveOccurred())
-
-			// Create the reconciler for the tests.
-			r, err = NewControllerWithShims(cli, scheme, mockStatus, operatorv1.ProviderNone, dns.DefaultClusterDomain, true, readyFlag)
-			Expect(err).ShouldNot(HaveOccurred())
-		})
-
-		It("should wait for the tenant CA to be provisioned", func() {
-			// Delete the CA secret for this test.
-			caSecret := &corev1.Secret{}
-			caSecret.Name = certificatemanagement.TenantCASecretName
-			caSecret.Namespace = tenantNS
-			Expect(cli.Delete(ctx, caSecret)).ShouldNot(HaveOccurred())
-
-			// Run the reconciler.
-			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "default", Namespace: tenantNS}})
-			Expect(err).Should(HaveOccurred())
-			Expect(err.Error()).Should(ContainSubstring("CA secret"))
-		})
-
-		It("should not reconcile any resources if no Namespace was given", func() {
-			// Run the reconciler, passing in a Request with no Namespace. It should return successfully.
-			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "default"}})
-			Expect(err).ShouldNot(HaveOccurred())
-
-			// Check that nothing was installed on the cluster.
-			dep := appsv1.Deployment{
-				TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      kubecontrollers.EsKubeController,
-					Namespace: tenantNS,
-				},
-			}
-			err = cli.Get(ctx, types.NamespacedName{Name: dep.Name, Namespace: dep.Namespace}, &dep)
-			Expect(err).Should(HaveOccurred())
-			Expect(errors.IsNotFound(err)).Should(BeTrue())
-
-			// Check that OnCRFound was not called.
-			mockStatus.AssertNotCalled(GinkgoT(), "OnCRFound")
-		})
-
-		It("should reconcile resources for a cluster", func() {
-			// Run the reconciler.
-			result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: "default", Namespace: tenantNS}})
-			Expect(err).ShouldNot(HaveOccurred())
-			Expect(result).Should(Equal(successResult))
-
-			// SetDegraded should not have been called.
-			mockStatus.AssertNumberOfCalls(GinkgoT(), "SetDegraded", 0)
-
-			// Check that kube-controllers was created as expected. We don't need to check every resource in detail, since
-			// the render package has its own tests which cover this in more detail.
-			dep := appsv1.Deployment{
-				TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      kubecontrollers.EsKubeController,
-					Namespace: tenantNS,
-				},
-			}
-			Expect(test.GetResource(cli, &dep)).To(BeNil())
+			Expect(cli.Get(ctx, client.ObjectKey{
+				Name:      "tigera-pull-secret",
+				Namespace: common.CalicoNamespace,
+			}, &pullSecrets)).NotTo(HaveOccurred())
+			Expect(pullSecrets.OwnerReferences).To(HaveLen(1))
+			pullSecret := pullSecrets.OwnerReferences[0]
+			Expect(pullSecret.Kind).To(Equal("LogStorage"))
 		})
 	})
 })

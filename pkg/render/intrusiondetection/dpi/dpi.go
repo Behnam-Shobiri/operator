@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -179,9 +179,10 @@ func (d *dpiComponent) SupportedOSType() meta.OSType {
 
 func (d *dpiComponent) dpiDaemonset() *appsv1.DaemonSet {
 	var terminationGracePeriod int64 = 0
+	container := d.dpiContainer()
 	var initContainers []corev1.Container
 	if d.cfg.TyphaNodeTLS.NodeSecret.UseCertificateManagement() {
-		initContainers = append(initContainers, d.cfg.TyphaNodeTLS.NodeSecret.InitContainer(DeepPacketInspectionNamespace))
+		initContainers = append(initContainers, d.cfg.TyphaNodeTLS.NodeSecret.InitContainer(DeepPacketInspectionNamespace, container.SecurityContext))
 	}
 	if d.dpiInitContainers() {
 		for _, initContainer := range d.cfg.IntrusionDetection.Spec.DeepPacketInspectionDaemonset.Spec.Template.Spec.InitContainers {
@@ -216,7 +217,7 @@ func (d *dpiComponent) dpiDaemonset() *appsv1.DaemonSet {
 			// Adjust DNS policy so we can access in-cluster services.
 			DNSPolicy:      corev1.DNSClusterFirstWithHostNet,
 			InitContainers: initContainers,
-			Containers:     []corev1.Container{d.dpiContainer()},
+			Containers:     []corev1.Container{container},
 			Volumes:        d.dpiVolumes(),
 		},
 	}
@@ -456,6 +457,12 @@ func (d *dpiComponent) dpiClusterRole() *rbacv1.ClusterRole {
 				Resources: []string{"endpoints", "services"},
 				Verbs:     []string{"watch", "list", "get"},
 			},
+			{
+				// Used to discover Typha endpoints using EndpointSlice API (Kubernetes 1.17+).
+				APIGroups: []string{"discovery.k8s.io"},
+				Resources: []string{"endpointslices"},
+				Verbs:     []string{"watch", "list", "get"},
+			},
 		},
 	}
 	if d.cfg.OpenShift {
@@ -515,8 +522,8 @@ func (c *dpiComponent) externalLinseedRoleBinding() *rbacv1.RoleBinding {
 		Subjects: []rbacv1.Subject{
 			{
 				Kind:      "ServiceAccount",
-				Name:      linseed,
-				Namespace: render.ElasticsearchNamespace,
+				Name:      render.GuardianServiceAccountName,
+				Namespace: render.GuardianNamespace,
 			},
 		},
 	}

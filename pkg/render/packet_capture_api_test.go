@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -191,7 +191,7 @@ var _ = Describe("Rendering tests for PacketCapture API component", func() {
 		return []corev1.Container{
 			{
 				Name:            render.PacketCaptureContainerName,
-				Image:           fmt.Sprintf("%s%s:%s", components.TigeraRegistry, components.ComponentPacketCapture.Image, components.ComponentPacketCapture.Version),
+				Image:           fmt.Sprintf("%s%s%s:%s", components.TigeraRegistry, components.TigeraImagePath, components.ComponentPacketCapture.Image, components.ComponentPacketCapture.Version),
 				ImagePullPolicy: render.ImagePullPolicy(),
 				SecurityContext: &corev1.SecurityContext{
 					AllowPrivilegeEscalation: ptr.BoolToPtr(false),
@@ -410,7 +410,7 @@ var _ = Describe("Rendering tests for PacketCapture API component", func() {
 			},
 		}
 
-		dexCfg := render.NewDexKeyValidatorConfig(authentication, nil, dns.DefaultClusterDomain)
+		dexCfg := render.NewDexKeyValidatorConfig(authentication, dns.DefaultClusterDomain)
 		resources := renderPacketCapture(defaultInstallation, dexCfg)
 
 		checkPacketCaptureResources(resources, false, true)

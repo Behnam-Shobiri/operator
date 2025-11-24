@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -82,7 +82,6 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 		mockStatus.On("IsAvailable").Return(true)
 		mockStatus.On("OnCRFound").Return()
 		mockStatus.On("ClearDegraded")
-		mockStatus.On("SetDegraded", "Waiting for LicenseKeyAPI to be ready", "").Return().Maybe()
 		mockStatus.On("SetDegraded", operatorv1.ResourceValidationError, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return().Maybe()
 		mockStatus.On("SetDegraded", operatorv1.ResourceReadError, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return().Maybe()
 		mockStatus.On("SetDegraded", operatorv1.ResourceUpdateError, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return().Maybe()
@@ -113,6 +112,9 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 				Spec: operatorv1.InstallationSpec{
 					Variant:  operatorv1.TigeraSecureEnterprise,
 					Registry: "some.registry.org/",
+					ImagePullSecrets: []corev1.LocalObjectReference{{
+						Name: "tigera-pull-secret",
+					}},
 				},
 				Status: operatorv1.InstallationStatus{
 					Variant: operatorv1.TigeraSecureEnterprise,
@@ -138,6 +140,8 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 		Expect(c.Create(ctx, &operatorv1.LogCollector{
 			ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure"},
 		})).NotTo(HaveOccurred())
+		pullSecrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tigera-pull-secret", Namespace: common.OperatorNamespace()}}
+		Expect(c.Create(ctx, pullSecrets)).NotTo(HaveOccurred())
 
 		certificateManager, err := certificatemanager.Create(c, nil, "", common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
@@ -183,7 +187,8 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 			Expect(d.Spec.Template.Spec.NodeSelector).To((Equal(map[string]string{"kubernetes.io/os": "linux"})))
 			controller := test.GetContainer(d.Spec.Template.Spec.Containers, "policy-recommendation-controller")
 			Expect(controller).ToNot(BeNil())
-			Expect(controller.Image).To(Equal(fmt.Sprintf("some.registry.org/%s:%s",
+			Expect(controller.Image).To(Equal(fmt.Sprintf("some.registry.org/%s%s:%s",
+				components.TigeraImagePath,
 				components.ComponentPolicyRecommendation.Image,
 				components.ComponentPolicyRecommendation.Version)))
 		})
@@ -214,7 +219,8 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 			controller := test.GetContainer(d.Spec.Template.Spec.Containers, "policy-recommendation-controller")
 			Expect(controller).ToNot(BeNil())
 			Expect(controller.Image).To(Equal(
-				fmt.Sprintf("some.registry.org/%s@%s",
+				fmt.Sprintf("some.registry.org/%s%s@%s",
+					components.TigeraImagePath,
 					components.ComponentPolicyRecommendation.Image,
 					"sha256:policyrecommendationcontrollerhash")))
 		})
@@ -484,7 +490,6 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 			mockStatus.On("IsAvailable").Return(true)
 			mockStatus.On("OnCRFound").Return()
 			mockStatus.On("ClearDegraded")
-			mockStatus.On("SetDegraded", "Waiting for LicenseKeyAPI to be ready", "").Return().Maybe()
 			mockStatus.On("SetDegraded", operatorv1.ResourceValidationError, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return().Maybe()
 			mockStatus.On("SetDegraded", operatorv1.ResourceReadError, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return().Maybe()
 			mockStatus.On("SetDegraded", operatorv1.ResourceUpdateError, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return().Maybe()

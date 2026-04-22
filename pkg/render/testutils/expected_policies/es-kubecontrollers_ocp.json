@@ -2,12 +2,12 @@
   "apiVersion": "projectcalico.org/v3",
   "kind": "NetworkPolicy",
   "metadata": {
-    "name": "allow-tigera.es-kube-controller-access",
+    "name": "calico-system.es-kube-controller-access",
     "namespace": "calico-system"
   },
   "spec": {
     "order": 1,
-    "tier": "allow-tigera",
+    "tier": "calico-system",
     "selector": "k8s-app == 'es-calico-kube-controllers'",
     "types": [
       "Egress"
@@ -61,8 +61,8 @@
         "action": "Allow",
         "protocol": "TCP",
         "destination": {
-          "selector": "k8s-app == 'tigera-manager'",
-          "namespaceSelector": "projectcalico.org/name == 'tigera-manager'",
+          "selector": "k8s-app == 'calico-manager'",
+          "namespaceSelector": "projectcalico.org/name == 'calico-system'",
           "ports": [
             9443
           ]

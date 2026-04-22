@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,17 @@ import (
 )
 
 var log = logf.Log.WithName("status_manager")
+
+const (
+	// terminationReasonError is the reason string the container runtime sets on
+	// ContainerStateTerminated when the container exits with a non-zero exit code.
+	terminationReasonError = "Error"
+
+	// exitCodeSIGKILL is the exit code for a container killed by SIGKILL (128 + 9).
+	// The kubelet sends SIGKILL when a liveness probe fails, but other actors (OOM
+	// killer, manual kill) can also produce this code.
+	exitCodeSIGKILL = 137
+)
 
 // StatusManager manages the status for a single controller and component, and reports the status via
 // a TigeraStatus API object. The status manager uses the following conditions/states to represent the
@@ -71,6 +83,8 @@ type StatusManager interface {
 	RemoveCertificateSigningRequests(name string)
 	SetDegraded(reason operator.TigeraStatusReason, msg string, err error, log logr.Logger)
 	ClearDegraded()
+	SetWarning(key string, msg string)
+	ClearWarning(key string)
 	IsAvailable() bool
 	IsProgressing() bool
 	IsDegraded() bool
@@ -94,6 +108,9 @@ type statusManager struct {
 	degraded               bool
 	explicitDegradedMsg    string
 	explicitDegradedReason operator.TigeraStatusReason
+
+	// warnings stores warning messages keyed by component/secret name.
+	warnings map[string]string
 
 	// Keep track of currently calculated status.
 	progressing []string
@@ -132,6 +149,7 @@ func New(client client.Client, component string, kubernetesVersion *common.Versi
 		statefulsets:              make(map[string]types.NamespacedName),
 		cronjobs:                  make(map[string]types.NamespacedName),
 		certificatestatusrequests: make(map[string]map[string]string),
+		warnings:                  make(map[string]string),
 		kubernetesVersion:         kubernetesVersion,
 		crExists:                  crExists,
 	}
@@ -160,8 +178,9 @@ func (m *statusManager) updateStatus() {
 		// We've collected knowledge about the current state of the objects we're monitoring.
 		// Now, use that to update the TigeraStatus object for this manager.
 		available := m.IsAvailable()
-		if m.IsAvailable() {
-			m.setAvailable(operator.AllObjectsAvailable, "All objects available")
+		availableMsg := m.availableMessage()
+		if available {
+			m.setAvailable(operator.AllObjectsAvailable, availableMsg)
 		} else {
 			m.clearAvailable()
 		}
@@ -170,7 +189,7 @@ func (m *statusManager) updateStatus() {
 			m.setProgressing(operator.ResourceNotReady, m.progressingMessage())
 		} else {
 			if available {
-				m.clearProgressingWithReason(operator.AllObjectsAvailable, "All Objects Available")
+				m.clearProgressingWithReason(operator.AllObjectsAvailable, availableMsg)
 			} else {
 				m.clearProgressing()
 			}
@@ -180,7 +199,7 @@ func (m *statusManager) updateStatus() {
 			m.setDegraded(m.degradedReason(), m.degradedMessage())
 		} else {
 			if available {
-				m.clearDegradedWithReason(operator.AllObjectsAvailable, "All Objects Available")
+				m.clearDegradedWithReason(operator.AllObjectsAvailable, availableMsg)
 			} else {
 				m.clearDegraded()
 			}
@@ -262,6 +281,7 @@ func (m *statusManager) OnCRNotFound() {
 	m.deployments = make(map[string]types.NamespacedName)
 	m.statefulsets = make(map[string]types.NamespacedName)
 	m.cronjobs = make(map[string]types.NamespacedName)
+	m.warnings = make(map[string]string)
 }
 
 // AddDaemonsets tells the status manager to monitor the health of the given daemonsets.
@@ -361,7 +381,11 @@ func (m *statusManager) SetDegraded(reason operator.TigeraStatusReason, msg stri
 	defer m.lock.Unlock()
 	m.degraded = true
 	m.explicitDegradedReason = reason
-	m.explicitDegradedMsg = fmt.Sprintf("%s: %s", msg, errormsg)
+	if errormsg != "" {
+		m.explicitDegradedMsg = fmt.Sprintf("%s: %s", msg, errormsg)
+	} else {
+		m.explicitDegradedMsg = msg
+	}
 }
 
 // ClearDegraded clears degraded state.
@@ -371,6 +395,40 @@ func (m *statusManager) ClearDegraded() {
 	m.degraded = false
 	m.explicitDegradedReason = ""
 	m.explicitDegradedMsg = ""
+}
+
+// SetWarning sets a warning message for the given key. Warnings are appended to the Available
+// condition message so they are visible in `kubectl get tigerastatus`.
+func (m *statusManager) SetWarning(key string, msg string) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	m.warnings[key] = msg
+}
+
+// ClearWarning removes the warning for the given key.
+func (m *statusManager) ClearWarning(key string) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	delete(m.warnings, key)
+}
+
+// warningMessage returns all warning messages joined by "; ", or empty if there are none.
+func (m *statusManager) warningMessage() string {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if len(m.warnings) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(m.warnings))
+	for k := range m.warnings {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	msgs := make([]string, 0, len(keys))
+	for _, k := range keys {
+		msgs = append(msgs, m.warnings[k])
+	}
+	return strings.Join(msgs, "; ")
 }
 
 // IsAvailable returns true if the component is available and false otherwise.
@@ -644,6 +702,16 @@ func (m *statusManager) podsFailing(selector *metav1.LabelSelector, namespace st
 				return msg, nil
 			}
 		}
+
+		// If none of the container-level checks matched, check if the pod is running but
+		// not passing readiness checks.
+		if p.Status.Phase == corev1.PodRunning {
+			for _, cond := range p.Status.Conditions {
+				if cond.Type == corev1.ContainersReady && cond.Status == corev1.ConditionFalse {
+					return fmt.Sprintf("Pod %s/%s is running but not ready", p.Namespace, p.Name), nil
+				}
+			}
+		}
 	}
 	return "", nil
 }
@@ -653,13 +721,21 @@ func (m *statusManager) containerErrorMessage(p corev1.Pod, c corev1.ContainerSt
 		// Check well-known error states here and report an appropriate mesage to the end user.
 		switch c.State.Waiting.Reason {
 		case "CrashLoopBackOff":
-			return fmt.Sprintf("Pod %s/%s has crash looping container: %s", p.Namespace, p.Name, c.Name)
+			msg := fmt.Sprintf("Pod %s/%s has crash looping container: %s", p.Namespace, p.Name, c.Name)
+			if lt := c.LastTerminationState.Terminated; lt != nil {
+				if lt.Reason == terminationReasonError && lt.ExitCode == exitCodeSIGKILL {
+					msg += " (exit code 137, possible liveness probe failure)"
+				} else {
+					msg += fmt.Sprintf(" (%s, exit code %d)", lt.Reason, lt.ExitCode)
+				}
+			}
+			return msg
 		case "ImagePullBackOff", "ErrImagePull":
 			return fmt.Sprintf("Pod %s/%s failed to pull container image for: %s", p.Namespace, p.Name, c.Name)
 		}
 	}
 	if c.State.Terminated != nil {
-		if c.State.Terminated.Reason == "Error" {
+		if c.State.Terminated.Reason == terminationReasonError {
 			return fmt.Sprintf("Pod %s/%s has terminated container: %s", p.Namespace, p.Name, c.Name)
 		}
 	}
@@ -796,6 +872,14 @@ func (m *statusManager) clearAvailable() {
 		{Type: operator.ComponentAvailable, Status: operator.ConditionFalse, Reason: string(operator.Unknown), Message: ""},
 	}
 	m.set(true, conditions...)
+}
+
+func (m *statusManager) availableMessage() string {
+	msg := "All objects available"
+	if w := m.warningMessage(); w != "" {
+		msg = msg + "; " + w
+	}
+	return msg
 }
 
 func (m *statusManager) progressingMessage() string {

@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,15 +18,15 @@ import (
 	"context"
 	"fmt"
 
-	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-func PatchFelixConfiguration(ctx context.Context, c client.Client, patchFn func(fc *crdv1.FelixConfiguration) (bool, error)) (*crdv1.FelixConfiguration, error) {
+func PatchFelixConfiguration(ctx context.Context, c client.Client, patchFn func(fc *v3.FelixConfiguration) (bool, error)) (*v3.FelixConfiguration, error) {
 	// Fetch any existing default FelixConfiguration object.
-	fc := &crdv1.FelixConfiguration{}
+	fc := &v3.FelixConfiguration{}
 	err := c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 	if err != nil && !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("unable to read FelixConfiguration: %w", err)
@@ -34,6 +34,10 @@ func PatchFelixConfiguration(ctx context.Context, c client.Client, patchFn func(
 
 	// Create a base state for the upcoming patch operation.
 	patchFrom := client.MergeFrom(fc.DeepCopy())
+
+	if err = RestoreV3Metadata(fc); err != nil {
+		return nil, err
+	}
 
 	// Apply desired changes to the FelixConfiguration.
 	updated, err := patchFn(fc)
@@ -57,8 +61,8 @@ func PatchFelixConfiguration(ctx context.Context, c client.Client, patchFn func(
 	return fc, nil
 }
 
-func GetFelixConfiguration(ctx context.Context, c client.Client) (*crdv1.FelixConfiguration, error) {
-	fc := &crdv1.FelixConfiguration{}
+func GetFelixConfiguration(ctx context.Context, c client.Client) (*v3.FelixConfiguration, error) {
+	fc := &v3.FelixConfiguration{}
 	err := c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 	if err != nil && !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("unable to read FelixConfiguration: %w", err)
@@ -66,7 +70,7 @@ func GetFelixConfiguration(ctx context.Context, c client.Client) (*crdv1.FelixCo
 	return fc, nil
 }
 
-func IsFelixPrometheusMetricsEnabled(felixConfiguration *crdv1.FelixConfiguration) bool {
+func IsFelixPrometheusMetricsEnabled(felixConfiguration *v3.FelixConfiguration) bool {
 	if felixConfiguration.Spec.PrometheusMetricsEnabled != nil {
 		return *felixConfiguration.Spec.PrometheusMetricsEnabled
 	}

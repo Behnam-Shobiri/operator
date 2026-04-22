@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@ package kubeproxy
 import (
 	"context"
 
-	. "github.com/onsi/ginkgo"
-	"github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
 
@@ -28,17 +27,17 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	// gopkg.in/yaml.v2 didn't parse all the fields but this package did
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
-	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
 	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 )
 
@@ -57,7 +56,7 @@ var _ = Describe("kube-proxy controller tests", func() {
 	BeforeEach(func() {
 		// The schema contains all objects that should be known to the fake client when the test runs.
 		scheme = runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 		Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(discoveryv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(operatorv1.SchemeBuilder.AddToScheme(scheme)).NotTo(HaveOccurred())
@@ -82,7 +81,7 @@ var _ = Describe("kube-proxy controller tests", func() {
 			Endpoints: []discoveryv1.Endpoint{
 				{Addresses: []string{"5.6.7.8", "5.6.7.9", "5.6.7.10"}},
 			},
-			Ports: []discoveryv1.EndpointPort{{Port: ptr.Int32ToPtr(6443)}},
+			Ports: []discoveryv1.EndpointPort{{Port: ptr.To(int32(6443))}},
 		}
 
 		mockStatus = &status.MockStatus{}
@@ -135,10 +134,10 @@ var _ = Describe("kube-proxy controller tests", func() {
 		})
 	}
 	createFelixConfiguration := func(bpfEnabled bool) {
-		createResource(&crdv1.FelixConfiguration{
+		createResource(&v3.FelixConfiguration{
 			ObjectMeta: metav1.ObjectMeta{Name: "default"},
-			Spec: crdv1.FelixConfigurationSpec{
-				BPFEnabled: ptr.BoolToPtr(bpfEnabled),
+			Spec: v3.FelixConfigurationSpec{
+				BPFEnabled: ptr.To(bpfEnabled),
 			},
 		})
 	}
@@ -151,7 +150,7 @@ var _ = Describe("kube-proxy controller tests", func() {
 		}
 	}
 
-	table.DescribeTable("manage kube-proxy DaemonSet",
+	DescribeTable("manage kube-proxy DaemonSet",
 		func(bpfEnabled bool, kpManaged *operatorv1.KubeProxyManagementType) {
 			kp := &appsv1.DaemonSet{}
 			nodeSelectorIncluded := !bpfEnabled
@@ -182,16 +181,16 @@ var _ = Describe("kube-proxy controller tests", func() {
 			}
 			checkKubeProxyState(kp, nodeSelectorIncluded)
 		},
-		table.Entry("disable kube-proxy if BPFEnabled is false and kubeProxyManagement is Enabled",
+		Entry("disable kube-proxy if BPFEnabled is false and kubeProxyManagement is Enabled",
 			true, &kpManagementEnabled,
 		),
-		table.Entry("enable kube-proxy if BPFEnabled is false and kubeProxyManagement is Enabled",
+		Entry("enable kube-proxy if BPFEnabled is false and kubeProxyManagement is Enabled",
 			false, &kpManagementEnabled,
 		),
-		table.Entry("doesn't change kube-proxy if kubeProxyManagement is Disabled",
+		Entry("doesn't change kube-proxy if kubeProxyManagement is Disabled",
 			false, &kpManagementDisabled,
 		),
-		table.Entry("doesn't change kube-proxy if kubeProxyManagement is unset",
+		Entry("doesn't change kube-proxy if kubeProxyManagement is unset",
 			true, nil,
 		),
 	)
@@ -205,7 +204,7 @@ var _ = Describe("kube-proxy controller tests", func() {
 				},
 			}
 		}
-		table.DescribeTable("check whether kube-proxy is not managed",
+		DescribeTable("check whether kube-proxy is not managed",
 			func(labels map[string]string, annotations map[string]string, shouldSucceed bool) {
 				ds := kubeProxyDS()
 				ds.Labels = labels
@@ -213,24 +212,23 @@ var _ = Describe("kube-proxy controller tests", func() {
 				err := validateDaemonSetUnmanaged(ds)
 				Expect(err == nil).Should(Equal(shouldSucceed))
 			},
-			table.Entry("managed by argocd",
+			Entry("managed by argocd",
 				map[string]string{"app.kubernetes.io/managed-by": "argocd"}, nil, false,
 			),
-			table.Entry("addonmanager mode ReconcileOnce",
+			Entry("addonmanager mode ReconcileOnce",
 				map[string]string{"addonmanager.kubernetes.io/mode": "ReconcileOnce"}, nil, false,
 			),
-			table.Entry("managed by argocd with tracking-id",
+			Entry("managed by argocd with tracking-id",
 				nil, map[string]string{"argocd.argoproj.io/tracking-id": "fake-git-commit-hash"}, false,
 			),
-			table.Entry("kube-proxy not managed",
+			Entry("kube-proxy not managed",
 				map[string]string{"app.kubernetes.io/name": "kube-proxy"}, nil, true,
 			),
-			table.Entry("kube-proxy not managed",
+			Entry("kube-proxy not managed",
 				map[string]string{"app.kubernetes.io/name": "kube-proxy"},
 				map[string]string{"kube-proxy.config.k8s.io/proxy-mode": "iptables"},
 				true,
 			),
 		)
 	})
-
 })

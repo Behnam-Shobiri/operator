@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@ package render_test
 import (
 	"fmt"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gstruct"
 
@@ -93,7 +92,7 @@ var _ = Describe("Windows rendering tests", func() {
 		defaultInstance.CalicoNetwork.NodeAddressAutodetectionV4 = &operatorv1.NodeAddressAutodetection{FirstFound: &ff}
 		defaultInstance.ServiceCIDRs = []string{"10.96.0.0/12"}
 		scheme := runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 		cli = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 		certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
@@ -141,7 +140,7 @@ var _ = Describe("Windows rendering tests", func() {
 			} else {
 				defaultInstance.CalicoNetwork.IPPools[0].Encapsulation = operatorv1.EncapsulationNone
 			}
-			Context(fmt.Sprintf("BGP enabled: %v, VXLAN enabled: %v", enableBGP, enableVXLAN), func() {
+			By(fmt.Sprintf("BGP enabled: %v, VXLAN enabled: %v", enableBGP, enableVXLAN), func() {
 				expectedResources := []struct {
 					name    string
 					ns      string
@@ -386,6 +385,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 				// Verify env
 				expectedNodeEnv := []corev1.EnvVar{
+					{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 					{Name: "DATASTORE_TYPE", Value: "kubernetes"},
 					{Name: "WAIT_FOR_DATASTORE", Value: "true"},
 					{Name: "CALICO_MANAGE_CNI", Value: "true"},
@@ -457,6 +457,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 				expectedCNIEnv := []corev1.EnvVar{
 					{Name: "SLEEP", Value: "false"},
+					{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 					{Name: "CNI_BIN_DIR", Value: "/host/opt/cni/bin"},
 					{Name: "CNI_CONF_NAME", Value: "10-calico.conflist"},
 					{Name: "CNI_NET_DIR", Value: "/etc/cni/net.d"},
@@ -489,6 +490,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 				expectedUninstallEnv := []corev1.EnvVar{
 					{Name: "SLEEP", Value: "false"},
+					{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 					{Name: "CNI_BIN_DIR", Value: "/host/opt/cni/bin"},
 					{Name: "CNI_CONF_NAME", Value: "10-calico.conflist"},
 					{Name: "CNI_NET_DIR", Value: "/host/etc/cni/net.d"},
@@ -660,7 +662,7 @@ var _ = Describe("Windows rendering tests", func() {
 		}
 	})
 
-	It("should render all resources for a default configuration using TigeraSecureEnterprise", func() {
+	It("should render all resources for a default configuration using CalicoEnterprise", func() {
 		type testConf struct {
 			EnableBGP   bool
 			EnableVXLAN bool
@@ -684,7 +686,7 @@ var _ = Describe("Windows rendering tests", func() {
 			} else {
 				defaultInstance.CalicoNetwork.IPPools[0].Encapsulation = operatorv1.EncapsulationNone
 			}
-			Context(fmt.Sprintf("BGP enabled: %v, VXLAN enabled: %v", enableBGP, enableVXLAN), func() {
+			By(fmt.Sprintf("BGP enabled: %v, VXLAN enabled: %v", enableBGP, enableVXLAN), func() {
 				expectedResources := []struct {
 					name    string
 					ns      string
@@ -696,7 +698,7 @@ var _ = Describe("Windows rendering tests", func() {
 					{name: "cni-config-windows", ns: common.CalicoNamespace, group: "", version: "v1", kind: "ConfigMap"},
 					{name: common.WindowsDaemonSetName, ns: common.CalicoNamespace, group: "apps", version: "v1", kind: "DaemonSet"},
 				}
-				defaultInstance.Variant = operatorv1.TigeraSecureEnterprise
+				defaultInstance.Variant = operatorv1.CalicoEnterprise
 				cfg.NodeReporterMetricsPort = 9081
 
 				component := render.Windows(&cfg)
@@ -853,6 +855,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 				// Verify env
 				expectedNodeEnv := []corev1.EnvVar{
+					{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 					{Name: "DATASTORE_TYPE", Value: "kubernetes"},
 					{Name: "WAIT_FOR_DATASTORE", Value: "true"},
 					{Name: "CALICO_MANAGE_CNI", Value: "true"},
@@ -935,6 +938,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 				expectedCNIEnv := []corev1.EnvVar{
 					{Name: "SLEEP", Value: "false"},
+					{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 					{Name: "CNI_BIN_DIR", Value: "/host/opt/cni/bin"},
 					{Name: "CNI_CONF_NAME", Value: "10-calico.conflist"},
 					{Name: "CNI_NET_DIR", Value: "/etc/cni/net.d"},
@@ -967,6 +971,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 				expectedUninstallEnv := []corev1.EnvVar{
 					{Name: "SLEEP", Value: "false"},
+					{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 					{Name: "CNI_BIN_DIR", Value: "/host/opt/cni/bin"},
 					{Name: "CNI_CONF_NAME", Value: "10-calico.conflist"},
 					{Name: "CNI_NET_DIR", Value: "/host/etc/cni/net.d"},
@@ -1177,6 +1182,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 		// Verify env
 		expectedNodeEnv := []corev1.EnvVar{
+			{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 			{Name: "DATASTORE_TYPE", Value: "kubernetes"},
 			{Name: "WAIT_FOR_DATASTORE", Value: "true"},
 			{Name: "CALICO_MANAGE_CNI", Value: "true"},
@@ -1226,6 +1232,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 		expectedCNIEnv := []corev1.EnvVar{
 			{Name: "SLEEP", Value: "false"},
+			{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 			{Name: "CNI_BIN_DIR", Value: "/host/opt/cni/bin"},
 			{Name: "CNI_CONF_NAME", Value: "10-calico.conflist"},
 			{Name: "CNI_NET_DIR", Value: "/etc/cni/net.d"},
@@ -1259,6 +1266,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 		expectedUninstallEnv := []corev1.EnvVar{
 			{Name: "SLEEP", Value: "false"},
+			{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 			{Name: "CNI_BIN_DIR", Value: "/host/opt/cni/bin"},
 			{Name: "CNI_CONF_NAME", Value: "10-calico.conflist"},
 			{Name: "CNI_NET_DIR", Value: "/host/etc/cni/net.d"},
@@ -1377,6 +1385,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 		// Verify env
 		expectedNodeEnv := []corev1.EnvVar{
+			{Name: "CNI_PLUGIN_TYPE", Value: "AmazonVPC"},
 			{Name: "DATASTORE_TYPE", Value: "kubernetes"},
 			{Name: "WAIT_FOR_DATASTORE", Value: "true"},
 			{Name: "CALICO_NETWORKING_BACKEND", Value: "none"},
@@ -1515,6 +1524,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 			// Verify env
 			expectedEnvs := []corev1.EnvVar{
+				{Name: "CNI_PLUGIN_TYPE", Value: string(cni)},
 				{Name: "CALICO_NETWORKING_BACKEND", Value: "none"},
 				{Name: "FELIX_DEFAULTENDPOINTTOHOSTACTION", Value: "ACCEPT"},
 			}
@@ -1621,6 +1631,7 @@ var _ = Describe("Windows rendering tests", func() {
 		Expect(ds.Spec.Template.Spec.Volumes).To(ConsistOf(expectedVols))
 
 		expectedNodeEnv := []corev1.EnvVar{
+			{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 			{Name: "DATASTORE_TYPE", Value: "kubernetes"},
 			{Name: "WAIT_FOR_DATASTORE", Value: "true"},
 			{Name: "CALICO_MANAGE_CNI", Value: "true"},
@@ -1667,7 +1678,7 @@ var _ = Describe("Windows rendering tests", func() {
 		verifyWindowsProbesAndLifecycle(ds)
 	})
 
-	It("should render all resources when variant is TigeraSecureEnterprise and running on openshift", func() {
+	It("should render all resources when variant is CalicoEnterprise and running on openshift", func() {
 		expectedResources := []struct {
 			name    string
 			ns      string
@@ -1680,7 +1691,7 @@ var _ = Describe("Windows rendering tests", func() {
 			{name: common.WindowsDaemonSetName, ns: common.CalicoNamespace, group: "apps", version: "v1", kind: "DaemonSet"},
 		}
 
-		defaultInstance.Variant = operatorv1.TigeraSecureEnterprise
+		defaultInstance.Variant = operatorv1.CalicoEnterprise
 		defaultInstance.KubernetesProvider = operatorv1.ProviderOpenShift
 		cfg.NodeReporterMetricsPort = 9081
 
@@ -1763,6 +1774,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 		expectedNodeEnv := []corev1.EnvVar{
 			// Default envvars.
+			{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 			{Name: "DATASTORE_TYPE", Value: "kubernetes"},
 			{Name: "WAIT_FOR_DATASTORE", Value: "true"},
 			{Name: "CALICO_MANAGE_CNI", Value: "true"},
@@ -1822,7 +1834,7 @@ var _ = Describe("Windows rendering tests", func() {
 		verifyWindowsProbesAndLifecycle(ds)
 	})
 
-	It("should render all resources when variant is TigeraSecureEnterprise and running on RKE2", func() {
+	It("should render all resources when variant is CalicoEnterprise and running on RKE2", func() {
 		expectedResources := []struct {
 			name    string
 			ns      string
@@ -1835,7 +1847,7 @@ var _ = Describe("Windows rendering tests", func() {
 			{name: common.WindowsDaemonSetName, ns: common.CalicoNamespace, group: "apps", version: "v1", kind: "DaemonSet"},
 		}
 
-		defaultInstance.Variant = operatorv1.TigeraSecureEnterprise
+		defaultInstance.Variant = operatorv1.CalicoEnterprise
 		defaultInstance.KubernetesProvider = operatorv1.ProviderRKE2
 		cfg.NodeReporterMetricsPort = 9081
 
@@ -1918,6 +1930,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 		expectedNodeEnv := []corev1.EnvVar{
 			// Default envvars.
+			{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 			{Name: "DATASTORE_TYPE", Value: "kubernetes"},
 			{Name: "WAIT_FOR_DATASTORE", Value: "true"},
 			{Name: "CALICO_MANAGE_CNI", Value: "true"},
@@ -2121,7 +2134,7 @@ var _ = Describe("Windows rendering tests", func() {
 	})
 
 	It("should not enable prometheus metrics if NodeMetricsPort is nil", func() {
-		defaultInstance.Variant = operatorv1.TigeraSecureEnterprise
+		defaultInstance.Variant = operatorv1.CalicoEnterprise
 		defaultInstance.NodeMetricsPort = nil
 		cfg.NodeReporterMetricsPort = 9081
 
@@ -2144,7 +2157,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 	It("should set FELIX_PROMETHEUSMETRICSPORT with a custom value if NodeMetricsPort is set", func() {
 		var nodeMetricsPort int32 = 1234
-		defaultInstance.Variant = operatorv1.TigeraSecureEnterprise
+		defaultInstance.Variant = operatorv1.CalicoEnterprise
 		defaultInstance.NodeMetricsPort = &nodeMetricsPort
 		component := render.Windows(&cfg)
 		Expect(component.ResolveImages(nil)).To(BeNil())
@@ -2441,6 +2454,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 		// Verify env
 		expectedNodeEnv := []corev1.EnvVar{
+			{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 			{Name: "DATASTORE_TYPE", Value: "kubernetes"},
 			{Name: "WAIT_FOR_DATASTORE", Value: "true"},
 			{Name: "CALICO_NETWORKING_BACKEND", Value: "none"},
@@ -2484,6 +2498,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 		expectedCNIEnv := []corev1.EnvVar{
 			{Name: "SLEEP", Value: "false"},
+			{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 			{Name: "CNI_BIN_DIR", Value: "/host/opt/cni/bin"},
 			{Name: "CNI_CONF_NAME", Value: "10-calico.conflist"},
 			{Name: "CNI_NET_DIR", Value: "/etc/cni/net.d"},
@@ -2516,6 +2531,7 @@ var _ = Describe("Windows rendering tests", func() {
 
 		expectedUninstallEnv := []corev1.EnvVar{
 			{Name: "SLEEP", Value: "false"},
+			{Name: "CNI_PLUGIN_TYPE", Value: "Calico"},
 			{Name: "CNI_BIN_DIR", Value: "/host/opt/cni/bin"},
 			{Name: "CNI_CONF_NAME", Value: "10-calico.conflist"},
 			{Name: "CNI_NET_DIR", Value: "/host/etc/cni/net.d"},

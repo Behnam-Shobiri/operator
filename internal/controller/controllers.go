@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
-func AddToManager(mgr ctrl.Manager, options options.AddOptions) error {
+func AddToManager(mgr ctrl.Manager, options options.ControllerOptions) error {
 	if err := (&IPPoolReconciler{
 		Client: mgr.GetClient(),
 		Log:    ctrl.Log.WithName("controllers").WithName("IPPool"),
@@ -65,6 +65,13 @@ func AddToManager(mgr ctrl.Manager, options options.AddOptions) error {
 		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr, options); err != nil {
 		return fmt.Errorf("failed to create controller %s: %v", "LogCollector", err)
+	}
+	if err := (&IstioReconciler{
+		Client: mgr.GetClient(),
+		Log:    ctrl.Log.WithName("controllers").WithName("Istio"),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr, options); err != nil {
+		return fmt.Errorf("failed to create controller Istio: %v", err)
 	}
 	if err := (&ComplianceReconciler{
 		Client: mgr.GetClient(),

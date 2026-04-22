@@ -1,26 +1,10 @@
-# Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
+# Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 # This Makefile requires the following dependencies on the host system:
 # - go
 #
 # TODO: Add in the necessary variables, etc, to make this Makefile work.
 # TODO: Add in multi-arch stuff.
-
-define yq_cmd
-	$(shell yq --version | grep v$1.* >/dev/null && which yq || echo docker run --rm --user="root" -i -v "$(shell pwd)":/workdir mikefarah/yq:$1 $(if $(shell [ $1 -lt 4 ] && echo "true"), yq,))
-endef
-YQ_V4 = $(call yq_cmd,4)
-
-GIT_CMD   = git
-CURL_CMD  = curl -fL
-
-ifdef CONFIRM
-GIT       = $(GIT_CMD)
-CURL      = $(CURL_CMD)
-else
-GIT       = echo [DRY RUN] $(GIT_CMD)
-CURL      = echo [DRY RUN] $(CURL_CMD)
-endif
 
 # These values are used for fetching tools to run as part of the build process
 # and shouldn't vary based on the target we're building for
@@ -37,7 +21,7 @@ OPERATOR_SDK_URL = https://github.com/operator-framework/operator-sdk/releases/d
 
 # Our version of helm3 - Note that we use BUILD_ARCH here instead of NATIVE_ARCH because
 # that's what we used before and we don't want to break things if that's necessary.
-HELM3_VERSION = v3.11.3
+HELM3_VERSION = v3.20.1
 HELM3_URL = https://get.helm.sh/helm-$(HELM3_VERSION)-$(NATIVE_OS)-$(BUILDARCH).tar.gz
 HELM_BUILDARCH_BINARY = $(HACK_BIN)/helm-$(BUILDARCH)
 HELM_BUILDARCH_VERSIONED_BINARY = $(HELM_BUILDARCH_BINARY)-$(HELM3_VERSION)
@@ -117,8 +101,10 @@ endif
 REPO?=tigera/operator
 PACKAGE_NAME?=github.com/tigera/operator
 LOCAL_USER_ID?=$(shell id -u $$USER)
-GO_BUILD_VER?=1.25.3-llvm18.1.8-k8s1.34.1
+GO_BUILD_VER?=1.26.1-llvm20.1.8-k8s1.35.3
+CALICO_BASE_VER ?= ubi9-1774634880
 CALICO_BUILD?=calico/go-build:$(GO_BUILD_VER)-$(BUILDARCH)
+CALICO_BASE ?= calico/base:$(CALICO_BASE_VER)
 SRC_FILES=$(shell find ./pkg -name '*.go')
 SRC_FILES+=$(shell find ./api -name '*.go')
 SRC_FILES+=$(shell find ./internal/ -name '*.go')
@@ -126,6 +112,7 @@ SRC_FILES+=$(shell find ./test -name '*.go')
 SRC_FILES+=cmd/main.go
 
 EXTRA_DOCKER_ARGS += -e GOPRIVATE=github.com/tigera/*
+GIT_CLONE_URL_BASE?=git@github.com:
 ifeq ($(GIT_USE_SSH),true)
 	GIT_CONFIG_SSH ?= git config --global url."ssh://git@github.com/".insteadOf "https://github.com/";
 endif
@@ -155,8 +142,6 @@ CONTAINERIZED= mkdir -p .go-pkg-cache $(GOMOD_CACHE) && \
 		-e GOOS=linux \
 		-e GOARCH=$(ARCH) \
 		-e KUBECONFIG=/go/src/$(PACKAGE_NAME)/kubeconfig.yaml \
-		-e ACK_GINKGO_RC=true \
-		-e ACK_GINKGO_DEPRECATIONS=1.16.5 \
 		-w /go/src/$(PACKAGE_NAME) \
 		--net=host \
 		$(EXTRA_DOCKER_ARGS)
@@ -164,7 +149,6 @@ CONTAINERIZED= mkdir -p .go-pkg-cache $(GOMOD_CACHE) && \
 DOCKER_RUN := $(CONTAINERIZED) $(CALICO_BUILD)
 
 BUILD_IMAGE?=tigera/operator
-BUILD_INIT_IMAGE?=tigera/operator-init
 
 BUILD_DIR?=build/_output
 BINDIR?=$(BUILD_DIR)/bin
@@ -246,10 +230,24 @@ else
   GIT_VERSION?=$(shell git describe --tags --dirty --always --abbrev=12)
 endif
 
+# To update the Istio version, see "Updating the bundled version of Istio" in docs/common_tasks.md.
+ISTIO_HELM_REPO ?= https://istio-release.storage.googleapis.com/charts
+ISTIO_VERSION ?= 1.29.2
+ISTIO_RESOURCES_DIR = pkg/render/istio
+ISTIO_CHARTS = base istiod cni ztunnel
+ISTIO_CHART_FILES = $(addprefix $(ISTIO_RESOURCES_DIR)/,$(addsuffix .tgz,$(ISTIO_CHARTS)))
+
+.PHONY: istio_charts
+istio_charts: $(ISTIO_CHART_FILES)
+
+$(ISTIO_RESOURCES_DIR)/%.tgz:
+	@echo "Downloading Istio chart $* version $(ISTIO_VERSION)..."
+	@curl -fsSL -o $@ $(ISTIO_HELM_REPO)/$*-$(ISTIO_VERSION).tgz
+
 # To update the Envoy Gateway version, see "Updating the bundled version of
 # Envoy Gateway" in docs/common_tasks.md.
 ENVOY_GATEWAY_HELM_CHART ?= oci://docker.io/envoyproxy/gateway-helm
-ENVOY_GATEWAY_VERSION ?= v1.5.0
+ENVOY_GATEWAY_VERSION ?= v1.7.2
 ENVOY_GATEWAY_PREFIX ?= tigera-gateway-api
 ENVOY_GATEWAY_NAMESPACE ?= tigera-gateway
 ENVOY_GATEWAY_RESOURCES = pkg/render/gatewayapi/gateway_api_resources.yaml
@@ -278,11 +276,11 @@ $(HELM_BUILDARCH_VERSIONED_BINARY): | $(HACK_BIN)
 
 
 build: $(BINDIR)/operator-$(ARCH)
-$(BINDIR)/operator-$(ARCH): $(SRC_FILES) $(ENVOY_GATEWAY_RESOURCES)
+$(BINDIR)/operator-$(ARCH): $(SRC_FILES) $(ENVOY_GATEWAY_RESOURCES) $(ISTIO_CHART_FILES)
 	mkdir -p $(BINDIR)
 	$(CONTAINERIZED) -e CGO_ENABLED=$(CGO_ENABLED) -e GOEXPERIMENT=$(GOEXPERIMENT) $(CALICO_BUILD) \
 	sh -c '$(GIT_CONFIG_SSH) \
-	go build -buildvcs=false -v -o $(BINDIR)/operator-$(ARCH) -tags "$(TAGS)" -ldflags "-X $(PACKAGE_NAME)/version.VERSION=$(GIT_VERSION) -s -w" ./cmd/main.go'
+	go build -buildvcs=false -v -o $(BINDIR)/operator-$(ARCH) -tags "$(TAGS)" -ldflags "-X $(PACKAGE_NAME)/version.VERSION=$(GIT_VERSION) -s -w" ./cmd/'
 ifeq ($(ARCH), $(filter $(ARCH),amd64))
 	$(CONTAINERIZED) $(CALICO_BUILD) sh -c 'strings $(BINDIR)/operator-$(ARCH) | grep '_Cfunc__goboringcrypto_' 1> /dev/null'
 endif
@@ -292,7 +290,11 @@ image: build $(BUILD_IMAGE)
 
 $(BUILD_IMAGE): $(BUILD_IMAGE)-$(ARCH)
 $(BUILD_IMAGE)-$(ARCH): $(BINDIR)/operator-$(ARCH)
-	docker buildx build --load --platform=linux/$(ARCH) --pull -t $(BUILD_IMAGE):latest-$(ARCH) --build-arg GIT_VERSION=$(GIT_VERSION) -f build/Dockerfile .
+	docker buildx build --load --platform=linux/$(ARCH) --pull \
+		--build-arg GIT_VERSION=$(GIT_VERSION) \
+		--build-arg CALICO_BASE=$(CALICO_BASE) \
+		-t $(BUILD_IMAGE):latest-$(ARCH) \
+		-f build/Dockerfile .
 ifeq ($(ARCH),amd64)
 	docker tag $(BUILD_IMAGE):latest-$(ARCH) $(BUILD_IMAGE):latest
 endif
@@ -305,12 +307,6 @@ images: image
 image-all: $(addprefix sub-image-,$(VALIDARCHES))
 sub-image-%:
 	$(MAKE) images ARCH=$*
-
-.PHONY: image-init
-image-init: image
-ifeq ($(ARCH),amd64)
-	docker tag $(BUILD_IMAGE):latest-$(ARCH) $(BUILD_INIT_IMAGE):latest
-endif
 
 BINDIR?=build/init/bin
 $(BINDIR)/kubectl:
@@ -325,11 +321,12 @@ $(BINDIR)/kind:
 
 clean:
 	rm -rf $(BUILD_DIR)
+	rm -rf $(ISTIO_CHART_FILES)
 	rm -rf build/init/bin
 	rm -rf hack/bin
 	rm -rf .go-pkg-cache
 	rm -rf .crds
-	rm -f *-release-notes.md
+	find . -type f -name 'release-*.log' -delete -o  -name '*release-notes.md' -delete
 	docker rmi -f $(shell docker images -f "reference=$(BUILD_IMAGE):latest*" -q) > /dev/null 2>&1 || true
 
 ###############################################################################
@@ -339,21 +336,25 @@ UT_DIR?=./pkg
 FV_DIR?=./test
 GINKGO_ARGS?= -v -trace -r
 GINKGO_FOCUS?=.*
+ENVTEST_K8S_VERSION?=1.34.x
 
 .PHONY: ut
-ut: $(ENVOY_GATEWAY_RESOURCES)
+ut: $(ENVOY_GATEWAY_RESOURCES) $(ISTIO_CHART_FILES)
 	-mkdir -p .go-pkg-cache report
 	$(CONTAINERIZED) $(CALICO_BUILD) sh -c '$(GIT_CONFIG_SSH) \
+	go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.22 && \
+	export KUBEBUILDER_ASSETS=$$(setup-envtest use $(ENVTEST_K8S_VERSION) --bin-dir /tmp/envtest-bins -p path) && \
 	ginkgo -focus="$(GINKGO_FOCUS)" $(GINKGO_ARGS) "$(UT_DIR)"'
 
 ## Run the functional tests
 fv: cluster-create load-container-images run-fvs cluster-destroy
-run-fvs: $(ENVOY_GATEWAY_RESOURCES)
+run-fvs: $(ENVOY_GATEWAY_RESOURCES) $(ISTIO_CHART_FILES)
 	-mkdir -p .go-pkg-cache report
 	$(CONTAINERIZED) $(CALICO_BUILD) sh -c '$(GIT_CONFIG_SSH) \
 	ginkgo -focus="$(GINKGO_FOCUS)" $(GINKGO_ARGS) "$(FV_DIR)"'
 
 ## Create a local kind dual stack cluster.
+KIND_CLUSTER_NAME?=tigera-operator-kind
 KIND_KUBECONFIG?=./kubeconfig.yaml
 KINDEST_NODE_VERSION?=v1.31.12
 cluster-create: $(BINDIR)/kubectl $(BINDIR)/kind
@@ -362,11 +363,12 @@ cluster-create: $(BINDIR)/kubectl $(BINDIR)/kind
 
 	# Create a kind cluster.
 	$(BINDIR)/kind create cluster \
+	        --name $(KIND_CLUSTER_NAME) \
 	        --config ./deploy/kind-config.yaml \
 	        --kubeconfig $(KIND_KUBECONFIG) \
 	        --image kindest/node:$(KINDEST_NODE_VERSION)
 
-	./deploy/scripts/ipv6_kind_cluster_update.sh
+	KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) ./deploy/scripts/ipv6_kind_cluster_update.sh
 	# Deploy resources needed in test env.
 	$(MAKE) deploy-crds
 
@@ -456,7 +458,7 @@ IMAGE_TARS := calico-node.tar \
 
 load-container-images: ./test/load_images_on_kind_cluster.sh $(IMAGE_TARS)
 	# Load the latest tar files onto the currently running kind cluster.
-	KUBECONFIG=$(KIND_KUBECONFIG) ./test/load_images_on_kind_cluster.sh $(IMAGE_TARS)
+	KUBECONFIG=$(KIND_KUBECONFIG) KIND_CLUSTER_NAME=$(KIND_CLUSTER_NAME) ./test/load_images_on_kind_cluster.sh $(IMAGE_TARS)
 	# Restart the Calico containers so they launch with the newly loaded code.
 	# TODO: We should be able to do this without restarting everything in kube-system.
 	KUBECONFIG=$(KIND_KUBECONFIG) $(BINDIR)/kubectl delete pods -n kube-system --all
@@ -469,11 +471,12 @@ load-container-images: ./test/load_images_on_kind_cluster.sh $(IMAGE_TARS)
 ##
 deploy-crds: kubectl
 	@export KUBECONFIG=$(KIND_KUBECONFIG) && \
-		$(BINDIR)/kubectl create -f pkg/crds/operator/ && \
-		$(BINDIR)/kubectl apply -f pkg/crds/calico/ && \
-		$(BINDIR)/kubectl apply -f pkg/crds/enterprise/ && \
-		$(BINDIR)/kubectl apply -f deploy/crds/elastic/elasticsearch-crd.yaml && \
-		$(BINDIR)/kubectl apply -f deploy/crds/elastic/kibana-crd.yaml && \
+		$(BINDIR)/kubectl create -f pkg/imports/crds/operator/ && \
+		$(BINDIR)/kubectl apply -f pkg/imports/crds/calico/v1.crd.projectcalico.org/ && \
+		$(BINDIR)/kubectl apply -f pkg/imports/crds/calico/policy.networking.k8s.io/ && \
+		$(BINDIR)/kubectl apply -f pkg/imports/crds/enterprise/v1.crd.projectcalico.org/ && \
+		$(BINDIR)/kubectl apply -f pkg/imports/crds/enterprise/policy.networking.k8s.io/ && \
+		$(BINDIR)/kubectl apply -f pkg/imports/crds/enterprise/01-crd-eck-bundle.yaml && \
 		$(BINDIR)/kubectl create -f deploy/crds/prometheus
 
 create-tigera-operator-namespace: kubectl
@@ -481,7 +484,7 @@ create-tigera-operator-namespace: kubectl
 
 ## Destroy local kind cluster
 cluster-destroy: $(BINDIR)/kubectl $(BINDIR)/kind
-	-$(BINDIR)/kind delete cluster
+	-$(BINDIR)/kind delete cluster --name $(KIND_CLUSTER_NAME)
 	rm -f $(KIND_KUBECONFIG)
 
 
@@ -516,9 +519,9 @@ format-check:
 dirty-check:
 	@if [ "$$(git diff --stat)" != "" ]; then \
 	echo "The following files are dirty"; git diff --stat; exit 1; fi
-	@# Check that no new CRDs needed to be committed
-	@if [ "$$(git status --porcelain pkg/crds)" != "" ]; then \
-	echo "The following CRD files need to be added"; git status --porcelain pkg/crds; exit 1; fi
+	@# Check that no new CRDs or admission policies needed to be committed
+	@if [ "$$(git status --porcelain pkg/imports)" != "" ]; then \
+	echo "The following imported files need to be added"; git status --porcelain pkg/imports; exit 1; fi
 
 foss-checks:
 	@echo Running $@...
@@ -554,55 +557,29 @@ endif
 ###############################################################################
 # Release
 ###############################################################################
-VERSION_REGEX := ^v[0-9]+\.[0-9]+\.[0-9]+$$
+## Create a release for the specified RELEASE_TAG.
 release-tag: var-require-all-RELEASE_TAG-GITHUB_TOKEN
-	$(eval VALID_TAG := $(shell echo $(RELEASE_TAG) | grep -Eq "$(VERSION_REGEX)" && echo true))
-	$(if $(VALID_TAG),,$(error $(RELEASE_TAG) is not a valid version. Please use a version in the format vX.Y.Z))
-
-# Skip releasing if the image already exists.
-	@if !$(MAKE) VERSION=$(RELEASE_TAG) release-check-image-exists; then \
-		echo "Images for $(RELEASE_TAG) already exists"; \
-		exit 0; \
-	fi
-
 	$(MAKE) release VERSION=$(RELEASE_TAG)
-	$(MAKE) release-publish-images VERSION=$(RELEASE_TAG)
-	$(MAKE) release-github VERSION=$(RELEASE_TAG)
+	REPO=$(REPO) $(MAKE) release-publish VERSION=$(RELEASE_TAG)
 
+## Generate release notes for the specified VERSION.
+release-notes: hack/bin/release var-require-all-VERSION-GITHUB_TOKEN
+	REPO=$(REPO) hack/bin/release notes
 
-release-notes: var-require-all-VERSION-GITHUB_TOKEN
-	@docker build -t tigera/release-notes -f build/Dockerfile.release-notes .
-	@docker run --rm -v $(CURDIR):/workdir -e	GITHUB_TOKEN=$(GITHUB_TOKEN) -e VERSION=$(VERSION) tigera/release-notes
-
-## Tags and builds a release from start to finish.
-release: release-prereqs
-ifneq ($(VERSION), $(GIT_VERSION))
-	$(error Attempt to build $(VERSION) from $(GIT_VERSION))
-endif
-	$(MAKE) release-build
-	$(MAKE) release-verify
-
-	@echo ""
-	@echo "Release build complete. Next, push the produced images."
-	@echo ""
-	@echo "  make VERSION=$(VERSION) release-publish"
-	@echo ""
+## Build a release from start to finish.
+release: clean hack/bin/release
+	hack/bin/release build
 
 ## Produces a clean build of release artifacts at the specified version.
-release-build: release-prereqs clean
+release-build: release-prereqs var-require-all-VERSION-GIT_VERSION
 # Check that the correct code is checked out.
 ifneq ($(VERSION), $(GIT_VERSION))
 	$(error Attempt to build $(VERSION) from $(GIT_VERSION))
 endif
 	$(MAKE) image-all
-	$(MAKE) tag-images-all RELEASE=true IMAGETAG=$(VERSION)
+	$(MAKE) tag-images-all IMAGETAG=$(VERSION)
 	# Generate the `latest` images.
-	$(MAKE) tag-images-all RELEASE=true IMAGETAG=latest
-
-## Verifies the release artifacts produces by `make release-build` are correct.
-release-verify: release-prereqs
-	# Check the reported version is correct for each release artifact.
-	if ! docker run $(IMAGE_REGISTRY)/$(BUILD_IMAGE):$(VERSION)-$(ARCH) --version | grep '^Operator: $(VERSION)$$'; then echo "Reported version:" `docker run $(IMAGE_REGISTRY)/$(BUILD_IMAGE):$(VERSION)-$(ARCH) --version ` "\nExpected version: $(VERSION)"; false; else echo "\nVersion check passed\n"; fi
+	$(MAKE) tag-images-all IMAGETAG=latest
 
 release-check-image-exists: release-prereqs
 	@echo "Checking if $(IMAGE_REGISTRY)/$(BUILD_IMAGE):$(VERSION) exists already"; \
@@ -613,14 +590,15 @@ release-check-image-exists: release-prereqs
 		echo "Image tag check passed; image does not already exist"; \
 	fi
 
-release-publish-images: release-prereqs release-check-image-exists
-	# Push images.
-	$(MAKE) push-all push-manifests push-non-manifests RELEASE=true IMAGETAG=$(VERSION)
+release-publish: hack/bin/release
+	hack/bin/release publish
 
-release-github: release-notes hack/bin/gh
-	@echo "Creating github release for $(VERSION)"
-	hack/bin/gh release create $(VERSION) --title $(VERSION) --draft --notes-file $(VERSION)-release-notes.md
-	@echo "$(VERSION) GitHub release created in draft state. Please review and publish: https://github.com/tigera/operator/releases/tag/$(VERSION) ."
+release-publish-images: release-prereqs release-check-image-exists var-require-all-VERSION
+	# Push images.
+	$(MAKE) push-all push-manifests push-non-manifests IMAGETAG=$(VERSION)
+
+release-github: hack/bin/release var-require-all-VERSION-GITHUB_TOKEN
+	hack/bin/release github
 
 GITHUB_CLI_VERSION?=2.62.0
 hack/bin/gh:
@@ -630,69 +608,35 @@ hack/bin/gh:
 	chmod +x $@
 	rm hack/bin/gh.tgz
 
-hack/bin/release-from: $(shell find ./hack/release-from -type f)
+hack/bin/release: $(shell find ./hack/release -type f)
 	mkdir -p hack/bin
 	$(CONTAINERIZED) $(CALICO_BUILD) \
 	sh -c '$(GIT_CONFIG_SSH) \
-	go build -buildvcs=false -o hack/bin/release-from ./hack/release-from'
+	go build -buildvcs=false -o hack/bin/release ./hack/release'
 
-release-from: hack/bin/release-from var-require-all-VERSION-OPERATOR_BASE_VERSION var-require-one-of-EE_IMAGES_VERSIONS-OS_IMAGES_VERSIONS
-	hack/bin/release-from
+hack/release/ut:
+	mkdir -p report/release
+	$(CONTAINERIZED) $(CALICO_BUILD) \
+	sh -c '$(GIT_CONFIG_SSH) \
+	gotestsum --format=testname --junitfile report/release/ut.xml $(PACKAGE_NAME)/hack/release'
+
+release-from: hack/bin/release var-require-all-VERSION-OPERATOR_BASE_VERSION var-require-one-of-EE_IMAGES_VERSIONS-OS_IMAGES_VERSIONS
+	hack/bin/release from
 
 # release-prereqs checks that the environment is configured properly to create a release.
 release-prereqs:
 ifndef VERSION
-	$(error VERSION is undefined - run using make release VERSION=vX.Y.Z)
+	$(error VERSION is undefined - specify using "VERSION=vX.Y.Z" with make target(s))
 endif
 ifdef LOCAL_BUILD
 	$(error LOCAL_BUILD must not be set for a release)
 endif
 
-check-milestone: hack/bin/gh var-require-all-VERSION-GITHUB_TOKEN
-	@gh extension install valeriobelli/gh-milestone
-	@echo "Checking milestone $(VERSION) exists"
-	$(eval MILESTONE_NUMBER := $(shell gh milestone list --query $(VERSION) --repo $(REPO) --state all --json title --jq '.[0].title' | grep $(VERSION)))
-	$(if $(MILESTONE_NUMBER),,$(error Milestone $(VERSION) does not exist))
-	@echo "Checking $(VERSION) milestone has no open PRs"
-	$(eval OPEN_PRS := $(shell gh search prs --milestone $(VERSION) --repo $(REPO) --state open --json number --jq '.[].number'))
-	$(if $(OPEN_PRS),$(error Milestone $(VERSION) has open PRs))
-	@echo "Checking milestone $(VERSION) is closed"
-	$(eval CLOSED_MILESTONE := $(shell gh milestone list --query $(VERSION) --repo $(REPO) --state closed --json title --jq '.[0].title' | grep $(VERSION)))
-	$(if $(CLOSED_MILESTONE),,$(error Milestone $(VERSION) is not closed))
+release-prep: hack/bin/release hack/bin/gh var-require-all-VERSION var-require-one-of-CALICO_VERSION-ENTERPRISE_VERSION
+	@REPO=$(REPO) hack/bin/release prep
 
-release-prep: check-milestone var-require-all-GIT_PR_BRANCH_BASE-GIT_REPO_SLUG-VERSION-CALICO_VERSION-COMMON_VERSION-CALICO_ENTERPRISE_VERSION
-	$(YQ_V4) ".title = \"$(CALICO_ENTERPRISE_VERSION)\" | .components |= with_entries(select(.key | test(\"^(eck-|coreos-).*\") | not)) |= with(.[]; .version = \"$(CALICO_ENTERPRISE_VERSION)\")" -i config/enterprise_versions.yml
-	$(YQ_V4) ".title = \"$(CALICO_VERSION)\" | .components.[].version = \"$(CALICO_VERSION)\"" -i config/calico_versions.yml
-	sed -i "s/\"gcr.io.*\"/\"quay.io\/\"/g" pkg/components/images.go
-	sed -i "s/\"gcr.io.*\"/\"quay.io\"/g" hack/gen-versions/main.go
-	$(MAKE) gen-versions release-prep/create-and-push-branch release-prep/create-pr release-prep/set-pr-labels
-
-GIT_REMOTE?=origin
-ifneq ($(if $(GIT_REPO_SLUG),$(shell dirname $(GIT_REPO_SLUG)),), $(shell dirname `git config remote.$(GIT_REMOTE).url | cut -d: -f2`))
-GIT_FORK_USER:=$(shell dirname `git config remote.$(GIT_REMOTE).url | cut -d: -f2`)
-endif
-GIT_PR_BRANCH_BASE?=$(if $(SEMAPHORE),$(SEMAPHORE_GIT_BRANCH),)
-GIT_REPO_SLUG?=$(if $(SEMAPHORE),$(SEMAPHORE_GIT_REPO_SLUG),)
-RELEASE_UPDATE_BRANCH?=$(if $(SEMAPHORE),semaphore-,)auto-build-updates-$(VERSION)
-GIT_PR_BRANCH_HEAD?=$(if $(GIT_FORK_USER),$(GIT_FORK_USER):$(RELEASE_UPDATE_BRANCH),$(RELEASE_UPDATE_BRANCH))
-release-prep/create-and-push-branch:
-ifeq ($(shell git rev-parse --abbrev-ref HEAD),$(RELEASE_UPDATE_BRANCH))
-	$(error Current branch is pull request head, cannot set it up.)
-endif
-	-git branch -D $(RELEASE_UPDATE_BRANCH)
-	-$(GIT) push $(GIT_REMOTE) --delete $(RELEASE_UPDATE_BRANCH)
-	git checkout -b $(RELEASE_UPDATE_BRANCH)
-	$(GIT) add config/*_versions.yml hack/gen-versions/main.go pkg/components/* pkg/crds/*
-	$(GIT) commit -m "Automatic version updates for $(VERSION) release"
-	$(GIT) push $(GIT_REMOTE) $(RELEASE_UPDATE_BRANCH)
-
-release-prep/create-pr:
-	$(call github_pr_create,$(GIT_REPO_SLUG),[$(GIT_PR_BRANCH_BASE)] $(if $(SEMAPHORE), Semaphore,) Auto Release Update for $(VERSION),$(GIT_PR_BRANCH_HEAD),$(GIT_PR_BRANCH_BASE))
-	echo 'Created release update pull request for $(VERSION): $(PR_NUMBER)'
-
-release-prep/set-pr-labels:
-	$(call github_pr_add_comment,$(GIT_REPO_SLUG),$(PR_NUMBER),/merge-when-ready release-note-not-required docs-not-required delete-branch)
-	echo "Added labels to pull request $(PR_NUMBER): merge-when-ready, release-note-not-required, docs-not-required & delete-branch"
+create-release-branch: hack/bin/release var-require-all-CALICO_REF-ENTERPRISE_REF var-require-one-of-STREAM-RELEASE_STREAM
+	hack/bin/release branch
 
 ###############################################################################
 # Utilities
@@ -738,9 +682,13 @@ $(BINDIR)/gen-versions: $(shell find ./hack/gen-versions -type f)
 # $(1) is the product
 define prep_local_crds
     $(eval product := $(1))
-	rm -rf pkg/crds/$(product)
+	rm -rf pkg/imports/crds/$(product)
+	rm -rf pkg/imports/admission/$(product)
 	rm -rf .crds/$(product)
-	mkdir -p pkg/crds/$(product)
+	mkdir -p pkg/imports/crds/$(product)/v1.crd.projectcalico.org/
+	mkdir -p pkg/imports/crds/$(product)/v3.projectcalico.org/
+	mkdir -p pkg/imports/crds/$(product)/policy.networking.k8s.io/
+	mkdir -p pkg/imports/admission/$(product)
 	mkdir -p .crds/$(product)
 endef
 
@@ -752,17 +700,32 @@ define fetch_crds
     $(eval branch := $(2))
     $(eval dir := $(3))
 	@echo "Fetching $(dir) CRDs from $(project) branch $(branch)"
-	git -C .crds/$(dir) clone --depth 1 --branch $(branch) --single-branch git@github.com:$(project).git ./
+	git -C .crds/$(dir) clone --depth 1 --branch $(branch) --single-branch $(GIT_CLONE_URL_BASE)$(project).git ./
 endef
-define copy_crds
+define copy_v1_crds
     $(eval dir := $(1))
 		$(eval product := $(2))
-	@cp $(dir)/libcalico-go/config/crd/* pkg/crds/$(product)/ && echo "Copied $(product) CRDs"
+	@cp $(dir)/libcalico-go/config/crd/* pkg/imports/crds/$(product)/v1.crd.projectcalico.org/ && echo "Copied $(product) CRDs"
+endef
+define copy_v3_crds
+    $(eval dir := $(1))
+		$(eval product := $(2))
+	@cp $(dir)/api/config/crd/* pkg/imports/crds/$(product)/v3.projectcalico.org/ && echo "Copied $(product) CRDs"
+endef
+define copy_k8s_policy_crds
+    $(eval product := $(1))
+	@mv pkg/imports/crds/$(product)/v1.crd.projectcalico.org/policy.networking.k8s.io_* pkg/imports/crds/$(product)/policy.networking.k8s.io/ 2>/dev/null; true
+	@echo "Moved $(product) K8s policy CRDs to dedicated directory"
 endef
 define copy_eck_crds
     $(eval dir := $(1))
 		$(eval product := $(2))
-	@cp $(dir)/charts/tigera-operator/crds/eck/* pkg/crds/$(product)/ && echo "Copied $(product) ECK CRDs"
+	@cp $(dir)/charts/crd.projectcalico.org.v1/templates/eck/* pkg/imports/crds/$(product)/ && echo "Copied $(product) ECK CRDs"
+endef
+define copy_admission_policies
+    $(eval dir := $(1))
+		$(eval product := $(2))
+	@cp $(dir)/api/admission/* pkg/imports/admission/$(product)/ && echo "Copied $(product) admission policies"
 endef
 
 .PHONY: read-libcalico-version read-libcalico-enterprise-version
@@ -780,7 +743,10 @@ read-libcalico-calico-version:
 	if [ -z "$(CALICO_BRANCH)" ]; then echo "libcalico branch not defined"; exit 1; fi
 
 update-calico-crds: fetch-calico-crds
-	$(call copy_crds, $(CALICO_CRDS_DIR),"calico")
+	$(call copy_v1_crds, $(CALICO_CRDS_DIR),"calico")
+	$(call copy_v3_crds, $(CALICO_CRDS_DIR),"calico")
+	$(call copy_k8s_policy_crds,"calico")
+	$(call copy_admission_policies, $(CALICO_CRDS_DIR),"calico")
 
 prepare-for-calico-crds:
 	$(call prep_local_crds,"calico")
@@ -798,8 +764,11 @@ read-libcalico-enterprise-version:
 	if [ -z "$(CALICO_ENTERPRISE_BRANCH)" ]; then echo "libcalico enterprise branch not defined"; exit 1; fi
 
 update-enterprise-crds: fetch-enterprise-crds
-	$(call copy_crds,$(ENTERPRISE_CRDS_DIR),"enterprise")
+	$(call copy_v1_crds,$(ENTERPRISE_CRDS_DIR),"enterprise")
+	$(call copy_v3_crds, $(ENTERPRISE_CRDS_DIR),"enterprise")
+	$(call copy_k8s_policy_crds,"enterprise")
 	$(call copy_eck_crds,$(ENTERPRISE_CRDS_DIR),"enterprise")
+	$(call copy_admission_policies,$(ENTERPRISE_CRDS_DIR),"enterprise")
 
 prepare-for-enterprise-crds:
 	$(call prep_local_crds,"enterprise")
@@ -878,7 +847,7 @@ deploy: manifests kustomize
 manifests:
 	$(DOCKER_RUN) sh -c 'controller-gen crd paths="./api/..." output:crd:artifacts:config=config/crd/bases'
 	for x in $$(find config/crd/bases/*); do sed -i -e '/creationTimestamp: null/d' -e '/^---/d' -e '/^\s*$$/d' $$x; done
-	@docker run --rm --user $(id -u):$(id -g) -v $(CURDIR)/pkg/crds/operator/:/work/crds/operator/ tmknom/prettier --write --parser=yaml /work
+	@docker run --rm --user $(id -u):$(id -g) -v $(CURDIR)/pkg/imports/crds/operator/:/work/crds/operator/ tmknom/prettier --write --parser=yaml /work
 
 # Run go fmt against code
 fmt:
@@ -887,7 +856,7 @@ fmt:
 	go fmt ./...'
 
 # Run go vet against code
-vet:
+vet: $(ISTIO_CHART_FILES)
 	$(CONTAINERIZED) $(CALICO_BUILD) \
 	sh -c '$(GIT_CONFIG_SSH) \
 	go vet ./...'
@@ -924,13 +893,23 @@ $(KUSTOMIZE): $(HACK_BIN)
 
 
 # Options for 'bundle-build'
-ifneq ($(origin CHANNELS), undefined)
-BUNDLE_CHANNELS := --channels=$(CHANNELS)
-endif
+
+# Set the channels to the current release branch, unless
+# we got another one passed to us. Channel should be
+# release-vX.YY
+CHANNEL ?= $(shell git branch --show-current)
+BUNDLE_CHANNEL = --channels=$(if \
+		 $(findstring release-v1,$(CHANNEL)),$(CHANNEL),\
+		 $(error Channel for bundle should be a release branch of the format 'release-vX.YY', not '$(CHANNEL)'))
+
+# We only specify one channel so we don't need to set a
+# default, but if we have one then include it.
 ifneq ($(origin DEFAULT_CHANNEL), undefined)
 BUNDLE_DEFAULT_CHANNEL := --default-channel=$(DEFAULT_CHANNEL)
 endif
-BUNDLE_METADATA_OPTS ?= $(BUNDLE_CHANNELS) $(BUNDLE_DEFAULT_CHANNEL)
+
+# Collate our metadata
+BUNDLE_METADATA_OPTS ?= $(BUNDLE_CHANNEL) $(BUNDLE_DEFAULT_CHANNEL)
 
 BUNDLE_BASE_DIR ?= $(BUILD_DIR)/bundle/$(VERSION)
 BUNDLE_CRD_DIR ?= $(BUNDLE_BASE_DIR)/crds
@@ -969,7 +948,8 @@ bundle-generate: manifests $(KUSTOMIZE) $(OPERATOR_SDK_BARE) bundle-manifests
 		--verbose \
 		--manifests \
 		--package tigera-operator \
-		--metadata $(BUNDLE_METADATA_OPTS)
+		--metadata \
+		$(BUNDLE_METADATA_OPTS)
 
 # Update a generated bundle so that it can be certified.
 .PHONY: update-bundle
@@ -1037,34 +1017,6 @@ var-require-all-%:
 # must be set you would call var-require-all-FOO-BAR.
 var-require-one-of-%:
 	$(MAKE) var-require REQUIRED_VARS=$*
-
-GITHUB_API_EXIT_ON_FAILURE?=1
-# Call the github API. $(1) is the http method type for the https request, $(2) is the repo slug, and is $(3) is for json
-# data (if omitted then no data is set for the request). If GITHUB_API_EXIT_ON_FAILURE is set then the macro exits with 1
-# on failure. On success, the ENV variable GITHUB_API_RESPONSE will contain the response from github
-define github_call_api
-	$(eval CMD := $(CURL) -X $(1) \
-		-H "Content-Type: application/json"\
-		-H "Authorization: Bearer ${GITHUB_TOKEN}"\
-		https://api.github.com/repos/$(2) $(if $(3),--data '$(3)',))
-	$(eval GITHUB_API_RESPONSE := $(shell $(CMD) | sed -e 's/#/\\\#/g'))
-	$(if $(GITHUB_API_EXIT_ON_FAILURE), $(if $(GITHUB_API_RESPONSE),,exit 1),)
-endef
-
-# Create the pull request. $(1) is the repo slug, $(2) is the title, $(3) is the head branch and $(4) is the base branch.
-# If the call was successful then the ENV variable PR_NUMBER will contain the pull request number of the created pull request.
-define github_pr_create
-	$(eval JSON := {"title": "$(2)", "head": "$(3)", "base": "$(4)"})
-	$(call github_call_api,POST,$(1)/pulls,$(JSON))
-	$(eval PR_NUMBER := $(filter-out null,$(shell echo '$(GITHUB_API_RESPONSE)' | jq '.number')))
-endef
-
-# Create a comment on a pull request. $(1) is the repo slug, $(2) is the pull request number, and $(3) is the comment
-# body.
-define github_pr_add_comment
-	$(eval JSON := {"body":"$(3)"})
-	$(call github_call_api,POST,$(1)/issues/$(2)/comments,$(JSON))
-endef
 
 #####################################
 #####################################

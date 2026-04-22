@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -237,6 +237,51 @@ var (
 		variant:   calicoVariant,
 	}
 {{- end }}
+{{ with index .Components "istio-pilot" }}
+	ComponentCalicoIstioPilot = Component{
+		Version:   "{{ .Version }}",
+		Image:     "{{ .Image }}",
+		Registry:  "{{ .Registry }}",
+		imagePath: "{{ .ImagePath }}",
+		variant:   calicoVariant,
+	}
+{{- end }}
+{{ with index .Components "istio-install-cni" }}
+	ComponentCalicoIstioInstallCNI = Component{
+		Version:   "{{ .Version }}",
+		Image:     "{{ .Image }}",
+		Registry:  "{{ .Registry }}",
+		imagePath: "{{ .ImagePath }}",
+		variant:   calicoVariant,
+	}
+{{- end }}
+{{ with index .Components "istio-ztunnel" }}
+	ComponentCalicoIstioZTunnel = Component{
+		Version:   "{{ .Version }}",
+		Image:     "{{ .Image }}",
+		Registry:  "{{ .Registry }}",
+		imagePath: "{{ .ImagePath }}",
+		variant:   calicoVariant,
+	}
+{{- end }}
+{{ with index .Components "istio-proxyv2" }}
+	ComponentCalicoIstioProxyv2 = Component{
+		Version:   "{{ .Version }}",
+		Image:     "{{ .Image }}",
+		Registry:  "{{ .Registry }}",
+		imagePath: "{{ .ImagePath }}",
+		variant:   calicoVariant,
+	}
+{{- end }}
+{{ with index .Components.webhooks }}
+	ComponentCalicoWebhooks = Component{
+		Version:   "{{ .Version }}",
+		Image:     "{{ .Image }}",
+		Registry:  "{{ .Registry }}",
+		imagePath: "{{ .ImagePath }}",
+		variant:   calicoVariant,
+	}
+{{- end }}
 
 	CalicoImages = []Component{
 		ComponentCalicoCNI,
@@ -264,5 +309,10 @@ var (
 		ComponentCalicoEnvoyProxy,
 		ComponentCalicoEnvoyRatelimit,
 		ComponentCalicoGuardian,
+		ComponentCalicoIstioPilot,
+		ComponentCalicoIstioInstallCNI,
+		ComponentCalicoIstioZTunnel,
+		ComponentCalicoIstioProxyv2,
+		ComponentCalicoWebhooks,
 	}
 )

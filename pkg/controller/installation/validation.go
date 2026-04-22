@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2025, Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,12 +15,11 @@
 package installation
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"path"
 	"strings"
-
-	"errors"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
@@ -140,6 +139,7 @@ func validateCustomResource(instance *operatorv1.Installation) error {
 	// Verify Calico settings, if specified.
 	if instance.Spec.CalicoNetwork != nil {
 		bpfDataplane := instance.Spec.CalicoNetwork.LinuxDataplane != nil && *instance.Spec.CalicoNetwork.LinuxDataplane == operatorv1.LinuxDataplaneBPF
+		felixClusterRoutingMode := felixProgramsClusterRoutes(instance)
 
 		// Perform validation on non-IPPool fields that rely on IP pool configuration. Validation of the IP pools themselves
 		// happens in the IP pool controller.
@@ -168,15 +168,17 @@ func validateCustomResource(instance *operatorv1.Installation) error {
 					// Verify the specified encapsulation type is valid.
 					switch pool.Encapsulation {
 					case operatorv1.EncapsulationIPIP, operatorv1.EncapsulationIPIPCrossSubnet:
-						// IPIP currently requires BGP to be running in order to program routes.
-						if instance.Spec.CalicoNetwork.BGP == nil || *instance.Spec.CalicoNetwork.BGP == operatorv1.BGPDisabled {
-							return fmt.Errorf("IPIP encapsulation requires that BGP is enabled")
+						// In BIRD cluster routing mode, IPIP currently requires BGP to be running in order to program routes.
+						if !felixClusterRoutingMode &&
+							(instance.Spec.CalicoNetwork.BGP == nil || *instance.Spec.CalicoNetwork.BGP == operatorv1.BGPDisabled) {
+							return fmt.Errorf("with BIRD cluster routing mode, IPIP encapsulation requires that BGP is enabled")
 						}
 					case operatorv1.EncapsulationVXLAN, operatorv1.EncapsulationVXLANCrossSubnet:
 					case operatorv1.EncapsulationNone:
-						// Unencapsulated currently requires BGP to be running in order to program routes.
-						if instance.Spec.CalicoNetwork.BGP == nil || *instance.Spec.CalicoNetwork.BGP == operatorv1.BGPDisabled {
-							return fmt.Errorf("unencapsulated IP pools require that BGP is enabled")
+						// In BIRD cluster routing mode, Unencapsulated currently requires BGP to be running in order to program routes.
+						if !felixClusterRoutingMode &&
+							(instance.Spec.CalicoNetwork.BGP == nil || *instance.Spec.CalicoNetwork.BGP == operatorv1.BGPDisabled) {
+							return fmt.Errorf("with BIRD cluster routing mode, unencapsulated IP pools require that BGP is enabled")
 						}
 					}
 				case operatorv1.IPAMPluginHostLocal:
@@ -331,19 +333,9 @@ func validateCustomResource(instance *operatorv1.Installation) error {
 		}
 	}
 
-	// Verify that we are running in non-privileged mode only with the appropriate feature set
+	// Verify that non-privileged mode is not Enabled, since it's been deprecated.
 	if instance.Spec.NonPrivileged != nil && *instance.Spec.NonPrivileged == operatorv1.NonPrivilegedEnabled {
-		// BPF must be disabled
-		if instance.Spec.CalicoNetwork != nil &&
-			instance.Spec.CalicoNetwork.LinuxDataplane != nil &&
-			*instance.Spec.CalicoNetwork.LinuxDataplane == operatorv1.LinuxDataplaneBPF {
-			return fmt.Errorf("non-privileged Calico is not supported when BPF dataplane is enabled")
-		}
-
-		// Only allowed to run as non-privileged for OS Calico
-		if instance.Spec.Variant == operatorv1.TigeraSecureEnterprise {
-			return fmt.Errorf("non-privileged Calico is not supported for spec.Variant=%s", operatorv1.TigeraSecureEnterprise)
-		}
+		return fmt.Errorf("non-privileged Calico is deprecated and cannot be Enabled; please, remove this field from your installation spec")
 	}
 
 	// Verify the CalicoNodeDaemonSet overrides, if specified, is valid.
@@ -416,7 +408,7 @@ func validateCustomResource(instance *operatorv1.Installation) error {
 		}
 	}
 
-	if operatorv1.IsFIPSModeEnabled(instance.Spec.FIPSMode) && instance.Spec.Variant == operatorv1.TigeraSecureEnterprise {
+	if operatorv1.IsFIPSModeEnabled(instance.Spec.FIPSMode) && instance.Spec.Variant.IsEnterprise() {
 		return fmt.Errorf("installation spec.FIPSMode=%v combined with spec.Variant=%s is not supported", *instance.Spec.FIPSMode, instance.Spec.Variant)
 	}
 

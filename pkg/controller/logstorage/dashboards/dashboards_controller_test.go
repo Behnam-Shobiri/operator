@@ -1,4 +1,4 @@
-// Copyright (c) 2024-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2024-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 
 	"github.com/tigera/operator/pkg/render/logstorage/dashboards"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"github.com/stretchr/testify/mock"
@@ -66,7 +66,7 @@ func NewDashboardsControllerWithShims(
 	multiTenant bool,
 	externalElastic bool,
 ) (*DashboardsSubController, error) {
-	opts := options.AddOptions{
+	opts := options.ControllerOptions{
 		DetectedProvider: provider,
 		ClusterDomain:    clusterDomain,
 		ShutdownContext:  context.TODO(),
@@ -102,7 +102,7 @@ var _ = Describe("LogStorage Dashboards controller", func() {
 		// This BeforeEach contains common preparation for all tests - both single-tenant and multi-tenant.
 		// Any test-specific preparation should be done in subsequen BeforeEach blocks in the Contexts below.
 		scheme = runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).ShouldNot(HaveOccurred())
 		Expect(storagev1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -118,12 +118,12 @@ var _ = Describe("LogStorage Dashboards controller", func() {
 				Name: "default",
 			},
 			Status: operatorv1.InstallationStatus{
-				Variant:  operatorv1.TigeraSecureEnterprise,
+				Variant:  operatorv1.CalicoEnterprise,
 				Computed: &operatorv1.InstallationSpec{},
 			},
 			Spec: operatorv1.InstallationSpec{
 				ControlPlaneReplicas: &replicas,
-				Variant:              operatorv1.TigeraSecureEnterprise,
+				Variant:              operatorv1.CalicoEnterprise,
 				Registry:             "some.registry.org/",
 			},
 		}
@@ -143,8 +143,8 @@ var _ = Describe("LogStorage Dashboards controller", func() {
 		es.Status.Phase = esv1.ElasticsearchReadyPhase
 		Expect(cli.Create(ctx, es)).ShouldNot(HaveOccurred())
 
-		// Create the allow-tigera Tier, since the controller blocks on its existence.
-		tier := &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}}
+		// Create the calico-system Tier, since the controller blocks on its existence.
+		tier := &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}}
 		Expect(cli.Create(ctx, tier)).ShouldNot(HaveOccurred())
 	})
 

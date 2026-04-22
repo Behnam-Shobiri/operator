@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ import (
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	"github.com/tigera/operator/pkg/controller/compliance"
+	lscommon "github.com/tigera/operator/pkg/controller/logstorage/common"
 	"github.com/tigera/operator/pkg/controller/options"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
@@ -53,13 +54,16 @@ import (
 	"github.com/tigera/operator/pkg/url"
 )
 
-const ResourceName = "manager"
+const (
+	ResourceName        = "manager"
+	TrustedBundlePrefix = render.ManagerName
+)
 
 var log = logf.Log.WithName("controller_manager")
 
 // Add creates a new Manager Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	if !opts.EnterpriseCRDExists {
 		// No need to start this controller.
 		return nil
@@ -92,11 +96,20 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	}
 
 	go utils.WaitToAddLicenseKeyWatch(c, opts.K8sClientset, log, licenseAPIReady)
-	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, opts.K8sClientset, log, tierWatchReady)
-	go utils.WaitToAddNetworkPolicyWatches(c, opts.K8sClientset, log, []types.NamespacedName{
+	go utils.WaitToAddTierWatch(networkpolicy.CalicoTierName, c, opts.K8sClientset, log, tierWatchReady)
+	policiesToWatch := []types.NamespacedName{
 		{Name: render.ManagerPolicyName, Namespace: helper.InstallNamespace()},
-		{Name: networkpolicy.TigeraComponentDefaultDenyPolicyName, Namespace: helper.InstallNamespace()},
-	})
+	}
+	// The default-deny policy in calico-system is owned by the Installation
+	// controller; only watch it here when we render it ourselves, i.e. in
+	// multi-tenant mode where the Manager lives in a tenant namespace.
+	if helper.InstallNamespace() != common.CalicoNamespace {
+		policiesToWatch = append(policiesToWatch, types.NamespacedName{
+			Name:      networkpolicy.CalicoComponentDefaultDenyPolicyName,
+			Namespace: helper.InstallNamespace(),
+		})
+	}
+	go utils.WaitToAddNetworkPolicyWatches(c, opts.K8sClientset, log, policiesToWatch)
 
 	// Watch for changes to primary resource Manager
 	err = c.WatchObject(&operatorv1.Manager{}, &handler.EnqueueRequestForObject{})
@@ -142,6 +155,9 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	if err = c.WatchObject(&operatorv1.ImageSet{}, eventHandler); err != nil {
 		return fmt.Errorf("manager-controller failed to watch ImageSet: %w", err)
 	}
+	if err = c.WatchObject(&operatorv1.LogStorage{}, eventHandler); err != nil {
+		return fmt.Errorf("manager-controller failed to watch LogStorage resource: %w", err)
+	}
 	if opts.MultiTenant {
 		if err = c.WatchObject(&operatorv1.Tenant{}, &handler.EnqueueRequestForObject{}); err != nil {
 			return fmt.Errorf("manager-controller failed to watch Tenant resource: %w", err)
@@ -158,7 +174,8 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 			// We need to watch for es-gateway certificate because ui-apis still creates a
 			// client to talk to elastic via es-gateway
 			render.ManagerTLSSecretName, relasticsearch.PublicCertSecret,
-			render.VoltronTunnelSecretName, render.ComplianceServerCertSecret, render.PacketCaptureServerCert,
+			render.VoltronTunnelSecretName, render.VoltronAdditionalTunnelSecretName,
+			render.ComplianceServerCertSecret, render.PacketCaptureServerCert,
 			render.ManagerInternalTLSSecretName, monitor.PrometheusServerTLSSecretName, certificatemanagement.CASecretName,
 		} {
 			if err = utils.AddSecretsWatch(c, secretName, namespace); err != nil {
@@ -189,17 +206,14 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 }
 
 // newReconciler returns a new reconcile.Reconciler
-func newReconciler(mgr manager.Manager, opts options.AddOptions, licenseAPIReady *utils.ReadyFlag, tierWatchReady *utils.ReadyFlag) reconcile.Reconciler {
+func newReconciler(mgr manager.Manager, opts options.ControllerOptions, licenseAPIReady *utils.ReadyFlag, tierWatchReady *utils.ReadyFlag) reconcile.Reconciler {
 	c := &ReconcileManager{
 		client:          mgr.GetClient(),
 		scheme:          mgr.GetScheme(),
-		provider:        opts.DetectedProvider,
 		status:          status.New(mgr.GetClient(), "manager", opts.KubernetesVersion),
-		clusterDomain:   opts.ClusterDomain,
 		licenseAPIReady: licenseAPIReady,
 		tierWatchReady:  tierWatchReady,
-		multiTenant:     opts.MultiTenant,
-		elasticExternal: opts.ElasticExternal,
+		opts:            opts,
 	}
 	c.status.Run(opts.ShutdownContext)
 	return c
@@ -213,15 +227,10 @@ type ReconcileManager struct {
 	// that reads objects from the cache and writes to the apiserver
 	client          client.Client
 	scheme          *runtime.Scheme
-	provider        operatorv1.Provider
 	status          status.StatusManager
-	clusterDomain   string
 	licenseAPIReady *utils.ReadyFlag
 	tierWatchReady  *utils.ReadyFlag
-
-	// Whether or not the operator is running in multi-tenant mode.
-	multiTenant     bool
-	elasticExternal bool
+	opts            options.ControllerOptions
 }
 
 // GetManager returns the default manager instance with defaults populated.
@@ -247,17 +256,17 @@ func GetManager(ctx context.Context, cli client.Client, mt bool, ns string) (*op
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	// Perform any common preparation that needs to be done for single-tenant and multi-tenant scenarios.
-	helper := utils.NewNamespaceHelper(r.multiTenant, render.ManagerNamespace, request.Namespace)
-	logc := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name, "installNS", helper.InstallNamespace(), "truthNS", helper.TruthNamespace(), "multi-tenant", r.multiTenant)
+	helper := utils.NewNamespaceHelper(r.opts.MultiTenant, render.ManagerNamespace, request.Namespace)
+	logc := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name, "installNS", helper.InstallNamespace(), "truthNS", helper.TruthNamespace(), "multi-tenant", r.opts.MultiTenant)
 	logc.Info("Reconciling Manager")
 
 	// We skip requests without a namespace specified in multi-tenant setups.
-	if r.multiTenant && request.Namespace == "" {
+	if r.opts.MultiTenant && request.Namespace == "" {
 		return reconcile.Result{}, nil
 	}
 
 	// Check if this is a tenant-scoped request.
-	tenant, _, err := utils.GetTenant(ctx, r.multiTenant, r.client, request.Namespace)
+	tenant, _, err := utils.GetTenant(ctx, r.opts.MultiTenant, r.client, request.Namespace)
 	if errors.IsNotFound(err) {
 		logc.Info("No Tenant in this Namespace, skip")
 		return reconcile.Result{}, nil
@@ -267,7 +276,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 	}
 
 	// Fetch the Manager instance that corresponds with this reconcile trigger.
-	instance, err := GetManager(ctx, r.client, r.multiTenant, request.Namespace)
+	instance, err := GetManager(ctx, r.client, r.opts.MultiTenant, request.Namespace)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			logc.Info("Manager object not found")
@@ -297,7 +306,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		}
 	}
 
-	if !utils.IsAPIServerReady(r.client, logc) {
+	if !utils.IsProjectCalicoV3Available(r.client, r.opts, logc) {
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for Tigera API server to be ready", nil, logc)
 		return reconcile.Result{}, nil
 	}
@@ -308,13 +317,13 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
-	// Ensure the allow-tigera tier exists, before rendering any network policies within it.
-	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.TigeraComponentTierName}, &v3.Tier{}); err != nil {
+	// Ensure the calico-system tier exists, before rendering any network policies within it.
+	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.CalicoTierName}, &v3.Tier{}); err != nil {
 		if errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for allow-tigera tier to be created, see the 'tiers' TigeraStatus for more information", err, logc)
+			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for calico-system tier to be created, see the 'tiers' TigeraStatus for more information", err, logc)
 			return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 		} else {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying allow-tigera tier", err, logc)
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying calico-system tier", err, logc)
 			return reconcile.Result{}, err
 		}
 	}
@@ -338,7 +347,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 	// Fetch the Installation instance. We need this for a few reasons.
 	// - We need to make sure it has successfully completed installation.
 	// - We need to get the registry information from its spec.
-	variant, installation, err := utils.GetInstallation(ctx, r.client)
+	variant, installationSpec, err := utils.GetInstallationSpec(ctx, r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotFound, "Installation not found", err, logc)
@@ -353,13 +362,23 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		certificatemanager.WithLogger(logc),
 		certificatemanager.WithTenant(tenant),
 	}
-	certificateManager, err := certificatemanager.Create(r.client, installation, r.clusterDomain, helper.TruthNamespace(), opts...)
+	certificateManager, err := certificatemanager.Create(r.client, installationSpec, r.opts.ClusterDomain, helper.TruthNamespace(), opts...)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the Tigera CA", err, logc)
 		return reconcile.Result{}, err
 	}
+	dnsNames := dns.GetServiceDNSNames(render.ManagerServiceName, helper.InstallNamespace(), r.opts.ClusterDomain)
 
-	dnsNames := dns.GetServiceDNSNames(render.ManagerServiceName, helper.InstallNamespace(), r.clusterDomain)
+	// Continue to add in the legacy names and namespaces of manager components to cover version skew scenarios. These
+	// can be removed in v3.26 when the oldest version we will officially support will use the newer names and namespace
+	var legacyInstallNamespace string
+	if r.opts.MultiTenant {
+		legacyInstallNamespace = helper.InstallNamespace()
+	} else {
+		legacyInstallNamespace = render.LegacyManagerNamespace
+	}
+	legacyDNSNames := dns.GetServiceDNSNames(render.LegacyManagerServiceName, legacyInstallNamespace, r.opts.ClusterDomain)
+	dnsNames = append(dnsNames, legacyDNSNames...)
 
 	// Get or create a certificate for clients of the manager pod ui-apis container.
 	tlsSecret, err := certificateManager.GetOrCreateKeyPair(
@@ -385,7 +404,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 
 	// Determine if compliance is enabled.
 	complianceLicenseFeatureActive := utils.IsFeatureActive(license, common.ComplianceFeature)
-	complianceCR, err := compliance.GetCompliance(ctx, r.client, r.multiTenant, request.Namespace)
+	complianceCR, err := compliance.GetCompliance(ctx, r.client, r.opts.MultiTenant, request.Namespace)
 	if err != nil && !errors.IsNotFound(err) {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying compliance: ", err, logc)
 		return reconcile.Result{}, err
@@ -396,7 +415,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 	// certificates, in case the user has provided their own cert in lieu of the default certificate.
 
 	var trustedSecretNames []string
-	if !r.multiTenant {
+	if !r.opts.MultiTenant {
 		// For multi-tenant systems, we don't support user-provided certs for all components. So, we don't need to include these,
 		// and the bundle will simply use the root CA for the tenant. For single-tenant systems, we need to include these in case
 		// any of them haven't been signed by the root CA.
@@ -428,7 +447,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		// If external prometheus is enabled, the secret will be signed by the Calico CA and no secret will be created. We can skip
 		// adding it to the bundle, as trusting the CA will suffice.
 		monitorCR := &operatorv1.Monitor{}
-		if err := r.client.Get(ctx, utils.DefaultTSEEInstanceKey, monitorCR); err != nil {
+		if err := r.client.Get(ctx, utils.DefaultEnterpriseInstanceKey, monitorCR); err != nil {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying required Monitor resource: ", err, logc)
 			return reconcile.Result{}, err
 		}
@@ -460,18 +479,10 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		trustedSecretNames = append(trustedSecretNames, render.DexTLSSecretName)
 	}
 
-	bundleMaker := certificateManager.CreateTrustedBundle()
-	for _, secret := range trustedSecretNames {
-		certificate, err := certificateManager.GetCertificate(r.client, secret, helper.TruthNamespace())
-		if err != nil {
-			r.status.SetDegraded(operatorv1.CertificateError, fmt.Sprintf("Failed to retrieve %s", secret), err, logc)
-			return reconcile.Result{}, err
-		} else if certificate == nil {
-			logc.Info(fmt.Sprintf("Waiting for secret '%s' to become available", secret))
-			r.status.SetDegraded(operatorv1.ResourceNotReady, fmt.Sprintf("Waiting for secret '%s' to become available", secret), nil, logc)
-			return reconcile.Result{}, nil
-		}
-		bundleMaker.AddCertificates(certificate)
+	bundleMaker, err := certificateManager.CreateNamedTrustedBundleFromSecrets(TrustedBundlePrefix, r.client,
+		helper.TruthNamespace(), false, trustedSecretNames...)
+	if err != nil {
+		r.status.SetDegraded(operatorv1.ResourceCreateError, "Error creating trusted bundle for manager", err, logc)
 	}
 	certificateManager.AddToStatusManager(r.status, helper.InstallNamespace())
 
@@ -488,7 +499,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		return reconcile.Result{}, err
 	}
 
-	pullSecrets, err := utils.GetNetworkingPullSecrets(installation, r.client)
+	pullSecrets, err := utils.GetInstallationPullSecrets(installationSpec, r.client)
 	if err != nil {
 		log.Error(err, "Error with Pull secrets")
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error retrieving pull secrets", err, logc)
@@ -535,7 +546,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		// to Linseed. This certificate is used only for connections received over Voltron's mTLS tunnel targeting tigera-linseed.
 		// The public cert from this keypair is sent by es-kube-controllers to managed clusters so that linseed clients in those clusters
 		// can authenticate the certificate presented by Voltron.
-		linseedDNSNames := dns.GetServiceDNSNames(render.LinseedServiceName, render.ElasticsearchNamespace, r.clusterDomain)
+		linseedDNSNames := dns.GetServiceDNSNames(render.LinseedServiceName, render.ElasticsearchNamespace, r.opts.ClusterDomain)
 		linseedVoltronServerCert, err = certificateManager.GetOrCreateKeyPair(
 			r.client,
 			render.VoltronLinseedTLS,
@@ -559,7 +570,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 
 		// Single tenant MCM clusters will use "voltron" as a server name to establish mTLS connection
 		serverName := "voltron"
-		if r.multiTenant {
+		if r.opts.MultiTenant {
 			// Multi-tenant MCM clusters will use the tenat ID as a server name to establish mTLS connection
 			serverName = tenant.Spec.ID
 		}
@@ -585,17 +596,17 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 
 		// We use the CA as the server cert.
 		tunnelServerCert = certificatemanagement.NewKeyPair(tunnelCASecret, nil, "")
-		tunnelSecretPassthrough = render.NewPassthrough(tunnelCASecret)
+		tunnelSecretPassthrough = render.NewCreationPassthrough(tunnelCASecret)
 	}
 
-	keyValidatorConfig, err := utils.GetKeyValidatorConfig(ctx, r.client, authenticationCR, r.clusterDomain)
+	keyValidatorConfig, err := utils.GetKeyValidatorConfig(ctx, r.client, authenticationCR, r.opts.ClusterDomain)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceValidationError, "Failed to process the authentication CR.", err, logc)
 		return reconcile.Result{}, err
 	}
 
 	elasticLicenseType := render.ElasticsearchLicenseTypeBasic
-	if !r.elasticExternal && managementClusterConnection == nil {
+	if !r.opts.ElasticExternal && managementClusterConnection == nil {
 		if elasticLicenseType, err = utils.GetElasticLicenseType(ctx, r.client, logc); err != nil {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to get Elasticsearch license", err, logc)
 			return reconcile.Result{}, err
@@ -607,14 +618,14 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 
 	// Set replicas to 1 for management or managed clusters.
 	// TODO Remove after MCM tigera-manager HA deployment is supported.
-	replicas := installation.ControlPlaneReplicas
+	replicas := installationSpec.ControlPlaneReplicas
 	if managementCluster != nil || managementClusterConnection != nil {
 		var mcmReplicas int32 = 1
 		replicas = &mcmReplicas
 	}
 
 	trustedBundle := bundleMaker.(certificatemanagement.TrustedBundleRO)
-	if r.multiTenant {
+	if r.opts.MultiTenant {
 		// For multi-tenant systems, we load the pre-created bundle for this tenant instead of using the one we built here.
 		// Multi-tenant managers need the bundle variant that includes system root certificates, in order to verify external auth providers.
 		trustedBundle, err = certificateManager.LoadMultiTenantTrustedBundleWithRootCertificates(ctx, r.client, helper.InstallNamespace())
@@ -654,32 +665,62 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		}
 	}
 
+	// If an additional tunnel CA secret has been provisioned in the truth namespace, Voltron
+	// will mount it and serve TLS from it. This is only relevant for management clusters
+	// (Voltron is what consumes the additional CA). The secret is managed out-of-band; the
+	// controller just watches and consumes it.
+	var additionalTunnelServerCert certificatemanagement.KeyPairInterface
+	if managementCluster != nil {
+		additionalTunnelServerCert, err = r.resolveAdditionalTunnelCert(ctx, helper.TruthNamespace())
+		if err != nil {
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Error resolving additional tunnel CA", err, logc)
+			return reconcile.Result{}, err
+		}
+	}
+
+	// Determine if Kibana is enabled based on multi-tenancy and LogStorage replicas.
+	kibanaEnabled := !r.opts.MultiTenant
+	if kibanaEnabled {
+		ls := &operatorv1.LogStorage{}
+		if err := r.client.Get(ctx, utils.DefaultEnterpriseInstanceKey, ls); err != nil {
+			if !errors.IsNotFound(err) {
+				r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to query LogStorage resource", err, logc)
+				return reconcile.Result{}, err
+			}
+		} else {
+			kibanaEnabled = lscommon.KibanaEnabled(ls, r.opts.MultiTenant)
+		}
+	}
+
 	managerCfg := &render.ManagerConfiguration{
-		VoltronRouteConfig:      routeConfig,
-		KeyValidatorConfig:      keyValidatorConfig,
-		TrustedCertBundle:       trustedBundle,
-		TLSKeyPair:              tlsSecret,
-		VoltronLinseedKeyPair:   linseedVoltronServerCert,
-		PullSecrets:             pullSecrets,
-		OpenShift:               r.provider.IsOpenShift(),
-		Installation:            installation,
-		ManagementCluster:       managementCluster,
-		NonClusterHost:          nonclusterhost,
-		TunnelServerCert:        tunnelServerCert,
-		InternalTLSKeyPair:      internalTrafficSecret,
-		ClusterDomain:           r.clusterDomain,
-		ESLicenseType:           elasticLicenseType,
-		Replicas:                replicas,
-		Compliance:              complianceCR,
-		ComplianceLicenseActive: complianceLicenseFeatureActive,
-		ComplianceNamespace:     utils.NewNamespaceHelper(r.multiTenant, render.ComplianceNamespace, request.Namespace).InstallNamespace(),
-		Namespace:               helper.InstallNamespace(),
-		TruthNamespace:          helper.TruthNamespace(),
-		Tenant:                  tenant,
-		ExternalElastic:         r.elasticExternal,
-		BindingNamespaces:       namespaces,
-		OSSTenantNamespaces:     ossTenantNamespaces,
-		Manager:                 instance,
+		VoltronRouteConfig:         routeConfig,
+		KeyValidatorConfig:         keyValidatorConfig,
+		TrustedCertBundle:          trustedBundle,
+		TLSKeyPair:                 tlsSecret,
+		VoltronLinseedKeyPair:      linseedVoltronServerCert,
+		PullSecrets:                pullSecrets,
+		OpenShift:                  r.opts.DetectedProvider.IsOpenShift(),
+		Installation:               installationSpec,
+		ManagementCluster:          managementCluster,
+		NonClusterHost:             nonclusterhost,
+		TunnelServerCert:           tunnelServerCert,
+		AdditionalTunnelServerCert: additionalTunnelServerCert,
+		InternalTLSKeyPair:         internalTrafficSecret,
+		ClusterDomain:              r.opts.ClusterDomain,
+		ESLicenseType:              elasticLicenseType,
+		Replicas:                   replicas,
+		Compliance:                 complianceCR,
+		ComplianceLicenseActive:    complianceLicenseFeatureActive,
+		ComplianceNamespace:        utils.NewNamespaceHelper(r.opts.MultiTenant, render.ComplianceNamespace, request.Namespace).InstallNamespace(),
+		Namespace:                  helper.InstallNamespace(),
+		TruthNamespace:             helper.TruthNamespace(),
+		Tenant:                     tenant,
+		ExternalElastic:            r.opts.ElasticExternal,
+		BindingNamespaces:          namespaces,
+		OSSTenantNamespaces:        ossTenantNamespaces,
+		Manager:                    instance,
+		KibanaEnabled:              kibanaEnabled,
+		CACertCommonName:           certificateManager.CACertCommonName(),
 	}
 
 	// Render the desired objects from the CRD and create or update them.
@@ -694,14 +735,6 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		return reconcile.Result{}, err
 	}
 
-	setup := render.NewSetup(&render.SetUpConfiguration{
-		OpenShift:       r.provider.IsOpenShift(),
-		Installation:    installation,
-		PullSecrets:     pullSecrets,
-		Namespace:       helper.InstallNamespace(),
-		PSS:             render.PSSRestricted,
-		CreateNamespace: !tenant.MultiTenant(),
-	})
 	components := []render.Component{
 		// Install manager components.
 		component,
@@ -716,6 +749,7 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 				rcertificatemanagement.NewKeyPairOption(linseedVoltronServerCert, true, true),
 				rcertificatemanagement.NewKeyPairOption(internalTrafficSecret, true, true),
 				rcertificatemanagement.NewKeyPairOption(tunnelServerCert, false, true),
+				rcertificatemanagement.NewKeyPairOption(additionalTunnelServerCert, false, true),
 			},
 			TrustedBundle: bundleMaker,
 		}),
@@ -725,22 +759,19 @@ func (r *ReconcileManager) Reconcile(ctx context.Context, request reconcile.Requ
 		components = append(components, tunnelSecretPassthrough)
 	}
 
-	setupHandler := defaultHandler
-	if tenant.MultiTenant() {
-		// In standard installs, the Manager CR owns all the objects. For multi-tenant, pull secrets are owned by the Tenant instance.
-		setupHandler = utils.NewComponentHandler(log, r.client, r.scheme, tenant)
-	}
-	if err := setupHandler.CreateOrUpdateOrDelete(ctx, setup, r.status); err != nil {
-		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating resource", err, logc)
-		return reconcile.Result{}, err
-	}
-
 	for _, component := range components {
 		if err := defaultHandler.CreateOrUpdateOrDelete(ctx, component, r.status); err != nil {
 			r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating resource", err, logc)
 			return reconcile.Result{}, err
 		}
 	}
+
+	// Check BYO certificate expiry warnings.
+	certificatemanagement.CheckKeyPairWarnings(map[string]certificatemanagement.KeyPairInterface{
+		render.ManagerTLSSecretName:         tlsSecret,
+		render.ManagerInternalTLSSecretName: internalTrafficSecret,
+		render.VoltronLinseedTLS:            linseedVoltronServerCert,
+	}, r.status)
 
 	// Clear the degraded bit if we've reached this far.
 	r.status.ClearDegraded()
@@ -819,4 +850,23 @@ func getVoltronRouteConfig(ctx context.Context, cli client.Client, managerNamesp
 	}
 
 	return builder.Build()
+}
+
+// resolveAdditionalTunnelCert looks up the additional tunnel CA secret in the truth namespace.
+// When the secret is present, a KeyPair is returned so that Voltron mounts the CA and gets the
+// corresponding environment variables set. When the secret is absent, (nil, nil) is returned and
+// Voltron runs without the additional CA. The secret is created and rotated out-of-band; this
+// controller only consumes it.
+func (r *ReconcileManager) resolveAdditionalTunnelCert(
+	ctx context.Context,
+	truthNamespace string,
+) (certificatemanagement.KeyPairInterface, error) {
+	secret, err := utils.GetSecret(ctx, r.client, render.VoltronAdditionalTunnelSecretName, truthNamespace)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read %s secret: %w", render.VoltronAdditionalTunnelSecretName, err)
+	}
+	if secret == nil {
+		return nil, nil
+	}
+	return certificatemanagement.NewKeyPair(secret, nil, ""), nil
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -53,8 +53,8 @@ const (
 	ComplianceSnapshotterName                                 = "compliance-snapshotter"
 	ComplianceReporterName                                    = "compliance-reporter"
 	ComplianceBenchmarkerName                                 = "compliance-benchmarker"
-	ComplianceAccessPolicyName                                = networkpolicy.TigeraComponentPolicyPrefix + "compliance-access"
-	ComplianceServerPolicyName                                = networkpolicy.TigeraComponentPolicyPrefix + ComplianceServerName
+	ComplianceAccessPolicyName                                = networkpolicy.CalicoComponentPolicyPrefix + "compliance-access"
+	ComplianceServerPolicyName                                = networkpolicy.CalicoComponentPolicyPrefix + ComplianceServerName
 	MultiTenantComplianceManagedClustersAccessRoleBindingName = "compliance-server-managed-cluster-access"
 
 	// ServiceAccount names.
@@ -171,7 +171,7 @@ func (c *complianceComponent) SupportedOSType() rmeta.OSType {
 }
 
 func (c *complianceComponent) Objects() ([]client.Object, []client.Object) {
-	var complianceObjs []client.Object
+	var complianceObjs, objsToDelete []client.Object
 	if c.cfg.Tenant.MultiTenant() {
 		complianceObjs = append(complianceObjs, c.multiTenantManagedClustersAccess()...)
 		// We need to bind compliance components that run inside the managed cluster
@@ -193,8 +193,8 @@ func (c *complianceComponent) Objects() ([]client.Object, []client.Object) {
 			c.complianceSnapshotterClusterRoleBinding())
 	} else {
 		complianceObjs = append(complianceObjs,
-			c.complianceAccessAllowTigeraNetworkPolicy(),
-			networkpolicy.AllowTigeraDefaultDeny(c.cfg.Namespace),
+			c.complianceAccessCalicoSystemNetworkPolicy(),
+			networkpolicy.CalicoSystemDefaultDeny(c.cfg.Namespace),
 		)
 		complianceObjs = append(complianceObjs,
 			c.complianceControllerServiceAccount(),
@@ -231,10 +231,9 @@ func (c *complianceComponent) Objects() ([]client.Object, []client.Object) {
 		complianceObjs = append(complianceObjs, configmap.ToRuntimeObjects(c.cfg.KeyValidatorConfig.RequiredConfigMaps(c.cfg.Namespace)...)...)
 	}
 
-	var objsToDelete []client.Object
 	if c.cfg.ManagementClusterConnection == nil {
 		complianceObjs = append(complianceObjs,
-			c.complianceServerAllowTigeraNetworkPolicy(),
+			c.complianceServerCalicoSystemNetworkPolicy(),
 			c.complianceServerClusterRole(),
 			c.complianceServerService(),
 			c.complianceServerDeployment(),
@@ -267,11 +266,18 @@ func (c *complianceComponent) Objects() ([]client.Object, []client.Object) {
 		complianceObjs = append(complianceObjs, c.complianceControllerClusterAdminClusterRoleBinding())
 	}
 
-	if c.cfg.HasNoLicense {
-		return nil, complianceObjs
+	deprecatedObjs := []client.Object{
+		// allow-tigera Tier was renamed to calico-system
+		networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("compliance-server", c.cfg.Namespace),
+		networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("compliance-access", c.cfg.Namespace),
+		networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("default-deny", c.cfg.Namespace),
 	}
 
-	return complianceObjs, objsToDelete
+	if c.cfg.HasNoLicense {
+		return nil, append(complianceObjs, deprecatedObjs...)
+	}
+
+	return complianceObjs, append(objsToDelete, deprecatedObjs...)
 }
 
 func (c *complianceComponent) Ready() bool {
@@ -1625,12 +1631,12 @@ func (c *complianceComponent) getCISDownloadReportTemplates() []v3.ReportTemplat
 
 // Allow internal communication from compliance-benchmarker, compliance-controller, compliance-snapshotter, compliance-reporter
 // to apiserver, coredns, linseed, and elasticsearch.
-func (c *complianceComponent) complianceAccessAllowTigeraNetworkPolicy() *v3.NetworkPolicy {
+func (c *complianceComponent) complianceAccessCalicoSystemNetworkPolicy() *v3.NetworkPolicy {
 	egressRules := []v3.Rule{
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.KubeAPIServerServiceSelectorEntityRule,
+			Destination: networkpolicy.KubeAPIServerEntityRule,
 		},
 	}
 
@@ -1658,7 +1664,7 @@ func (c *complianceComponent) complianceAccessAllowTigeraNetworkPolicy() *v3.Net
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
+			Tier:     networkpolicy.CalicoTierName,
 			Selector: networkpolicy.KubernetesAppSelector(ComplianceBenchmarkerName, ComplianceControllerName, ComplianceSnapshotterName, ComplianceReporterName),
 			Types:    []v3.PolicyType{v3.PolicyTypeEgress},
 			Egress:   egressRules,
@@ -1667,13 +1673,13 @@ func (c *complianceComponent) complianceAccessAllowTigeraNetworkPolicy() *v3.Net
 }
 
 // Allow internal communication to compliance-server from Manager.
-func (c *complianceComponent) complianceServerAllowTigeraNetworkPolicy() *v3.NetworkPolicy {
+func (c *complianceComponent) complianceServerCalicoSystemNetworkPolicy() *v3.NetworkPolicy {
 	networkpolicyHelper := networkpolicy.Helper(c.cfg.Tenant.MultiTenant(), c.cfg.Namespace)
 	egressRules := []v3.Rule{
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.KubeAPIServerServiceSelectorEntityRule,
+			Destination: networkpolicy.KubeAPIServerEntityRule,
 		},
 		{
 			Action:      v3.Allow,
@@ -1724,7 +1730,7 @@ func (c *complianceComponent) complianceServerAllowTigeraNetworkPolicy() *v3.Net
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
+			Tier:     networkpolicy.CalicoTierName,
 			Selector: networkpolicy.KubernetesAppSelector(ComplianceServerName),
 			Types:    []v3.PolicyType{v3.PolicyTypeIngress, v3.PolicyTypeEgress},
 			Ingress:  ingressRules,

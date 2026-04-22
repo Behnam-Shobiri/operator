@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -26,12 +26,32 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +kubebuilder:resource:scope=Cluster
+
+// Installation configures an installation of Calico or Calico Enterprise. At most one instance
+// of this resource is supported. It must be named "default". The Installation API installs core networking
+// and network policy components, and provides general install-time configuration.
+//
+// +kubebuilder:validation:XValidation:rule="self.metadata.name == 'default' || self.metadata.name == 'tigera-secure' || self.metadata.name == 'overlay'", message="resource name must be 'default', 'tigera-secure', or 'overlay'"
+type Installation struct {
+	metav1.TypeMeta   `json:",inline"`
+	metav1.ObjectMeta `json:"metadata,omitempty"`
+
+	// Specification of the desired state for the Calico or Calico Enterprise installation.
+	Spec InstallationSpec `json:"spec,omitempty"`
+	// Most recently observed state for the Calico or Calico Enterprise installation.
+	Status InstallationStatus `json:"status,omitempty"`
+}
+
 // InstallationSpec defines configuration for a Calico or Calico Enterprise installation.
 type InstallationSpec struct {
-	// Variant is the product to install - one of Calico or TigeraSecureEnterprise
+	// Variant is the product to install - one of Calico or CalicoEnterprise.
+	// TigeraSecureEnterprise is also accepted as a deprecated alias for CalicoEnterprise.
 	// Default: Calico
 	// +optional
-	// +kubebuilder:validation:Enum=Calico;TigeraSecureEnterprise
+	// +kubebuilder:validation:Enum=Calico;CalicoEnterprise;TigeraSecureEnterprise
 	Variant ProductVariant `json:"variant,omitempty"`
 
 	// Registry is the default Docker registry used for component Docker images.
@@ -156,6 +176,8 @@ type InstallationSpec struct {
 	// +optional
 	TLSCipherSuites TLSCipherSuites `json:"tlsCipherSuites,omitempty"`
 
+	// Deprecated. NonPrivileged is deprecated and will be removed from the API in a future release.
+	// Enabling this field is not supported and will cause errors.
 	// NonPrivileged configures Calico to be run in non-privileged containers as non-root users where possible.
 	// +optional
 	NonPrivileged *NonPrivilegedType `json:"nonPrivileged,omitempty"`
@@ -378,7 +400,7 @@ const (
 // The ComponentResource struct associates a ResourceRequirements with a component by name
 type ComponentResource struct {
 	// ComponentName is an enum which identifies the component
-	// +kubebuilder:validation:Enum=Node;Typha;KubeControllers
+	// +kubebuilder:validation:Enum=Node;Typha;KubeControllers;NodeWindows;FelixWindows;ConfdWindows
 	ComponentName ComponentName `json:"componentName"`
 
 	// ResourceRequirements allows customization of limits and requests for compute resources such as cpu and memory.
@@ -439,13 +461,22 @@ func (p Provider) IsKind() bool {
 
 // ProductVariant represents the variant of the product.
 //
-// One of: Calico, TigeraSecureEnterprise
+// One of: Calico, CalicoEnterprise.
+// TigeraSecureEnterprise is a deprecated alias for CalicoEnterprise.
 type ProductVariant string
 
 var (
-	Calico                 ProductVariant = "Calico"
+	Calico           ProductVariant = "Calico"
+	CalicoEnterprise ProductVariant = "CalicoEnterprise"
+
+	// Deprecated: Use CalicoEnterprise instead.
 	TigeraSecureEnterprise ProductVariant = "TigeraSecureEnterprise"
 )
+
+// IsEnterprise returns true if the variant is an enterprise variant (either CalicoEnterprise or TigeraSecureEnterprise).
+func (v ProductVariant) IsEnterprise() bool {
+	return v == CalicoEnterprise || v == TigeraSecureEnterprise
+}
 
 // NonPrivilegedType specifies whether Calico runs as permissioned or not
 //
@@ -515,6 +546,15 @@ type BGPOption string
 func BGPOptionPtr(b BGPOption) *BGPOption {
 	return &b
 }
+
+// ClusterRoutingMode describes the mode of cluster routing.
+// +kubebuilder:validation:Enum=BIRD;Felix
+type ClusterRoutingMode string
+
+const (
+	ClusterRoutingModeBIRD  ClusterRoutingMode = "BIRD"
+	ClusterRoutingModeFelix ClusterRoutingMode = "Felix"
+)
 
 const (
 	BGPEnabled  BGPOption = "Enabled"
@@ -593,6 +633,13 @@ type CalicoNetworkSpec struct {
 	// +kubebuilder:validation:Enum=Enabled;Disabled
 	BGP *BGPOption `json:"bgp,omitempty"`
 
+	// ClusterRoutingMode controls how nodes get a route to a workload on another node,
+	// when that workload's IP comes from an IP Pool with vxlanMode: Never. When ClusterRoutingMode is BIRD,
+	// confd and BIRD program that route. When ClusterRoutingMode is Felix, it is expected that Felix will program that route.
+	// Felix always programs such routes for IP Pools with vxlanMode: Always or vxlanMode: CrossSubnet. [Default: BIRD]
+	// +optional
+	ClusterRoutingMode *ClusterRoutingMode `json:"clusterRoutingMode,omitempty"`
+
 	// IPPools contains a list of IP pools to manage. If nil, a single IPv4 IP pool
 	// will be created by the operator. If an empty list is provided, the operator will not create any IP pools and will instead
 	// wait for IP pools to be created out-of-band.
@@ -656,6 +703,9 @@ type CalicoNetworkSpec struct {
 // NodeAddressAutodetection provides configuration options for auto-detecting node addresses. At most one option
 // can be used. If no detection option is specified, then IP auto detection will be disabled for this address family and IPs
 // must be specified directly on the Node resource.
+//
+// +kubebuilder:validation:XValidation:rule="[has(self.firstFound) && self.firstFound == true, has(self.kubernetes), has(self.interface) && size(self.interface) > 0, has(self.skipInterface) && size(self.skipInterface) > 0, has(self.canReach) && size(self.canReach) > 0, has(self.cidrs) && size(self.cidrs) > 0].filter(x, x).size() <= 1",message="no more than one autodetection method can be specified"
+// +structType=atomic
 type NodeAddressAutodetection struct {
 	// FirstFound uses default interface matching parameters to select an interface, performing best-effort
 	// filtering based on well-known interface names.
@@ -942,8 +992,9 @@ type CNISpec struct {
 
 // InstallationStatus defines the observed state of the Calico or Calico Enterprise installation.
 type InstallationStatus struct {
-	// Variant is the most recently observed installed variant - one of Calico or TigeraSecureEnterprise
-	// +kubebuilder:validation:Enum=Calico;TigeraSecureEnterprise
+	// Variant is the most recently observed installed variant - one of Calico or CalicoEnterprise.
+	// TigeraSecureEnterprise is a deprecated alias for CalicoEnterprise.
+	// +kubebuilder:validation:Enum=Calico;CalicoEnterprise;TigeraSecureEnterprise
 	Variant ProductVariant `json:"variant,omitempty"`
 
 	// MTU is the most recently observed value for pod network MTU. This may be an explicitly
@@ -968,23 +1019,6 @@ type InstallationStatus struct {
 	// Ready, Progressing, Degraded or other customer types.
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
-}
-
-// +kubebuilder:object:root=true
-// +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster
-
-// Installation configures an installation of Calico or Calico Enterprise. At most one instance
-// of this resource is supported. It must be named "default". The Installation API installs core networking
-// and network policy components, and provides general install-time configuration.
-type Installation struct {
-	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
-
-	// Specification of the desired state for the Calico or Calico Enterprise installation.
-	Spec InstallationSpec `json:"spec,omitempty"`
-	// Most recently observed state for the Calico or Calico Enterprise installation.
-	Status InstallationStatus `json:"status,omitempty"`
 }
 
 // BPFEnabled is an extension method that returns true if the Installation resource

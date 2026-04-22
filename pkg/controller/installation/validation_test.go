@@ -1,4 +1,4 @@
-// Copyright (c) 2019, 2022-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,8 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/utils/ptr"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -185,7 +184,7 @@ var _ = Describe("Installation validation tests", func() {
 		instance.Spec.CNI.Type = operator.PluginCalico
 		err := validateCustomResource(instance)
 		Expect(err).NotTo(HaveOccurred())
-		instance.Spec.Variant = operator.TigeraSecureEnterprise
+		instance.Spec.Variant = operator.CalicoEnterprise
 		err = validateCustomResource(instance)
 		Expect(err).To(HaveOccurred())
 	})
@@ -246,7 +245,7 @@ var _ = Describe("Installation validation tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 	})
 
-	It("should prevent IPIP if BGP is disabled", func() {
+	It("should prevent IPIP with BGP disabled in BIRD cluster routing mode", func() {
 		disabled := operator.BGPDisabled
 		instance.Spec.CalicoNetwork.BGP = &disabled
 		instance.Spec.CalicoNetwork.IPPools = []operator.IPPool{
@@ -261,7 +260,7 @@ var _ = Describe("Installation validation tests", func() {
 		Expect(err).To(HaveOccurred())
 	})
 
-	It("should prevent IPIP cross-subnet if BGP is disabled", func() {
+	It("should prevent IPIP cross-subnet with BGP disabled in BIRD cluster routing mode", func() {
 		disabled := operator.BGPDisabled
 		instance.Spec.CalicoNetwork.BGP = &disabled
 		instance.Spec.CalicoNetwork.IPPools = []operator.IPPool{
@@ -276,10 +275,76 @@ var _ = Describe("Installation validation tests", func() {
 		Expect(err).To(HaveOccurred())
 	})
 
+	It("should prevent no-encap with BGP disabled in BIRD cluster routing mode", func() {
+		disabled := operator.BGPDisabled
+		instance.Spec.CalicoNetwork.BGP = &disabled
+		instance.Spec.CalicoNetwork.IPPools = []operator.IPPool{
+			{
+				CIDR:          "192.168.0.0/24",
+				Encapsulation: operator.EncapsulationNone,
+				NATOutgoing:   operator.NATOutgoingEnabled,
+				NodeSelector:  "all()",
+			},
+		}
+		err := validateCustomResource(instance)
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("should allow IPIP with BGP disabled in Felix cluster routing mode", func() {
+		disabled := operator.BGPDisabled
+		instance.Spec.CalicoNetwork.BGP = &disabled
+		clusterRoutingMode := operator.ClusterRoutingModeFelix
+		instance.Spec.CalicoNetwork.ClusterRoutingMode = &clusterRoutingMode
+		instance.Spec.CalicoNetwork.IPPools = []operator.IPPool{
+			{
+				CIDR:          "192.168.0.0/24",
+				Encapsulation: operator.EncapsulationIPIP,
+				NATOutgoing:   operator.NATOutgoingEnabled,
+				NodeSelector:  "all()",
+			},
+		}
+		err := validateCustomResource(instance)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("should allow IPIP cross-subnet with BGP disabled in Felix cluster routing mode", func() {
+		disabled := operator.BGPDisabled
+		instance.Spec.CalicoNetwork.BGP = &disabled
+		clusterRoutingMode := operator.ClusterRoutingModeFelix
+		instance.Spec.CalicoNetwork.ClusterRoutingMode = &clusterRoutingMode
+		instance.Spec.CalicoNetwork.IPPools = []operator.IPPool{
+			{
+				CIDR:          "192.168.0.0/24",
+				Encapsulation: operator.EncapsulationIPIPCrossSubnet,
+				NATOutgoing:   operator.NATOutgoingEnabled,
+				NodeSelector:  "all()",
+			},
+		}
+		err := validateCustomResource(instance)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("should allow no-encap with BGP disabled in Felix cluster routing mode", func() {
+		disabled := operator.BGPDisabled
+		instance.Spec.CalicoNetwork.BGP = &disabled
+		clusterRoutingMode := operator.ClusterRoutingModeFelix
+		instance.Spec.CalicoNetwork.ClusterRoutingMode = &clusterRoutingMode
+		instance.Spec.CalicoNetwork.IPPools = []operator.IPPool{
+			{
+				CIDR:          "192.168.0.0/24",
+				Encapsulation: operator.EncapsulationNone,
+				NATOutgoing:   operator.NATOutgoingEnabled,
+				NodeSelector:  "all()",
+			},
+		}
+		err := validateCustomResource(instance)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
 	It("should not error if CalicoNetwork is provided on EKS", func() {
 		instance := &operator.Installation{}
 		instance.Spec.CNI = &operator.CNISpec{Type: operator.PluginCalico}
-		instance.Spec.Variant = operator.TigeraSecureEnterprise
+		instance.Spec.Variant = operator.CalicoEnterprise
 		instance.Spec.CalicoNetwork = &operator.CalicoNetworkSpec{}
 		instance.Spec.KubernetesProvider = operator.ProviderEKS
 
@@ -360,19 +425,9 @@ var _ = Describe("Installation validation tests", func() {
 		Expect(err).To(HaveOccurred())
 	})
 
-	It("should not allow Calico to run in non-privileged mode if BPF is enabled", func() {
-		np := operator.NonPrivilegedEnabled
-		bpf := operator.LinuxDataplaneBPF
-		instance.Spec.NonPrivileged = &np
-		instance.Spec.CalicoNetwork.LinuxDataplane = &bpf
-		err := validateCustomResource(instance)
-		Expect(err).To(HaveOccurred())
-	})
-
-	It("should not allow Calico to run in non-privileged mode with Tigera Secure Enterprise", func() {
+	It("should not allow Calico to run in non-privileged mode, since it's deprecated", func() {
 		np := operator.NonPrivilegedEnabled
 		instance.Spec.NonPrivileged = &np
-		instance.Spec.Variant = operator.TigeraSecureEnterprise
 		err := validateCustomResource(instance)
 		Expect(err).To(HaveOccurred())
 	})
@@ -619,14 +674,14 @@ var _ = Describe("Installation validation tests", func() {
 			Expect(fillDefaults(instance, nil)).NotTo(HaveOccurred())
 			err := validateCustomResource(instance)
 			Expect(err).NotTo(HaveOccurred())
-		}, nonCalicoCNIEntries...)
+		}, nonCalicoCNIEntries)
 		DescribeTable("test with no CalicoNetwork", func(plugin operator.CNIPluginType, ipam operator.IPAMPluginType) {
 			instance.Spec.CalicoNetwork = nil
 			instance.Spec.CNI.Type = plugin
 			instance.Spec.CNI.IPAM = &operator.IPAMSpec{Type: ipam}
 			err := validateCustomResource(instance)
 			Expect(err).NotTo(HaveOccurred())
-		}, nonCalicoCNIEntries...)
+		}, nonCalicoCNIEntries)
 		DescribeTable("test invalid CNI and IPAM combinations",
 			func(plugin operator.CNIPluginType, allowedipam operator.IPAMPluginType) {
 				instance.Spec.CNI.Type = plugin
@@ -680,7 +735,7 @@ var _ = Describe("Installation validation tests", func() {
 			}
 			err := validateCustomResource(instance)
 			Expect(err).NotTo(HaveOccurred())
-		}, nonCalicoCNIEntries...)
+		}, nonCalicoCNIEntries)
 		DescribeTable("should disallow IPPool with IPIP", func(plugin operator.CNIPluginType, ipam operator.IPAMPluginType) {
 			instance.Spec.CNI.Type = plugin
 			instance.Spec.CNI.IPAM = &operator.IPAMSpec{Type: ipam}
@@ -694,7 +749,7 @@ var _ = Describe("Installation validation tests", func() {
 			}
 			err := validateCustomResource(instance)
 			Expect(err).To(HaveOccurred())
-		}, nonCalicoCNIEntries...)
+		}, nonCalicoCNIEntries)
 		DescribeTable("should disallow IPPool with non-all NodeSelector", func(plugin operator.CNIPluginType, ipam operator.IPAMPluginType) {
 			instance.Spec.CNI.Type = plugin
 			instance.Spec.CNI.IPAM = &operator.IPAMSpec{Type: ipam}
@@ -708,7 +763,7 @@ var _ = Describe("Installation validation tests", func() {
 			}
 			err := validateCustomResource(instance)
 			Expect(err).To(HaveOccurred())
-		}, nonCalicoCNIEntries...)
+		}, nonCalicoCNIEntries)
 		DescribeTable("should not allow BGP", func(plugin operator.CNIPluginType, ipam operator.IPAMPluginType) {
 			instance.Spec.CNI.Type = plugin
 			instance.Spec.CNI.IPAM = &operator.IPAMSpec{Type: ipam}
@@ -716,7 +771,7 @@ var _ = Describe("Installation validation tests", func() {
 			instance.Spec.CalicoNetwork.BGP = &be
 			err := validateCustomResource(instance)
 			Expect(err).NotTo(HaveOccurred())
-		}, nonCalicoCNIEntries...)
+		}, nonCalicoCNIEntries)
 	})
 	Describe("cross validate CNI.Type and kubernetesProvider", func() {
 		BeforeEach(func() {
@@ -1216,8 +1271,8 @@ var _ = Describe("Installation validation tests", func() {
 
 			Entry("Product: Calico FipsMode: Disabled", operator.Calico, operator.FIPSModeDisabled, false),
 			Entry("Product: Calico FipsMode: Enabled", operator.Calico, operator.FIPSModeEnabled, false),
-			Entry("Product: TigeraSecureEnterprise FipsMode: Disabled", operator.TigeraSecureEnterprise, operator.FIPSModeDisabled, false),
-			Entry("Product: TigeraSecureEnterprise FipsMode: Enabled", operator.TigeraSecureEnterprise, operator.FIPSModeEnabled, true),
+			Entry("Product: CalicoEnterprise FipsMode: Disabled", operator.CalicoEnterprise, operator.FIPSModeDisabled, false),
+			Entry("Product: CalicoEnterprise FipsMode: Enabled", operator.CalicoEnterprise, operator.FIPSModeEnabled, true),
 		)
 	})
 })

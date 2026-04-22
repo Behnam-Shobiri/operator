@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -51,7 +51,7 @@ const (
 	DexPort          = 5556
 	DexTLSSecretName = "tigera-dex-tls"
 	DexClientId      = "tigera-manager"
-	DexPolicyName    = networkpolicy.TigeraComponentPolicyPrefix + "allow-tigera-dex"
+	DexPolicyName    = networkpolicy.CalicoComponentPolicyPrefix + "dex"
 )
 
 var DexEntityRule = networkpolicy.CreateEntityRule(DexNamespace, DexObjectName, DexPort)
@@ -122,8 +122,8 @@ func (c *dexComponent) Objects() ([]client.Object, []client.Object) {
 
 	objs := []client.Object{
 		CreateNamespace(DexObjectName, c.cfg.Installation.KubernetesProvider, PSSRestricted, c.cfg.Installation.Azure),
-		c.allowTigeraNetworkPolicy(c.cfg.Installation.Variant),
-		networkpolicy.AllowTigeraDefaultDeny(DexNamespace),
+		c.calicoSystemNetworkPolicy(c.cfg.Installation.Variant),
+		networkpolicy.CalicoSystemDefaultDeny(DexNamespace),
 		CreateOperatorSecretsRoleBinding(DexNamespace),
 		c.serviceAccount(),
 		c.deployment(),
@@ -136,6 +136,9 @@ func (c *dexComponent) Objects() ([]client.Object, []client.Object) {
 		// Delete the secret called tigera-dex which in the past was used to store a client secret.
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: DexObjectName, Name: DexObjectName}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: common.OperatorNamespace(), Name: DexObjectName}},
+		// allow-tigera Tier was renamed to calico-system
+		networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("allow-tigera-dex", DexNamespace),
+		networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("default-deny", DexNamespace),
 	}
 
 	// TODO Some of the secrets created in the operator namespace are created by the customer (i.e. oidc credentials)
@@ -412,7 +415,7 @@ func (c *dexComponent) configMap() *corev1.ConfigMap {
 	}
 }
 
-func (c *dexComponent) allowTigeraNetworkPolicy(installationVariant operatorv1.ProductVariant) *v3.NetworkPolicy {
+func (c *dexComponent) calicoSystemNetworkPolicy(installationVariant operatorv1.ProductVariant) *v3.NetworkPolicy {
 	egressRules := []v3.Rule{}
 	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, c.cfg.OpenShift)
 	egressRules = append(egressRules, []v3.Rule{
@@ -440,7 +443,7 @@ func (c *dexComponent) allowTigeraNetworkPolicy(installationVariant operatorv1.P
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
+			Tier:     networkpolicy.CalicoTierName,
 			Selector: networkpolicy.KubernetesAppSelector(DexObjectName),
 			Types:    []v3.PolicyType{v3.PolicyTypeIngress, v3.PolicyTypeEgress},
 			Ingress: []v3.Rule{

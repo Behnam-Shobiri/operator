@@ -1,4 +1,4 @@
-// Copyright (c) 2020, 2022-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020, 2022-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -278,6 +278,11 @@ func mergeCalicoNetwork(cfg, override *operatorv1.CalicoNetworkSpec) *operatorv1
 	switch compareFields(out.BGP, override.BGP) {
 	case BOnlySet, Different:
 		out.BGP = override.BGP
+	}
+
+	switch compareFields(out.ClusterRoutingMode, override.ClusterRoutingMode) {
+	case BOnlySet, Different:
+		out.ClusterRoutingMode = override.ClusterRoutingMode
 	}
 
 	switch compareFields(out.IPPools, override.IPPools) {

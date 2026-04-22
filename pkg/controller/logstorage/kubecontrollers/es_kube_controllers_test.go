@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"github.com/stretchr/testify/mock"
@@ -68,7 +68,7 @@ func NewControllerWithShims(
 	multiTenant bool,
 	tierWatchReady *utils.ReadyFlag,
 ) (*ESKubeControllersController, error) {
-	opts := options.AddOptions{
+	opts := options.ControllerOptions{
 		DetectedProvider: provider,
 		ClusterDomain:    clusterDomain,
 		ShutdownContext:  context.TODO(),
@@ -100,7 +100,7 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 
 	BeforeEach(func() {
 		scheme = runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).ShouldNot(HaveOccurred())
 		Expect(storagev1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -120,12 +120,12 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 				Name: "default",
 			},
 			Status: operatorv1.InstallationStatus{
-				Variant:  operatorv1.TigeraSecureEnterprise,
+				Variant:  operatorv1.CalicoEnterprise,
 				Computed: &operatorv1.InstallationSpec{},
 			},
 			Spec: operatorv1.InstallationSpec{
 				ControlPlaneReplicas: &replicas,
-				Variant:              operatorv1.TigeraSecureEnterprise,
+				Variant:              operatorv1.CalicoEnterprise,
 				Registry:             "some.registry.org/",
 				ImagePullSecrets: []corev1.LocalObjectReference{{
 					Name: "tigera-pull-secret",
@@ -191,8 +191,8 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 		r, err = NewControllerWithShims(cli, scheme, mockStatus, operatorv1.ProviderNone, dns.DefaultClusterDomain, false, readyFlag)
 		Expect(err).ShouldNot(HaveOccurred())
 
-		// Create the allow-tigera Tier, since the controller blocks on its existence.
-		tier := &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}}
+		// Create the calico-system Tier, since the controller blocks on its existence.
+		tier := &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}}
 		Expect(cli.Create(ctx, tier)).ShouldNot(HaveOccurred())
 	})
 
@@ -250,30 +250,6 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 			},
 		}
 		Expect(test.GetResource(cli, &dep)).To(BeNil())
-
-		// Expect operator role binding to be created
-		rb := rbacv1.RoleBinding{
-			ObjectMeta: metav1.ObjectMeta{},
-		}
-		Expect(cli.Get(ctx, client.ObjectKey{
-			Name:      render.TigeraOperatorSecrets,
-			Namespace: common.CalicoNamespace,
-		}, &rb)).NotTo(HaveOccurred())
-		Expect(rb.OwnerReferences).To(HaveLen(1))
-		ownerRoleBinding := rb.OwnerReferences[0]
-		Expect(ownerRoleBinding.Kind).To(Equal("LogStorage"))
-
-		// Expect pull secrets to be created
-		pullSecrets := corev1.Secret{
-			TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
-		}
-		Expect(cli.Get(ctx, client.ObjectKey{
-			Name:      "tigera-pull-secret",
-			Namespace: common.CalicoNamespace,
-		}, &pullSecrets)).NotTo(HaveOccurred())
-		Expect(pullSecrets.OwnerReferences).To(HaveLen(1))
-		pullSecret := pullSecrets.OwnerReferences[0]
-		Expect(pullSecret.Kind).To(Equal("LogStorage"))
 	})
 
 	It("should use images from ImageSet", func() {
@@ -368,18 +344,6 @@ var _ = Describe("LogStorage ES kube-controllers controller", func() {
 				},
 			}
 			Expect(test.GetResource(cli, &dep)).To(BeNil())
-
-			// Expect pull secrets to be created
-			pullSecrets := corev1.Secret{
-				TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
-			}
-			Expect(cli.Get(ctx, client.ObjectKey{
-				Name:      "tigera-pull-secret",
-				Namespace: common.CalicoNamespace,
-			}, &pullSecrets)).NotTo(HaveOccurred())
-			Expect(pullSecrets.OwnerReferences).To(HaveLen(1))
-			pullSecret := pullSecrets.OwnerReferences[0]
-			Expect(pullSecret.Kind).To(Equal("LogStorage"))
 		})
 	})
 })

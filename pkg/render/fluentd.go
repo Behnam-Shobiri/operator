@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -66,7 +66,7 @@ const (
 	FluentdMetricsPort                       = 9081
 	FluentdInputPortName                     = "fluentd-http-input-port"
 	FluentdInputPort                         = 9880
-	FluentdPolicyName                        = networkpolicy.TigeraComponentPolicyPrefix + "allow-fluentd-node"
+	FluentdPolicyName                        = networkpolicy.CalicoComponentPolicyPrefix + "allow-fluentd-node"
 	filterHashAnnotation                     = "hash.operator.tigera.io/fluentd-filters"
 	s3CredentialHashAnnotation               = "hash.operator.tigera.io/s3-credentials"
 	splunkCredentialHashAnnotation           = "hash.operator.tigera.io/splunk-credentials"
@@ -185,6 +185,9 @@ type FluentdConfiguration struct {
 	PacketCapture *operatorv1.PacketCaptureAPI
 
 	NonClusterHost *operatorv1.NonClusterHost
+
+	// LicenseExpired indicates the license has expired and fluentd DaemonSet should be removed.
+	LicenseExpired bool
 }
 
 type fluentdComponent struct {
@@ -282,8 +285,11 @@ func (c *fluentdComponent) path(path string) string {
 
 func (c *fluentdComponent) Objects() ([]client.Object, []client.Object) {
 	var objs, toDelete []client.Object
-	objs = append(objs, c.allowTigeraPolicy())
+	objs = append(objs, c.calicoSystemPolicy())
 	objs = append(objs, c.metricsService())
+
+	// allow-tigera Tier was renamed to calico-system
+	toDelete = append(toDelete, networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("allow-fluentd-node", LogCollectorNamespace))
 
 	if c.cfg.Installation.KubernetesProvider.IsGKE() {
 		// We do this only for GKE as other providers don't (yet?)
@@ -329,7 +335,11 @@ func (c *fluentdComponent) Objects() ([]client.Object, []client.Object) {
 		objs = append(objs, c.packetCaptureApiRole(), c.packetCaptureApiRoleBinding())
 	}
 
-	objs = append(objs, c.daemonset())
+	if c.cfg.LicenseExpired {
+		toDelete = append(toDelete, c.daemonset())
+	} else {
+		objs = append(objs, c.daemonset())
+	}
 
 	if c.cfg.NonClusterHost != nil && c.cfg.OSType == rmeta.OSTypeLinux {
 		objs = append(objs, c.nonClusterHostInputService())
@@ -451,7 +461,7 @@ func (c *fluentdComponent) splunkCredentialSecret() []*corev1.Secret {
 		return nil
 	}
 	return []*corev1.Secret{
-		&corev1.Secret{
+		{
 			TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      SplunkFluentdTokenSecretName,
@@ -999,6 +1009,7 @@ func (c *fluentdComponent) fluentdClusterRole() *rbacv1.ClusterRole {
 					"bgplogs",
 					"waflogs",
 					"runtimereports",
+					"policyactivity",
 				},
 				Verbs: []string{"create"},
 			},
@@ -1155,7 +1166,6 @@ func trustedBundleVolume(bundle certificatemanagement.TrustedBundle) corev1.Volu
 }
 
 func (c *fluentdComponent) eksLogForwarderVolumeMounts() []corev1.VolumeMount {
-
 	volumeMounts := []corev1.VolumeMount{
 		{
 			Name:      "plugin-statefile-dir",
@@ -1182,7 +1192,6 @@ func (c *fluentdComponent) eksLogForwarderVolumeMounts() []corev1.VolumeMount {
 }
 
 func (c *fluentdComponent) eksLogForwarderVolumes() []corev1.Volume {
-
 	volumes := []corev1.Volume{
 		trustedBundleVolume(c.cfg.TrustedBundle),
 		{
@@ -1261,7 +1270,7 @@ func (c *fluentdComponent) eksLogForwarderClusterRole() *rbacv1.ClusterRole {
 	}
 }
 
-func (c *fluentdComponent) allowTigeraPolicy() *v3.NetworkPolicy {
+func (c *fluentdComponent) calicoSystemPolicy() *v3.NetworkPolicy {
 	multiTenant := false
 	tenantNamespace := ""
 	if c.cfg.Tenant != nil {
@@ -1339,7 +1348,7 @@ func (c *fluentdComponent) allowTigeraPolicy() *v3.NetworkPolicy {
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:                  &networkpolicy.HighPrecedenceOrder,
-			Tier:                   networkpolicy.TigeraComponentTierName,
+			Tier:                   networkpolicy.CalicoTierName,
 			Selector:               networkpolicy.KubernetesAppSelector(FluentdNodeName, fluentdNodeWindowsName),
 			ServiceAccountSelector: "",
 			Types:                  []v3.PolicyType{v3.PolicyTypeIngress, v3.PolicyTypeEgress},

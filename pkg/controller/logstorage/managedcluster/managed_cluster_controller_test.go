@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ package managedcluster
 import (
 	"context"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	admissionv1beta1 "k8s.io/api/admissionregistration/v1beta1"
@@ -43,7 +43,7 @@ func NewReconcilerWithShims(
 	provider operatorv1.Provider,
 	clusterDomain string,
 ) (*LogStorageManagedClusterController, error) {
-	opts := options.AddOptions{
+	opts := options.ControllerOptions{
 		DetectedProvider: provider,
 		ClusterDomain:    clusterDomain,
 		ShutdownContext:  context.TODO(),
@@ -68,7 +68,7 @@ var _ = Describe("LogStorageManagedCluster controller", func() {
 
 	BeforeEach(func() {
 		scheme = runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).ShouldNot(HaveOccurred())
 		Expect(storagev1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -84,12 +84,12 @@ var _ = Describe("LogStorageManagedCluster controller", func() {
 				Name: "default",
 			},
 			Status: operatorv1.InstallationStatus{
-				Variant:  operatorv1.TigeraSecureEnterprise,
+				Variant:  operatorv1.CalicoEnterprise,
 				Computed: &operatorv1.InstallationSpec{},
 			},
 			Spec: operatorv1.InstallationSpec{
 				ControlPlaneReplicas: &replicas,
-				Variant:              operatorv1.TigeraSecureEnterprise,
+				Variant:              operatorv1.CalicoEnterprise,
 			},
 		}
 		Expect(cli.Create(ctx, install)).ShouldNot(HaveOccurred())
@@ -98,7 +98,7 @@ var _ = Describe("LogStorageManagedCluster controller", func() {
 	Context("Managed Cluster", func() {
 		Context("LogStorage is nil", func() {
 			BeforeEach(func() {
-				Expect(cli.Create(ctx, &operatorv1.ManagementClusterConnection{ObjectMeta: metav1.ObjectMeta{Name: utils.DefaultTSEEInstanceKey.Name}})).NotTo(HaveOccurred())
+				Expect(cli.Create(ctx, &operatorv1.ManagementClusterConnection{ObjectMeta: metav1.ObjectMeta{Name: utils.DefaultEnterpriseInstanceKey.Name}})).NotTo(HaveOccurred())
 			})
 
 			Context("LogStorage exists", func() {

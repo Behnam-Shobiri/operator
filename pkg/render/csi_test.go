@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"strings"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -295,7 +295,7 @@ var _ = Describe("CSI rendering tests", func() {
 	})
 
 	It("should use private images when Variant = enterprise", func() {
-		cfg.Installation.Variant = operatorv1.TigeraSecureEnterprise
+		cfg.Installation.Variant = operatorv1.CalicoEnterprise
 		comp := render.CSI(&cfg)
 		Expect(comp.ResolveImages(nil)).To(BeNil())
 		createObjs, _ := comp.Objects()

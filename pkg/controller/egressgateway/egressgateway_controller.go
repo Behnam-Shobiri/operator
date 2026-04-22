@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,9 +35,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
 
-	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/controller/options"
 	"github.com/tigera/operator/pkg/controller/status"
@@ -57,7 +57,7 @@ var log = logf.Log.WithName("controller_egressgateway")
 
 // Add creates a new EgressGateway Controller and adds it to the Manager.
 // The Manager will set fields on the Controller and Start it when the Manager is Started.
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	if !opts.EnterpriseCRDExists {
 		// No need to start this controller.
 		return nil
@@ -77,7 +77,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 }
 
 // newReconciler returns a new *reconcile.Reconciler.
-func newReconciler(mgr manager.Manager, opts options.AddOptions, licenseAPIReady *utils.ReadyFlag) reconcile.Reconciler {
+func newReconciler(mgr manager.Manager, opts options.ControllerOptions, licenseAPIReady *utils.ReadyFlag) reconcile.Reconciler {
 	r := &ReconcileEgressGateway{
 		client:          mgr.GetClient(),
 		scheme:          mgr.GetScheme(),
@@ -108,12 +108,11 @@ func add(_ manager.Manager, c ctrlruntime.Controller) error {
 	}
 
 	if err = utils.AddInstallationWatch(c); err != nil {
-		log.V(5).Info("Failed to create network watch", "err", err)
-		return fmt.Errorf("egressgateway-controller failed to watch Tigera network resource: %v", err)
+		return fmt.Errorf("egressgateway-controller failed to watch Installation resource: %v", err)
 	}
 
 	// Watch for changes to FelixConfiguration.
-	err = c.WatchObject(&crdv1.FelixConfiguration{}, &handler.EnqueueRequestForObject{})
+	err = c.WatchObject(&v3.FelixConfiguration{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return fmt.Errorf("egressGateway-controller failed to watch FelixConfiguration resource: %w", err)
 	}
@@ -203,7 +202,7 @@ func (r *ReconcileEgressGateway) Reconcile(ctx context.Context, request reconcil
 				for index, user := range scc.Users {
 					if user == userString {
 						scc.Users = append(scc.Users[:index], scc.Users[index+1:]...)
-						err := ch.CreateOrUpdateOrDelete(ctx, render.NewPassthrough(scc), r.status)
+						err := ch.CreateOrUpdateOrDelete(ctx, render.NewCreationPassthrough(scc), r.status)
 						if err != nil {
 							reqLogger.Error(err, "error updating security context constraints")
 						}
@@ -242,7 +241,7 @@ func (r *ReconcileEgressGateway) Reconcile(ctx context.Context, request reconcil
 		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
-	variant, installation, err := utils.GetInstallation(ctx, r.client)
+	variant, installationSpec, err := utils.GetInstallationSpec(ctx, r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			reqLogger.Error(err, "Installation not found")
@@ -261,8 +260,8 @@ func (r *ReconcileEgressGateway) Reconcile(ctx context.Context, request reconcil
 		return reconcile.Result{}, err
 	}
 
-	if variant != operatorv1.TigeraSecureEnterprise {
-		degradedMsg := fmt.Sprintf("Waiting for network to be %s", operatorv1.TigeraSecureEnterprise)
+	if !variant.IsEnterprise() {
+		degradedMsg := "Waiting for network to be an enterprise variant"
 		reqLogger.Error(err, degradedMsg)
 		r.status.SetDegraded(operatorv1.ResourceNotReady, degradedMsg, nil, reqLogger)
 		for _, egw := range egwsToReconcile {
@@ -286,7 +285,7 @@ func (r *ReconcileEgressGateway) Reconcile(ctx context.Context, request reconcil
 		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
-	pullSecrets, err := utils.GetNetworkingPullSecrets(installation, r.client)
+	pullSecrets, err := utils.GetInstallationPullSecrets(installationSpec, r.client)
 	if err != nil {
 		reqLogger.Error(err, "Error retrieving pull secrets")
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error retrieving pull secrets", err, reqLogger)
@@ -297,7 +296,7 @@ func (r *ReconcileEgressGateway) Reconcile(ctx context.Context, request reconcil
 	}
 
 	// patch and get the felix configuration
-	fc, err := utils.PatchFelixConfiguration(ctx, r.client, func(fc *crdv1.FelixConfiguration) (bool, error) {
+	fc, err := utils.PatchFelixConfiguration(ctx, r.client, func(fc *v3.FelixConfiguration) (bool, error) {
 		if fc.Spec.PolicySyncPathPrefix != "" {
 			return false, nil // don't proceed with the patch
 		}
@@ -316,7 +315,7 @@ func (r *ReconcileEgressGateway) Reconcile(ctx context.Context, request reconcil
 	// Reconcile all the EGWs
 	var errMsgs []string
 	for _, egw := range egwsToReconcile {
-		err = r.reconcileEgressGateway(ctx, &egw, reqLogger, variant, fc, pullSecrets, installation, namespaceAndNames)
+		err = r.reconcileEgressGateway(ctx, &egw, reqLogger, variant, fc, pullSecrets, installationSpec, namespaceAndNames)
 		if err != nil {
 			reqLogger.Error(err, "Error reconciling egress gateway")
 			errMsgs = append(errMsgs, err.Error())
@@ -342,12 +341,12 @@ func (r *ReconcileEgressGateway) Reconcile(ctx context.Context, request reconcil
 }
 
 func (r *ReconcileEgressGateway) reconcileEgressGateway(ctx context.Context, egw *operatorv1.EgressGateway, reqLogger logr.Logger,
-	variant operatorv1.ProductVariant, fc *crdv1.FelixConfiguration, pullSecrets []*v1.Secret,
-	installation *operatorv1.InstallationSpec, namespaceAndNames []string,
+	variant operatorv1.ProductVariant, fc *v3.FelixConfiguration, pullSecrets []*v1.Secret,
+	installationSpec *operatorv1.InstallationSpec, namespaceAndNames []string,
 ) error {
 	preDefaultPatchFrom := client.MergeFrom(egw.DeepCopy())
 	// update the EGW resource with default values.
-	fillDefaults(egw, installation)
+	fillDefaults(egw, installationSpec)
 	// Validate the EGW resource.
 	err := validateEgressGateway(ctx, r.client, egw)
 	if err != nil {
@@ -385,7 +384,7 @@ func (r *ReconcileEgressGateway) reconcileEgressGateway(ctx context.Context, egw
 
 	config := &egressgateway.Config{
 		PullSecrets:       pullSecrets,
-		Installation:      installation,
+		Installation:      installationSpec,
 		OSType:            rmeta.OSTypeLinux,
 		EgressGW:          egw,
 		VXLANPort:         egwVXLANPort,
@@ -512,7 +511,7 @@ func getOpenShiftSCC(ctx context.Context, cli client.Client) (*ocsv1.SecurityCon
 }
 
 // fillDefaults sets the default values of the EGW resource.
-func fillDefaults(egw *operatorv1.EgressGateway, installation *operatorv1.InstallationSpec) {
+func fillDefaults(egw *operatorv1.EgressGateway, installationSpec *operatorv1.InstallationSpec) {
 	defaultAWSNativeIP := operatorv1.NativeIPDisabled
 
 	// Default value of Native IP is Disabled.
@@ -551,7 +550,7 @@ func fillDefaults(egw *operatorv1.EgressGateway, installation *operatorv1.Instal
 			},
 		},
 	}
-	switch installation.KubernetesProvider {
+	switch installationSpec.KubernetesProvider {
 	case operatorv1.ProviderAKS:
 		defAffinity.NodeAffinity = &v1.NodeAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
@@ -583,7 +582,7 @@ func fillDefaults(egw *operatorv1.EgressGateway, installation *operatorv1.Instal
 
 // validateExternalNetwork validates if the specified external network exists.
 func validateExternalNetwork(ctx context.Context, cli client.Client, externalNetwork string) error {
-	instance := &crdv1.ExternalNetwork{}
+	instance := &v3.ExternalNetwork{}
 	key := types.NamespacedName{Name: externalNetwork}
 	err := cli.Get(ctx, key, instance)
 	if err != nil {
@@ -596,7 +595,7 @@ func validateExternalNetwork(ctx context.Context, cli client.Client, externalNet
 // to see if they match.
 func validateIPPool(ctx context.Context, cli client.Client, ipPool operatorv1.EgressGatewayIPPool, awsNativeIP operatorv1.NativeIP) error {
 	if ipPool.Name != "" {
-		instance := &crdv1.IPPool{}
+		instance := &v3.IPPool{}
 		key := types.NamespacedName{Name: ipPool.Name}
 		err := cli.Get(ctx, key, instance)
 		if err != nil {
@@ -613,7 +612,7 @@ func validateIPPool(ctx context.Context, cli client.Client, ipPool operatorv1.Eg
 		return nil
 	}
 	if ipPool.CIDR != "" {
-		instance := &crdv1.IPPoolList{}
+		instance := &v3.IPPoolList{}
 		err := cli.List(ctx, instance)
 		if err != nil {
 			return err

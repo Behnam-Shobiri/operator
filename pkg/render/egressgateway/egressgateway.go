@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,13 +28,13 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rcomp "github.com/tigera/operator/pkg/render/common/components"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
@@ -155,6 +155,9 @@ func (c *component) egwDeployment() *appsv1.Deployment {
 		rcomp.ApplyDeploymentOverrides(&d, overrides)
 	}
 
+	// Add AWS specific resource requests/limits after applying overrides to avoid being overwritten
+	// if the user has specified their own.
+	c.addAWSResources(&d)
 	return &d
 }
 
@@ -214,7 +217,6 @@ func (c *component) egwContainer() *corev1.Container {
 		Image:           c.config.egwImage,
 		ImagePullPolicy: render.ImagePullPolicy(),
 		Env:             c.egwEnvVars(),
-		Resources:       c.getResources(),
 		VolumeMounts:    c.egwVolumeMounts(),
 		Ports:           c.egwPorts(),
 		Command:         []string{"/start-gateway.sh"},
@@ -413,16 +415,21 @@ func (c *component) getHTTPProbe() (string, string, string) {
 	return probeURLs, interval, timeout
 }
 
-func (c *component) getResources() corev1.ResourceRequirements {
-	recommendedQuantity := resource.NewQuantity(1, resource.DecimalSI)
+func (c *component) addAWSResources(d *appsv1.Deployment) {
 	egw := c.config.EgressGW
-	if egw.Spec.AWS != nil && *egw.Spec.AWS.NativeIP == operatorv1.NativeIPEnabled {
-		return corev1.ResourceRequirements{
-			Limits:   corev1.ResourceList{"projectcalico.org/aws-secondary-ipv4": *recommendedQuantity},
-			Requests: corev1.ResourceList{"projectcalico.org/aws-secondary-ipv4": *recommendedQuantity},
-		}
+	if egw.Spec.AWS == nil || *egw.Spec.AWS.NativeIP == operatorv1.NativeIPDisabled {
+		return
 	}
-	return corev1.ResourceRequirements{}
+	recommendedQuantity := resource.NewQuantity(1, resource.DecimalSI)
+	resourceRequirements := &d.Spec.Template.Spec.Containers[0].Resources
+	if resourceRequirements.Limits == nil {
+		resourceRequirements.Limits = corev1.ResourceList{}
+	}
+	if resourceRequirements.Requests == nil {
+		resourceRequirements.Requests = corev1.ResourceList{}
+	}
+	resourceRequirements.Limits["projectcalico.org/aws-secondary-ipv4"] = *recommendedQuantity
+	resourceRequirements.Requests["projectcalico.org/aws-secondary-ipv4"] = *recommendedQuantity
 }
 
 func (c *component) getIPPools() string {
@@ -474,7 +481,7 @@ func (c *component) getSecurityContextConstraints() *ocsv1.SecurityContextConstr
 
 func SecurityContextConstraints() *ocsv1.SecurityContextConstraints {
 	scc := securitycontextconstraints.NewNonRootSecurityContextConstraints(OpenShiftSCCName, []string{})
-	scc.AllowPrivilegeEscalation = ptr.BoolToPtr(true)
+	scc.AllowPrivilegeEscalation = ptr.To(true)
 	scc.AllowPrivilegedContainer = true
 	scc.AllowedCapabilities = []corev1.Capability{corev1.Capability("NET_ADMIN"), corev1.Capability("NET_RAW")}
 	scc.ReadOnlyRootFilesystem = false

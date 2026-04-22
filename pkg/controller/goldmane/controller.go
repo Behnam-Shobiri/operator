@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -53,7 +53,7 @@ var log = logf.Log.WithName(controllerName)
 
 // Add creates a new Reconciler Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and start it when the Manager is started.
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	statusManager := status.New(mgr.GetClient(), "goldmane", opts.KubernetesVersion)
 	reconciler := newReconciler(mgr.GetClient(), mgr.GetScheme(), statusManager, opts.DetectedProvider, opts)
 
@@ -117,7 +117,7 @@ func newReconciler(
 	schema *runtime.Scheme,
 	statusMgr status.StatusManager,
 	p operatorv1.Provider,
-	opts options.AddOptions,
+	opts options.ControllerOptions,
 ) *Reconciler {
 	c := &Reconciler{
 		cli:           cli,
@@ -168,26 +168,26 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 	// SetMetaData in the TigeraStatus such as observedGenerations.
 	defer r.status.SetMetaData(&goldmaneCR.ObjectMeta)
 
-	variant, installation, err := utils.GetInstallation(ctx, r.cli)
+	variant, installationSpec, err := utils.GetInstallationSpec(ctx, r.cli)
 	if err != nil {
 		return reconcile.Result{}, err
-	} else if installation == nil {
+	} else if installationSpec == nil {
 		return reconcile.Result{}, nil
 	}
 
-	mgmtClusterConnectionCR, err := utils.GetIfExists[operatorv1.ManagementClusterConnection](ctx, utils.DefaultTSEEInstanceKey, r.cli)
+	mgmtClusterConnectionCR, err := utils.GetIfExists[operatorv1.ManagementClusterConnection](ctx, utils.DefaultEnterpriseInstanceKey, r.cli)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying ManagementClusterConnection CR", err, reqLogger)
 		return reconcile.Result{}, err
 	}
 
-	pullSecrets, err := utils.GetNetworkingPullSecrets(installation, r.cli)
+	pullSecrets, err := utils.GetInstallationPullSecrets(installationSpec, r.cli)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error retrieving pull secrets", err, reqLogger)
 		return reconcile.Result{}, err
 	}
 
-	certificateManager, err := certificatemanager.Create(r.cli, installation, r.clusterDomain, common.OperatorNamespace())
+	certificateManager, err := certificatemanager.Create(r.cli, installationSpec, r.clusterDomain, common.OperatorNamespace())
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the certificate manager", err, reqLogger)
 		return reconcile.Result{}, err
@@ -233,7 +233,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 	cfg := &goldmane.Configuration{
 		PullSecrets:                 pullSecrets,
 		OpenShift:                   r.provider.IsOpenShift(),
-		Installation:                installation,
+		Installation:                installationSpec,
 		TrustedCertBundle:           trustedBundle,
 		GoldmaneServerKeyPair:       keyPair,
 		ManagementClusterConnection: mgmtClusterConnectionCR,

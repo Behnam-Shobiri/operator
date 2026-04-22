@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,13 +23,13 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/components"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	"github.com/tigera/operator/pkg/render/common/elasticsearch"
@@ -49,7 +49,7 @@ const (
 	ServiceAccountName    = "tigera-secure-es-gateway"
 	RoleName              = "tigera-secure-es-gateway"
 	ServiceName           = "tigera-secure-es-gateway-http"
-	PolicyName            = networkpolicy.TigeraComponentPolicyPrefix + "es-gateway-access"
+	PolicyName            = networkpolicy.CalicoComponentPolicyPrefix + "es-gateway-access"
 	ElasticsearchPortName = "es-gateway-elasticsearch-port"
 	KibanaPortName        = "es-gateway-kibana-port"
 	Port                  = 5554
@@ -109,12 +109,15 @@ func (e *esGateway) ResolveImages(is *operatorv1.ImageSet) error {
 }
 
 func (e *esGateway) Objects() (toCreate, toDelete []client.Object) {
-	toCreate = append(toCreate, e.esGatewayAllowTigeraPolicy())
+	toCreate = append(toCreate, e.esGatewayCalicoSystemPolicy())
 	toCreate = append(toCreate, secret.ToRuntimeObjects(e.cfg.KubeControllersUserSecrets...)...)
 	toCreate = append(toCreate, e.esGatewayService())
 	toCreate = append(toCreate, e.esGatewayRole())
 	toCreate = append(toCreate, e.esGatewayRoleBinding())
 	toCreate = append(toCreate, e.esGatewayServiceAccount())
+
+	// allow-tigera Tier was renamed to calico-system
+	toDelete = append(toDelete, networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("es-gateway-access", e.cfg.Namespace))
 
 	// The following secret is used by kube controllers and sent to managed clusters. It is also used by manifests in our docs.
 	if e.cfg.ESGatewayKeyPair.UseCertificateManagement() {
@@ -124,6 +127,7 @@ func (e *esGateway) Objects() (toCreate, toDelete []client.Object) {
 	}
 	// Create the deployment last to ensure all secrets have been created
 	toCreate = append(toCreate, e.esGatewayDeployment())
+
 	return toCreate, toDelete
 }
 
@@ -285,8 +289,8 @@ func (e *esGateway) esGatewayDeployment() *appsv1.Deployment {
 			Strategy: appsv1.DeploymentStrategy{
 				Type: appsv1.RollingUpdateDeploymentStrategyType,
 				RollingUpdate: &appsv1.RollingUpdateDeployment{
-					MaxUnavailable: ptr.IntOrStrPtr("0"),
-					MaxSurge:       ptr.IntOrStrPtr("100%"),
+					MaxUnavailable: ptr.To(intstr.FromInt(0)),
+					MaxSurge:       ptr.To(intstr.FromString("100%")),
 				},
 			},
 			Template: *podTemplate,
@@ -342,7 +346,7 @@ func (e *esGateway) esGatewayService() *corev1.Service {
 }
 
 // Allow access to ES Gateway from components that need to talk to Elasticsearch or Kibana.
-func (e *esGateway) esGatewayAllowTigeraPolicy() *v3.NetworkPolicy {
+func (e *esGateway) esGatewayCalicoSystemPolicy() *v3.NetworkPolicy {
 	egressRules := []v3.Rule{}
 	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, e.cfg.Installation.KubernetesProvider.IsOpenShift())
 	egressRules = append(egressRules, []v3.Rule{
@@ -354,7 +358,7 @@ func (e *esGateway) esGatewayAllowTigeraPolicy() *v3.NetworkPolicy {
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.KubeAPIServerServiceSelectorEntityRule,
+			Destination: networkpolicy.KubeAPIServerEntityRule,
 		},
 		{
 			Action:      v3.Allow,
@@ -379,7 +383,7 @@ func (e *esGateway) esGatewayAllowTigeraPolicy() *v3.NetworkPolicy {
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
+			Tier:     networkpolicy.CalicoTierName,
 			Selector: networkpolicy.KubernetesAppSelector(DeploymentName),
 			Types:    []v3.PolicyType{v3.PolicyTypeIngress, v3.PolicyTypeEgress},
 			Ingress: []v3.Rule{

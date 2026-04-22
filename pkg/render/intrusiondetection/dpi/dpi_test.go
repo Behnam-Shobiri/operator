@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +15,7 @@
 package dpi_test
 
 import (
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -72,12 +71,12 @@ var (
 
 	expectedClusterRoleRules = []rbacv1.PolicyRule{
 		{
-			APIGroups: []string{"crd.projectcalico.org"},
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 			Resources: []string{"deeppacketinspections"},
 			Verbs:     []string{"get", "list", "watch"},
 		},
 		{
-			APIGroups: []string{"crd.projectcalico.org"},
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 			Resources: []string{"deeppacketinspections/status"},
 			Verbs:     []string{"update"},
 		},
@@ -199,7 +198,7 @@ var _ = Describe("DPI rendering tests", func() {
 
 	BeforeEach(func() {
 		scheme := runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 		cli := ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 		certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
@@ -299,6 +298,7 @@ var _ = Describe("DPI rendering tests", func() {
 
 		ds := rtest.GetResource(resources, dpi.DeepPacketInspectionName, dpi.DeepPacketInspectionNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
 		Expect(ds.Spec.Template.Spec.Containers[0].Env).Should(ContainElements(
+			corev1.EnvVar{Name: "LINSEED_URL", Value: "https://tigera-linseed.tigera-elasticsearch.svc"},
 			corev1.EnvVar{Name: "LINSEED_CLIENT_CERT", Value: "/deep-packet-inspection-tls/tls.crt"},
 			corev1.EnvVar{Name: "LINSEED_CLIENT_KEY", Value: "/deep-packet-inspection-tls/tls.key"},
 			corev1.EnvVar{Name: "LINSEED_TOKEN", Value: "/var/run/secrets/kubernetes.io/serviceaccount/token"},
@@ -344,6 +344,7 @@ var _ = Describe("DPI rendering tests", func() {
 
 		ds := rtest.GetResource(resources, dpi.DeepPacketInspectionName, dpi.DeepPacketInspectionNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
 		Expect(ds.Spec.Template.Spec.Containers[0].Env).Should(ContainElements(
+			corev1.EnvVar{Name: "LINSEED_URL", Value: "https://guardian.calico-system.svc"},
 			corev1.EnvVar{Name: "LINSEED_CLIENT_CERT", Value: "/deep-packet-inspection-tls/tls.crt"},
 			corev1.EnvVar{Name: "LINSEED_CLIENT_KEY", Value: "/deep-packet-inspection-tls/tls.key"},
 			corev1.EnvVar{Name: "LINSEED_TOKEN", Value: render.LinseedTokenPath},
@@ -584,34 +585,36 @@ var _ = Describe("DPI rendering tests", func() {
 		}))
 	})
 
-	Context("allow-tigera rendering", func() {
-		policyName := types.NamespacedName{Name: "allow-tigera.tigera-dpi", Namespace: "tigera-dpi"}
+	Context("calico-system rendering", func() {
+		policyName := types.NamespacedName{Name: "calico-system.tigera-dpi", Namespace: "tigera-dpi"}
 
-		getExpectedPolicy := func(scenario testutils.AllowTigeraScenario) *v3.NetworkPolicy {
+		getExpectedPolicy := func(scenario testutils.CalicoSystemScenario) *v3.NetworkPolicy {
 			return testutils.SelectPolicyByClusterTypeAndProvider(
 				scenario,
-				expectedUnmanagedPolicy,
-				expectedUnmanagedPolicyForOpenshift,
-				expectedManagedPolicy,
-				expectedManagedPolicyForOpenshift,
+				map[string]*v3.NetworkPolicy{
+					"unmanaged":           expectedUnmanagedPolicy,
+					"unmanaged-openshift": expectedUnmanagedPolicyForOpenshift,
+					"managed":             expectedManagedPolicy,
+					"managed-openshift":   expectedManagedPolicyForOpenshift,
+				},
 			)
 		}
 
-		DescribeTable("should render allow-tigera policy",
-			func(scenario testutils.AllowTigeraScenario) {
+		DescribeTable("should render calico-system policy",
+			func(scenario testutils.CalicoSystemScenario) {
 				cfg.ManagedCluster = scenario.ManagedCluster
 				cfg.OpenShift = scenario.OpenShift
 				component := dpi.DPI(cfg)
 				resources, _ := component.Objects()
 
-				policy := testutils.GetAllowTigeraPolicyFromResources(policyName, resources)
+				policy := testutils.GetCalicoSystemPolicyFromResources(policyName, resources)
 				expectedPolicy := getExpectedPolicy(scenario)
 				Expect(policy).To(Equal(expectedPolicy))
 			},
-			Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false}),
-			Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true}),
-			Entry("for managed, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: true, OpenShift: false}),
-			Entry("for managed, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: true, OpenShift: true}),
+			Entry("for management/standalone, kube-dns", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: false}),
+			Entry("for management/standalone, openshift-dns", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: true}),
+			Entry("for managed, kube-dns", testutils.CalicoSystemScenario{ManagedCluster: true, OpenShift: false}),
+			Entry("for managed, openshift-dns", testutils.CalicoSystemScenario{ManagedCluster: true, OpenShift: true}),
 		)
 	})
 
@@ -768,6 +771,76 @@ var _ = Describe("DPI rendering tests", func() {
 				},
 			}))
 		})
+	})
+
+	Context("LINSEED_URL environment variable", func() {
+		It("should set LINSEED_URL correctly for managed cluster", func() {
+			managedCfg := &dpi.DPIConfig{
+				IntrusionDetection: ids,
+				Installation:       installation,
+				TyphaNodeTLS:       typhaNodeTLS,
+				PullSecrets:        pullSecrets,
+				OpenShift:          false,
+				HasNoLicense:       false,
+				HasNoDPIResource:   false,
+				ClusterDomain:      dns.DefaultClusterDomain,
+				DPICertSecret:      dpiCertSecret,
+				ManagedCluster:     true,
+			}
+			component := dpi.DPI(managedCfg)
+			resources, _ := component.Objects()
+
+			ds := rtest.GetResource(resources, dpi.DeepPacketInspectionName, dpi.DeepPacketInspectionNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
+			envs := ds.Spec.Template.Spec.Containers[0].Env
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "LINSEED_URL", Value: "https://guardian.calico-system.svc"}))
+		})
+
+		It("should set LINSEED_URL correctly for single-tenant standalone cluster", func() {
+			standaloneCfg := &dpi.DPIConfig{
+				IntrusionDetection: ids,
+				Installation:       installation,
+				TyphaNodeTLS:       typhaNodeTLS,
+				PullSecrets:        pullSecrets,
+				OpenShift:          false,
+				HasNoLicense:       false,
+				HasNoDPIResource:   false,
+				ClusterDomain:      dns.DefaultClusterDomain,
+				DPICertSecret:      dpiCertSecret,
+				ManagedCluster:     false,
+				ManagementCluster:  false,
+			}
+			component := dpi.DPI(standaloneCfg)
+			resources, _ := component.Objects()
+
+			ds := rtest.GetResource(resources, dpi.DeepPacketInspectionName, dpi.DeepPacketInspectionNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
+			envs := ds.Spec.Template.Spec.Containers[0].Env
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "LINSEED_URL", Value: "https://tigera-linseed.tigera-elasticsearch.svc"}))
+		})
+
+		It("should set LINSEED_URL correctly for single-tenant management cluster", func() {
+			managementCfg := &dpi.DPIConfig{
+				IntrusionDetection: ids,
+				Installation:       installation,
+				TyphaNodeTLS:       typhaNodeTLS,
+				PullSecrets:        pullSecrets,
+				OpenShift:          false,
+				HasNoLicense:       false,
+				HasNoDPIResource:   false,
+				ClusterDomain:      dns.DefaultClusterDomain,
+				DPICertSecret:      dpiCertSecret,
+				ManagedCluster:     false,
+				ManagementCluster:  true,
+			}
+			component := dpi.DPI(managementCfg)
+			resources, _ := component.Objects()
+
+			ds := rtest.GetResource(resources, dpi.DeepPacketInspectionName, dpi.DeepPacketInspectionNamespace, "apps", "v1", "DaemonSet").(*appsv1.DaemonSet)
+			envs := ds.Spec.Template.Spec.Containers[0].Env
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "LINSEED_URL", Value: "https://tigera-linseed.tigera-elasticsearch.svc"}))
+		})
+
+		// No need to verify LINSEED_URL for multi-tenant management cluster as a DPI deployment does not get created on the management cluster
+		// in a multi-tenant setup. See multi-tenant tests above.
 	})
 })
 

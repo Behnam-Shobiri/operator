@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,17 +15,17 @@
 package applicationlayer_test
 
 import (
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/utils/ptr"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render/applicationlayer"
 	"github.com/tigera/operator/pkg/render/applicationlayer/ruleset"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
@@ -312,8 +312,8 @@ var _ = Describe("Tigera Secure Application Layer rendering tests", func() {
 			Installation:           installation,
 			OsType:                 rmeta.OSTypeLinux,
 			PerHostLogsEnabled:     true,
-			LogIntervalSeconds:     ptr.Int64ToPtr(5),
-			LogRequestsPerInterval: ptr.Int64ToPtr(-1),
+			LogIntervalSeconds:     ptr.To(int64(5)),
+			LogRequestsPerInterval: ptr.To(int64(-1)),
 		})
 		resources, _ := component.Objects()
 
@@ -343,8 +343,8 @@ var _ = Describe("Tigera Secure Application Layer rendering tests", func() {
 			Installation:           installation,
 			OsType:                 rmeta.OSTypeLinux,
 			PerHostLogsEnabled:     true,
-			LogIntervalSeconds:     ptr.Int64ToPtr(5),
-			LogRequestsPerInterval: ptr.Int64ToPtr(-1),
+			LogIntervalSeconds:     ptr.To(int64(5)),
+			LogRequestsPerInterval: ptr.To(int64(-1)),
 			UseRemoteAddressXFF:    true,
 			NumTrustedHopsXFF:      1,
 		})

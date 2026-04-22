@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ package render_test
 import (
 	"fmt"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gstruct"
 
@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
@@ -36,7 +37,6 @@ import (
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	"github.com/tigera/operator/pkg/controller/k8sapi"
 	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	rtest "github.com/tigera/operator/pkg/render/common/test"
@@ -69,7 +69,7 @@ var _ = Describe("Typha rendering tests", func() {
 			},
 		}
 		scheme := runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 		cli = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 		certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
@@ -293,8 +293,8 @@ var _ = Describe("Typha rendering tests", func() {
 		Expect(d.Spec.Strategy).To(Equal(appsv1.DeploymentStrategy{
 			Type: appsv1.RollingUpdateDeploymentStrategyType,
 			RollingUpdate: &appsv1.RollingUpdateDeployment{
-				MaxSurge:       ptr.IntOrStrPtr("100%"),
-				MaxUnavailable: ptr.IntOrStrPtr("1"),
+				MaxSurge:       ptr.To(intstr.FromString("100%")),
+				MaxUnavailable: ptr.To(intstr.FromInt(1)),
 			},
 		}))
 	})
@@ -484,7 +484,7 @@ var _ = Describe("Typha rendering tests", func() {
 	})
 
 	It("should not enable prometheus metrics if TyphaMetricsPort is nil", func() {
-		installation.Variant = operatorv1.TigeraSecureEnterprise
+		installation.Variant = operatorv1.CalicoEnterprise
 		installation.TyphaMetricsPort = nil
 		component := render.Typha(&cfg)
 		Expect(component.ResolveImages(nil)).To(BeNil())
@@ -500,7 +500,7 @@ var _ = Describe("Typha rendering tests", func() {
 
 	It("should set TYPHA_PROMETHEUSMETRICSPORT with a custom value if TyphaMetricsPort is set", func() {
 		var typhaMetricsPort int32 = 1234
-		installation.Variant = operatorv1.TigeraSecureEnterprise
+		installation.Variant = operatorv1.CalicoEnterprise
 		installation.TyphaMetricsPort = &typhaMetricsPort
 		component := render.Typha(&cfg)
 		Expect(component.ResolveImages(nil)).To(BeNil())
@@ -601,8 +601,8 @@ var _ = Describe("Typha rendering tests", func() {
 					MinReadySeconds: &minReadySeconds,
 					Strategy: &operatorv1.TyphaDeploymentStrategy{
 						RollingUpdate: &appsv1.RollingUpdateDeployment{
-							MaxSurge:       ptr.IntOrStrPtr("2"),
-							MaxUnavailable: ptr.IntOrStrPtr("0"),
+							MaxSurge:       ptr.To(intstr.FromString("2")),
+							MaxUnavailable: ptr.To(intstr.FromString("0")),
 						},
 					},
 					Template: &operatorv1.TyphaDeploymentPodTemplateSpec{
@@ -651,8 +651,8 @@ var _ = Describe("Typha rendering tests", func() {
 			Expect(d.Spec.Strategy).To(Equal(appsv1.DeploymentStrategy{
 				Type: appsv1.RollingUpdateDeploymentStrategyType,
 				RollingUpdate: &appsv1.RollingUpdateDeployment{
-					MaxSurge:       ptr.IntOrStrPtr("2"),
-					MaxUnavailable: ptr.IntOrStrPtr("0"),
+					MaxSurge:       ptr.To(intstr.FromString("2")),
+					MaxUnavailable: ptr.To(intstr.FromString("0")),
 				},
 			}))
 

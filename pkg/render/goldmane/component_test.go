@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +15,7 @@
 package goldmane_test
 
 import (
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"github.com/google/go-cmp/cmp"
@@ -25,9 +24,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
@@ -40,6 +40,7 @@ import (
 var (
 	defaultTLSKeyPair        = certificatemanagement.NewKeyPair(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "key-pair"}}, nil, "")
 	defaultTrustedCertBundle = certificatemanagement.CreateTrustedBundle(nil)
+	metricsPort              = int32(9081)
 )
 
 var _ = Describe("ComponentRendering", func() {
@@ -49,7 +50,7 @@ var _ = Describe("ComponentRendering", func() {
 		Expect(objsToCreate).To(HaveLen(creatObjs))
 		Expect(objsToDelete).To(HaveLen(delObjs))
 	},
-		Entry("Should return objects to create when variant is Calico",
+		Entry("Should return objects to create when variant is Calico (no metrics)",
 			&goldmane.Configuration{
 				Installation: &operatorv1.InstallationSpec{
 					KubernetesProvider: operatorv1.ProviderGKE,
@@ -59,19 +60,33 @@ var _ = Describe("ComponentRendering", func() {
 				GoldmaneServerKeyPair: defaultTLSKeyPair,
 				Goldmane:              &operatorv1.Goldmane{},
 			},
-			7, 0,
+			7, 2,
+		),
+		Entry("Should return objects to create when variant is Calico (with metrics)",
+			&goldmane.Configuration{
+				Installation: &operatorv1.InstallationSpec{
+					KubernetesProvider: operatorv1.ProviderGKE,
+					Variant:            operatorv1.Calico,
+				},
+				TrustedCertBundle:     certificatemanagement.CreateTrustedBundle(nil),
+				GoldmaneServerKeyPair: defaultTLSKeyPair,
+				Goldmane: &operatorv1.Goldmane{
+					Spec: operatorv1.GoldmaneSpec{MetricsPort: &metricsPort},
+				},
+			},
+			8, 1,
 		),
 		Entry("Should return objects to delete when variant is not Calico",
 			&goldmane.Configuration{
 				Installation: &operatorv1.InstallationSpec{
 					KubernetesProvider: operatorv1.ProviderGKE,
-					Variant:            operatorv1.TigeraSecureEnterprise,
+					Variant:            operatorv1.CalicoEnterprise,
 				},
 				TrustedCertBundle:     certificatemanagement.CreateTrustedBundle(nil),
 				GoldmaneServerKeyPair: defaultTLSKeyPair,
 				Goldmane:              &operatorv1.Goldmane{},
 			},
-			0, 7,
+			0, 8,
 		),
 	)
 
@@ -109,7 +124,7 @@ var _ = Describe("ComponentRendering", func() {
 					Annotations: map[string]string{"hash.operator.tigera.io/key-pair": "e9e6e60e8b6007cbf14a325c3fa1f1692412315a"},
 				},
 				Spec: appsv1.DeploymentSpec{
-					Replicas: ptr.ToPtr(int32(1)),
+					Replicas: ptr.To(int32(1)),
 					Strategy: appsv1.DeploymentStrategy{
 						Type: appsv1.RecreateDeploymentStrategyType,
 					},
@@ -177,6 +192,82 @@ var _ = Describe("ComponentRendering", func() {
 			},
 		),
 	)
+
+	It("Should create metrics service and set PROMETHEUS_PORT when metricsPort is configured", func() {
+		cfg := &goldmane.Configuration{
+			ClusterDomain: "cluster.local",
+			Installation: &operatorv1.InstallationSpec{
+				KubernetesProvider: operatorv1.ProviderGKE,
+				Variant:            operatorv1.Calico,
+			},
+			TrustedCertBundle:     certificatemanagement.CreateTrustedBundle(nil),
+			GoldmaneServerKeyPair: defaultTLSKeyPair,
+			Goldmane: &operatorv1.Goldmane{
+				Spec: operatorv1.GoldmaneSpec{MetricsPort: &metricsPort},
+			},
+		}
+		component := goldmane.Goldmane(cfg)
+		objsToCreate, objsToDelete := component.Objects()
+		Expect(objsToDelete).To(HaveLen(1))
+
+		// Verify the metrics service is created with prometheus annotations.
+		svc, err := rtest.GetResourceOfType[*corev1.Service](objsToCreate, goldmane.GoldmaneMetricsServiceName, goldmane.GoldmaneNamespace)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(svc.Annotations["prometheus.io/scrape"]).To(Equal("true"))
+		Expect(svc.Annotations["prometheus.io/port"]).To(Equal("9081"))
+		Expect(svc.Spec.ClusterIP).To(Equal("None"))
+		Expect(svc.Spec.Ports).To(HaveLen(1))
+		Expect(svc.Spec.Ports[0].Port).To(Equal(metricsPort))
+
+		// Verify the deployment has PROMETHEUS_PORT env var.
+		deployment, err := rtest.GetResourceOfType[*appsv1.Deployment](objsToCreate, goldmane.GoldmaneName, goldmane.GoldmaneNamespace)
+		Expect(err).ShouldNot(HaveOccurred())
+		env := deployment.Spec.Template.Spec.Containers[0].Env
+		found := false
+		for _, e := range env {
+			if e.Name == "PROMETHEUS_PORT" {
+				Expect(e.Value).To(Equal("9081"))
+				found = true
+			}
+		}
+		Expect(found).To(BeTrue(), "PROMETHEUS_PORT env var should be set")
+
+		// Verify the network policy includes the metrics port.
+		np, err := rtest.GetResourceOfType[*v3.NetworkPolicy](objsToCreate, goldmane.GoldmanePolicyName, goldmane.GoldmaneNamespace)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(np.Spec.Ingress).To(HaveLen(2))
+	})
+
+	It("Should not set PROMETHEUS_PORT when metricsPort is not configured", func() {
+		cfg := &goldmane.Configuration{
+			ClusterDomain: "cluster.local",
+			Installation: &operatorv1.InstallationSpec{
+				KubernetesProvider: operatorv1.ProviderGKE,
+				Variant:            operatorv1.Calico,
+			},
+			TrustedCertBundle:     certificatemanagement.CreateTrustedBundle(nil),
+			GoldmaneServerKeyPair: defaultTLSKeyPair,
+			Goldmane:              &operatorv1.Goldmane{},
+		}
+		component := goldmane.Goldmane(cfg)
+		objsToCreate, objsToDelete := component.Objects()
+
+		// Metrics service should be in deletion list.
+		_, err := rtest.GetResourceOfType[*corev1.Service](objsToDelete, goldmane.GoldmaneMetricsServiceName, goldmane.GoldmaneNamespace)
+		Expect(err).ShouldNot(HaveOccurred())
+
+		// Deployment should NOT have PROMETHEUS_PORT.
+		deployment, err := rtest.GetResourceOfType[*appsv1.Deployment](objsToCreate, goldmane.GoldmaneName, goldmane.GoldmaneNamespace)
+		Expect(err).ShouldNot(HaveOccurred())
+		for _, e := range deployment.Spec.Template.Spec.Containers[0].Env {
+			Expect(e.Name).NotTo(Equal("PROMETHEUS_PORT"))
+		}
+
+		// Network policy should only have the gRPC port.
+		np, err := rtest.GetResourceOfType[*v3.NetworkPolicy](objsToCreate, goldmane.GoldmanePolicyName, goldmane.GoldmaneNamespace)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(np.Spec.Ingress).To(HaveLen(1))
+	})
 
 	It("Should apply overrides", func() {
 		affinity := &corev1.Affinity{

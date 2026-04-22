@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
@@ -53,14 +53,14 @@ var _ = Describe("GatewayAPI tests", func() {
 	var operatorDone chan struct{}
 	BeforeEach(func() {
 		log = logf.Log.WithName("gatewayapi-test-logger")
-		c, clientset, mgr = setupManagerNoControllers(ManageCRDsDisable, SingleTenant, EnterpriseCRDsExist)
+		c, clientset, mgr = setupManagerNoControllers()
 
 		// Start the GatewayAPI controller.
 		shutdownContext, cancel = context.WithCancel(context.TODO())
 		err := (&controller.GatewayAPIReconciler{
 			Client: c,
 			Scheme: mgr.GetScheme(),
-		}).SetupWithManager(mgr, options.AddOptions{
+		}).SetupWithManager(mgr, options.ControllerOptions{
 			DetectedProvider:    operator.ProviderNone,
 			EnterpriseCRDExists: EnterpriseCRDsExist,
 			ManageCRDs:          ManageCRDsDisable,
@@ -75,7 +75,7 @@ var _ = Describe("GatewayAPI tests", func() {
 		cleanupResources(c)
 
 		By("Verifying CRDs are installed")
-		verifyCRDsExist(c, operator.TigeraSecureEnterprise)
+		verifyCRDsExist(c, operator.CalicoEnterprise)
 
 		By("Creating the tigera-operator namespace, if it doesn't exist")
 		ns := &corev1.Namespace{
@@ -150,7 +150,7 @@ var _ = Describe("GatewayAPI tests", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "default"},
 			Spec: operator.InstallationSpec{
 				Registry: "myregistry.io/",
-				Variant:  operator.TigeraSecureEnterprise,
+				Variant:  operator.CalicoEnterprise,
 			},
 		}
 		err := c.Create(shutdownContext, instance)
@@ -161,7 +161,7 @@ var _ = Describe("GatewayAPI tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Update the status to set variant to Enterprise.
-		instance.Status.Variant = operator.TigeraSecureEnterprise
+		instance.Status.Variant = operator.CalicoEnterprise
 		err = c.Status().Update(shutdownContext, instance)
 		Expect(err).NotTo(HaveOccurred())
 
@@ -190,7 +190,7 @@ var _ = Describe("GatewayAPI tests", func() {
 		Eventually(getGatewayClassNames, "10s").Should(ConsistOf("tigera-gateway-class:tigera-gateway-class"))
 
 		By("Now configuring two custom classes")
-		err = c.Get(shutdownContext, utils.DefaultTSEEInstanceKey, gatewayAPI)
+		err = c.Get(shutdownContext, utils.DefaultEnterpriseInstanceKey, gatewayAPI)
 		Expect(err).NotTo(HaveOccurred())
 		gatewayAPI.Spec.GatewayClasses = []operator.GatewayClassSpec{{
 			Name: "custom-class-1",
@@ -204,7 +204,7 @@ var _ = Describe("GatewayAPI tests", func() {
 		Eventually(getGatewayClassNames, "10s").Should(ConsistOf("custom-class-1:custom-class-1", "custom-class-2:custom-class-2"))
 
 		By("Deconfiguring one of the custom classes")
-		err = c.Get(shutdownContext, utils.DefaultTSEEInstanceKey, gatewayAPI)
+		err = c.Get(shutdownContext, utils.DefaultEnterpriseInstanceKey, gatewayAPI)
 		Expect(err).NotTo(HaveOccurred())
 		gatewayAPI.Spec.GatewayClasses = []operator.GatewayClassSpec{{
 			Name: "custom-class-1",
@@ -216,7 +216,7 @@ var _ = Describe("GatewayAPI tests", func() {
 		Eventually(getGatewayClassNames, "10s").Should(ConsistOf("custom-class-1:custom-class-1"))
 
 		By("Reverting to the default GatewayAPI")
-		err = c.Get(shutdownContext, utils.DefaultTSEEInstanceKey, gatewayAPI)
+		err = c.Get(shutdownContext, utils.DefaultEnterpriseInstanceKey, gatewayAPI)
 		Expect(err).NotTo(HaveOccurred())
 		gatewayAPI.Spec.GatewayClasses = nil
 		err = c.Update(shutdownContext, gatewayAPI)
@@ -233,7 +233,7 @@ var _ = Describe("GatewayAPI tests", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "default"},
 			Spec: operator.InstallationSpec{
 				Registry: "myregistry.io/",
-				Variant:  operator.TigeraSecureEnterprise,
+				Variant:  operator.CalicoEnterprise,
 			},
 		}
 		err := c.Create(shutdownContext, instance)
@@ -244,7 +244,7 @@ var _ = Describe("GatewayAPI tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Update the status to set variant to Enterprise.
-		instance.Status.Variant = operator.TigeraSecureEnterprise
+		instance.Status.Variant = operator.CalicoEnterprise
 		err = c.Status().Update(shutdownContext, instance)
 		Expect(err).NotTo(HaveOccurred())
 
@@ -278,7 +278,7 @@ var _ = Describe("GatewayAPI tests", func() {
 		}, "10s").ShouldNot(HaveOccurred())
 
 		By("Updating GatewayAPI with that custom EnvoyProxy")
-		err = c.Get(shutdownContext, utils.DefaultTSEEInstanceKey, gatewayAPI)
+		err = c.Get(shutdownContext, utils.DefaultEnterpriseInstanceKey, gatewayAPI)
 		Expect(err).NotTo(HaveOccurred())
 		gatewayAPI.Spec.GatewayClasses = []operator.GatewayClassSpec{{
 			Name: "custom-gc",
@@ -314,14 +314,14 @@ var _ = Describe("GatewayAPI tests", func() {
 		Consistently(getEPLoggingLevels, "60s", "10s").Should(HaveKeyWithValue(envoyapi.LogComponentConnection, envoyapi.LogLevelDebug))
 	})
 
-	It("watches the custom EnvoyGateway ConfigMap", func() {
+	It("creates EnvoyProxy with owning gateway env vars in l7-log-collector", func() {
 		By("Creating Installation")
 		instance := &operator.Installation{
 			TypeMeta:   metav1.TypeMeta{Kind: "Installation", APIVersion: "operator.tigera.io/v1"},
 			ObjectMeta: metav1.ObjectMeta{Name: "default"},
 			Spec: operator.InstallationSpec{
 				Registry: "myregistry.io/",
-				Variant:  operator.TigeraSecureEnterprise,
+				Variant:  operator.CalicoEnterprise,
 			},
 		}
 		err := c.Create(shutdownContext, instance)
@@ -332,7 +332,102 @@ var _ = Describe("GatewayAPI tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		// Update the status to set variant to Enterprise.
-		instance.Status.Variant = operator.TigeraSecureEnterprise
+		instance.Status.Variant = operator.CalicoEnterprise
+		err = c.Status().Update(shutdownContext, instance)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("Creating the default GatewayAPI")
+		gatewayAPI := &operator.GatewayAPI{
+			TypeMeta:   metav1.TypeMeta{Kind: "GatewayAPI", APIVersion: "operator.tigera.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure"},
+		}
+		err = c.Create(shutdownContext, gatewayAPI)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("Verifying EnvoyProxy is created with l7-log-collector containing owning gateway env vars")
+		Eventually(func() error {
+			var ep envoyapi.EnvoyProxy
+			err := c.Get(shutdownContext, types.NamespacedName{Namespace: "tigera-gateway", Name: "tigera-gateway-class"}, &ep)
+			if err != nil {
+				return err
+			}
+
+			// Check that EnvoyDeployment has init containers configured
+			if ep.Spec.Provider == nil || ep.Spec.Provider.Kubernetes == nil ||
+				ep.Spec.Provider.Kubernetes.EnvoyDeployment == nil {
+				return errors.New("EnvoyProxy does not have EnvoyDeployment configured")
+			}
+
+			initContainers := ep.Spec.Provider.Kubernetes.EnvoyDeployment.InitContainers
+			if len(initContainers) == 0 {
+				return errors.New("EnvoyProxy has no init containers")
+			}
+
+			// Find l7-log-collector init container
+			var l7LogCollector *corev1.Container
+			for i := range initContainers {
+				if initContainers[i].Name == "l7-log-collector" {
+					l7LogCollector = &initContainers[i]
+					break
+				}
+			}
+			if l7LogCollector == nil {
+				return errors.New("l7-log-collector init container not found")
+			}
+
+			// Verify owning gateway env vars are present
+			var foundName, foundNamespace bool
+			for _, env := range l7LogCollector.Env {
+				if env.Name == "OWNING_GATEWAY_NAME" {
+					if env.ValueFrom == nil || env.ValueFrom.FieldRef == nil {
+						return errors.New("OWNING_GATEWAY_NAME env var does not use FieldRef")
+					}
+					if env.ValueFrom.FieldRef.FieldPath != "metadata.labels['gateway.envoyproxy.io/owning-gateway-name']" {
+						return fmt.Errorf("OWNING_GATEWAY_NAME has wrong field path: %s", env.ValueFrom.FieldRef.FieldPath)
+					}
+					foundName = true
+				}
+				if env.Name == "OWNING_GATEWAY_NAMESPACE" {
+					if env.ValueFrom == nil || env.ValueFrom.FieldRef == nil {
+						return errors.New("OWNING_GATEWAY_NAMESPACE env var does not use FieldRef")
+					}
+					if env.ValueFrom.FieldRef.FieldPath != "metadata.labels['gateway.envoyproxy.io/owning-gateway-namespace']" {
+						return fmt.Errorf("OWNING_GATEWAY_NAMESPACE has wrong field path: %s", env.ValueFrom.FieldRef.FieldPath)
+					}
+					foundNamespace = true
+				}
+			}
+
+			if !foundName {
+				return errors.New("OWNING_GATEWAY_NAME env var not found in l7-log-collector")
+			}
+			if !foundNamespace {
+				return errors.New("OWNING_GATEWAY_NAMESPACE env var not found in l7-log-collector")
+			}
+
+			return nil
+		}, "30s").ShouldNot(HaveOccurred())
+	})
+
+	It("watches the custom EnvoyGateway ConfigMap", func() {
+		By("Creating Installation")
+		instance := &operator.Installation{
+			TypeMeta:   metav1.TypeMeta{Kind: "Installation", APIVersion: "operator.tigera.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "default"},
+			Spec: operator.InstallationSpec{
+				Registry: "myregistry.io/",
+				Variant:  operator.CalicoEnterprise,
+			},
+		}
+		err := c.Create(shutdownContext, instance)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Read it back again.
+		err = c.Get(shutdownContext, utils.DefaultInstanceKey, instance)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Update the status to set variant to Enterprise.
+		instance.Status.Variant = operator.CalicoEnterprise
 		err = c.Status().Update(shutdownContext, instance)
 		Expect(err).NotTo(HaveOccurred())
 

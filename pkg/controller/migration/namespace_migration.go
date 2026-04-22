@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -63,9 +63,7 @@ const (
 	defaultMaxUnavailable int32 = 1
 )
 
-var (
-	migratedNodeLabel = map[string]string{nodeSelectorKey: nodeSelectorValuePost}
-)
+var migratedNodeLabel = map[string]string{nodeSelectorKey: nodeSelectorValuePost}
 
 type NamespaceMigration interface {
 	NeedsCoreNamespaceMigration(ctx context.Context) (bool, error)
@@ -186,6 +184,22 @@ func AddBindingForKubeSystemNode(crb *rbacv1.ClusterRoleBinding) {
 		APIGroup: "rbac.authorization.k8s.io",
 		Kind:     "Group",
 		Name:     "system:nodes",
+	})
+}
+
+// AddBindingForKubeSystemCNIPlugin updates the ClusterRoleBinding passed in
+// to also bind the calico-cni-plugin service account in the kube-system namespace.
+// During migration, nodes that haven't been migrated yet still run the CNI plugin
+// as kube-system:calico-cni-plugin. Without this binding, pod creation fails on
+// those nodes because the CNI plugin loses permissions to access Calico CRDs.
+func AddBindingForKubeSystemCNIPlugin(crb *rbacv1.ClusterRoleBinding) {
+	if crb.Subjects == nil {
+		crb.Subjects = []rbacv1.Subject{}
+	}
+	crb.Subjects = append(crb.Subjects, rbacv1.Subject{
+		Kind:      "ServiceAccount",
+		Name:      "calico-cni-plugin",
+		Namespace: kubeSystem,
 	})
 }
 
@@ -391,13 +405,23 @@ func min(a, b int32) int32 {
 	return b
 }
 
-// NeedCleanup returns if the migration has been marked completed or not.
-// If cleanup is needed then we need to make sure that all our labels have
-// been removed from the nodes. We could check if the label is present
-// on any nodes but it is almost the same operation to call the remove
-// so we'll assume there are labels if we have not removed them previously.
+// NeedCleanup returns true if any nodes still have migration labels that need to be removed.
+// We check the node informer cache to avoid triggering unnecessary cleanup (including waiting
+// for calico-node readiness) on clusters where no migration has occurred.
 func (m *CoreNamespaceMigration) NeedCleanup() bool {
-	return !m.migrationComplete
+	if m.migrationComplete {
+		return false
+	}
+	for _, obj := range m.indexer.List() {
+		node, ok := obj.(*v1.Node)
+		if !ok {
+			continue
+		}
+		if _, exists := node.Labels[nodeSelectorKey]; exists {
+			return true
+		}
+	}
+	return false
 }
 
 // CleanupMigration ensures all labels used during the migration are removed

@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,14 +24,15 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
+	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/controller/k8sapi"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rcomp "github.com/tigera/operator/pkg/render/common/components"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
@@ -51,13 +52,13 @@ const (
 	KubeControllerRole              = "calico-kube-controllers"
 	KubeControllerRoleBinding       = "calico-kube-controllers"
 	KubeControllerMetrics           = "calico-kube-controllers-metrics"
-	KubeControllerNetworkPolicyName = networkpolicy.TigeraComponentPolicyPrefix + "kube-controller-access"
+	KubeControllerNetworkPolicyName = networkpolicy.CalicoComponentPolicyPrefix + "kube-controller-access"
 
 	EsKubeController                    = "es-calico-kube-controllers"
 	EsKubeControllerRole                = "es-calico-kube-controllers"
 	EsKubeControllerRoleBinding         = "es-calico-kube-controllers"
 	EsKubeControllerMetrics             = "es-calico-kube-controllers-metrics"
-	EsKubeControllerNetworkPolicyName   = networkpolicy.TigeraComponentPolicyPrefix + "es-kube-controller-access"
+	EsKubeControllerNetworkPolicyName   = networkpolicy.CalicoComponentPolicyPrefix + "es-kube-controller-access"
 	ManagedClustersWatchRoleBindingName = "es-calico-kube-controllers-managed-cluster-watch"
 
 	ElasticsearchKubeControllersUserSecret             = "tigera-ee-kube-controllers-elasticsearch-access"
@@ -68,7 +69,8 @@ const (
 )
 
 type KubeControllersConfiguration struct {
-	K8sServiceEp k8sapi.ServiceEndpoint
+	K8sServiceEp           k8sapi.ServiceEndpoint
+	K8sServiceEpPodNetwork k8sapi.ServiceEndpoint
 
 	Installation                *operatorv1.InstallationSpec
 	ManagementCluster           *operatorv1.ManagementCluster
@@ -103,14 +105,31 @@ type KubeControllersConfiguration struct {
 	Tenant *operatorv1.Tenant
 }
 
+func NewCalicoKubeControllersPolicy(cfg *KubeControllersConfiguration, defaultDeny *v3.NetworkPolicy) render.Component {
+	toCreate := []client.Object{kubeControllersCalicoSystemPolicy(cfg)}
+
+	if defaultDeny != nil {
+		toCreate = append(toCreate, defaultDeny)
+	}
+
+	return render.NewPassthrough(
+		toCreate,
+		[]client.Object{
+			// allow-tigera Tier was renamed to calico-system
+			networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("kube-controller-access", cfg.Namespace),
+			networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("default-deny", common.CalicoNamespace),
+		},
+	)
+}
+
 func NewCalicoKubeControllers(cfg *KubeControllersConfiguration) *kubeControllersComponent {
-	kubeControllerRolePolicyRules := kubeControllersRoleCommonRules(cfg, KubeController)
+	kubeControllerRolePolicyRules := kubeControllersRoleCommonRules(cfg)
 	enabledControllers := []string{"node", "loadbalancer"}
-	if cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if cfg.Installation.Variant.IsEnterprise() {
 		kubeControllerRolePolicyRules = append(kubeControllerRolePolicyRules, kubeControllersRoleEnterpriseCommonRules(cfg)...)
 		kubeControllerRolePolicyRules = append(kubeControllerRolePolicyRules,
 			rbacv1.PolicyRule{
-				APIGroups: []string{"crd.projectcalico.org"},
+				APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 				Resources: []string{"remoteclusterconfigurations"},
 				Verbs:     []string{"watch", "list", "get"},
 			},
@@ -146,15 +165,11 @@ func NewCalicoKubeControllers(cfg *KubeControllersConfiguration) *kubeController
 	}
 }
 
-func NewCalicoKubeControllersPolicy(cfg *KubeControllersConfiguration) render.Component {
-	return render.NewPassthrough(kubeControllersAllowTigeraPolicy(cfg))
-}
-
 func NewElasticsearchKubeControllers(cfg *KubeControllersConfiguration) *kubeControllersComponent {
-	var kubeControllerAllowTigeraPolicy *v3.NetworkPolicy
-	kubeControllerRolePolicyRules := kubeControllersRoleCommonRules(cfg, EsKubeController)
+	var kubeControllerCalicoSystemPolicy *v3.NetworkPolicy
+	kubeControllerRolePolicyRules := kubeControllersRoleCommonRules(cfg)
 
-	if cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if cfg.Installation.Variant.IsEnterprise() {
 		kubeControllerRolePolicyRules = append(kubeControllerRolePolicyRules, kubeControllersRoleEnterpriseCommonRules(cfg)...)
 		kubeControllerRolePolicyRules = append(kubeControllerRolePolicyRules,
 			rbacv1.PolicyRule{
@@ -169,7 +184,7 @@ func NewElasticsearchKubeControllers(cfg *KubeControllersConfiguration) *kubeCon
 			},
 		)
 
-		kubeControllerAllowTigeraPolicy = esKubeControllersAllowTigeraPolicy(cfg)
+		kubeControllerCalicoSystemPolicy = esKubeControllersCalicoSystemPolicy(cfg)
 	}
 
 	var enabledControllers []string
@@ -191,7 +206,7 @@ func NewElasticsearchKubeControllers(cfg *KubeControllersConfiguration) *kubeCon
 		kubeControllerConfigName:         "elasticsearch",
 		kubeControllerMetricsName:        EsKubeControllerMetrics,
 		kubeControllersRules:             kubeControllerRolePolicyRules,
-		kubeControllerAllowTigeraPolicy:  kubeControllerAllowTigeraPolicy,
+		kubeControllerCalicoSystemPolicy: kubeControllerCalicoSystemPolicy,
 		enabledControllers:               enabledControllers,
 	}
 }
@@ -210,8 +225,8 @@ type kubeControllersComponent struct {
 	kubeControllerConfigName         string
 	kubeControllerMetricsName        string
 
-	kubeControllersRules            []rbacv1.PolicyRule
-	kubeControllerAllowTigeraPolicy *v3.NetworkPolicy
+	kubeControllersRules             []rbacv1.PolicyRule
+	kubeControllerCalicoSystemPolicy *v3.NetworkPolicy
 
 	enabledControllers []string
 }
@@ -221,7 +236,7 @@ func (c *kubeControllersComponent) ResolveImages(is *operatorv1.ImageSet) error 
 	path := c.cfg.Installation.ImagePath
 	prefix := c.cfg.Installation.ImagePrefix
 	var err error
-	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if c.cfg.Installation.Variant.IsEnterprise() {
 		c.image, err = components.GetReference(components.ComponentTigeraKubeControllers, reg, path, prefix, is)
 	} else {
 		if operatorv1.IsFIPSModeEnabled(c.cfg.Installation.FIPSMode) {
@@ -241,8 +256,12 @@ func (c *kubeControllersComponent) Objects() ([]client.Object, []client.Object) 
 	objectsToCreate := []client.Object{}
 	objectsToDelete := []client.Object{}
 
-	if c.kubeControllerAllowTigeraPolicy != nil {
-		objectsToCreate = append(objectsToCreate, c.kubeControllerAllowTigeraPolicy)
+	if c.kubeControllerCalicoSystemPolicy != nil {
+		objectsToCreate = append(objectsToCreate, c.kubeControllerCalicoSystemPolicy)
+		// allow-tigera Tier was renamed to calico-system
+		objectsToDelete = append(objectsToDelete,
+			networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("es-kube-controller-access", c.cfg.Namespace),
+		)
 	}
 
 	objectsToCreate = append(objectsToCreate,
@@ -286,7 +305,7 @@ func (c *kubeControllersComponent) Ready() bool {
 	return true
 }
 
-func kubeControllersRoleCommonRules(cfg *KubeControllersConfiguration, kubeControllerName string) []rbacv1.PolicyRule {
+func kubeControllersRoleCommonRules(cfg *KubeControllersConfiguration) []rbacv1.PolicyRule {
 	rules := []rbacv1.PolicyRule{
 		{
 			// Nodes are watched to monitor for deletions.
@@ -307,30 +326,36 @@ func kubeControllersRoleCommonRules(cfg *KubeControllersConfiguration, kubeContr
 		},
 		{
 			// IPAM resources are manipulated in response to node and block updates, as well as periodic triggers.
-			APIGroups: []string{"crd.projectcalico.org"},
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 			Resources: []string{"ipreservations"},
 			Verbs:     []string{"list"},
 		},
 		{
-			APIGroups: []string{"crd.projectcalico.org"},
-			Resources: []string{"blockaffinities", "ipamblocks", "ipamhandles", "networksets", "ipamconfigs"},
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
+			Resources: []string{"blockaffinities", "ipamblocks", "ipamhandles", "networksets", "ipamconfigurations"},
 			Verbs:     []string{"get", "list", "create", "update", "delete", "watch"},
 		},
 		{
-			// Pools are watched to maintain a mapping of blocks to IP pools.
-			APIGroups: []string{"crd.projectcalico.org"},
-			Resources: []string{"ippools"},
-			Verbs:     []string{"list", "watch"},
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
+			Resources: []string{
+				// Pools are watched by various controllers.
+				// - IPAM garbage collection watches pools to know which blocks to GC.
+				// - The pool controller adds / manages finalizers on IP pools.
+				// - The pool controller updates status conditions on IP pools.
+				"ippools",
+				"ippools/status",
+			},
+			Verbs: []string{"list", "watch", "update"},
 		},
 		{
 			// Needs access to update clusterinformations.
-			APIGroups: []string{"crd.projectcalico.org"},
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 			Resources: []string{"clusterinformations"},
 			Verbs:     []string{"get", "create", "update", "list", "watch"},
 		},
 		{
 			// Needs to manage hostendpoints.
-			APIGroups: []string{"crd.projectcalico.org"},
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 			Resources: []string{"hostendpoints"},
 			Verbs:     []string{"get", "list", "create", "update", "delete", "watch"},
 		},
@@ -338,20 +363,58 @@ func kubeControllersRoleCommonRules(cfg *KubeControllersConfiguration, kubeContr
 			// Needs to manipulate kubecontrollersconfiguration, which contains
 			// its config.  It creates a default if none exists, and updates status
 			// as well.
-			APIGroups: []string{"crd.projectcalico.org"},
-			Resources: []string{"kubecontrollersconfigurations"},
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
+			Resources: []string{"kubecontrollersconfigurations", "kubecontrollersconfigurations/status"},
 			Verbs:     []string{"get", "create", "list", "update", "watch"},
 		},
 		{
-			// calico-kube-controllers requires tiers create
-			APIGroups: []string{"crd.projectcalico.org"},
+			// calico-kube-controllers requires tiers create to create the default tiers,
+			// and get permissions to access network policies in those tiers.
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 			Resources: []string{"tiers"},
-			Verbs:     []string{"create"},
+			Verbs:     []string{"create", "update", "get", "list", "watch"},
 		},
 		{
 			// Namespaces are watched for LoadBalancer IP allocation with namespace selector support
 			APIGroups: []string{""},
 			Resources: []string{"namespaces"},
+			Verbs:     []string{"get", "list", "watch"},
+		},
+		{
+			// The policy name migrator needs to check calico/node daemonset rollout status.
+			APIGroups:     []string{"apps"},
+			Resources:     []string{"daemonsets"},
+			Verbs:         []string{"get"},
+			ResourceNames: []string{"calico-node"},
+		},
+		{
+			// The policy name migrator needs to be able to CRUD Calico NetworkPolicies.
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
+			Resources: []string{
+				"networkpolicies",
+				"globalnetworkpolicies",
+				"stagednetworkpolicies",
+				"stagedglobalnetworkpolicies",
+			},
+			Verbs: []string{"get", "list", "watch", "create", "update", "delete"},
+		},
+		{
+			// The IPAM GC controller uses informers to list/watch KubeVirt VMs/VMIs for IP garbage collection.
+			APIGroups: []string{"kubevirt.io"},
+			Resources: []string{"virtualmachineinstances", "virtualmachines"},
+			Verbs:     []string{"get", "list", "watch"},
+		},
+		{
+			// The datastore migration controller watches DatastoreMigration CRs and updates their status.
+			APIGroups: []string{"migration.projectcalico.org"},
+			Resources: []string{"datastoremigrations", "datastoremigrations/status"},
+			Verbs:     []string{"get", "list", "watch", "create", "update", "patch"},
+		},
+		{
+			// The datastore migration controller needs to list/watch CRDs to determine
+			// which API group is active.
+			APIGroups: []string{"apiextensions.k8s.io"},
+			Resources: []string{"customresourcedefinitions"},
 			Verbs:     []string{"get", "list", "watch"},
 		},
 	}
@@ -384,15 +447,15 @@ func kubeControllersRoleEnterpriseCommonRules(cfg *KubeControllersConfiguration)
 		},
 		{
 			// Needed to validate the license
-			APIGroups: []string{"projectcalico.org"},
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 			Resources: []string{"licensekeys"},
 			Verbs:     []string{"get", "watch", "list"},
 		},
 		{
-			// Needed to validate the license
-			APIGroups: []string{"crd.projectcalico.org"},
-			Resources: []string{"licensekeys"},
-			Verbs:     []string{"get", "watch"},
+			// Needed to update the status of the LicenseKey with the result of license validation.
+			APIGroups: []string{"projectcalico.org"},
+			Resources: []string{"licensekeys/status"},
+			Verbs:     []string{"update"},
 		},
 		{
 			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
@@ -400,12 +463,12 @@ func kubeControllersRoleEnterpriseCommonRules(cfg *KubeControllersConfiguration)
 			Verbs:     []string{"get", "watch", "list"},
 		},
 		{
-			APIGroups: []string{"crd.projectcalico.org"},
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 			Resources: []string{"deeppacketinspections/status"},
 			Verbs:     []string{"update"},
 		},
 		{
-			APIGroups: []string{"crd.projectcalico.org"},
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 			Resources: []string{"packetcaptures"},
 			Verbs:     []string{"get", "list", "update"},
 		},
@@ -414,7 +477,7 @@ func kubeControllersRoleEnterpriseCommonRules(cfg *KubeControllersConfiguration)
 	if cfg.ManagementClusterConnection != nil {
 		rules = append(rules,
 			rbacv1.PolicyRule{
-				APIGroups: []string{"projectcalico.org"},
+				APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 				Resources: []string{"licensekeys"},
 				Verbs:     []string{"get", "create", "update", "list", "watch"},
 			},
@@ -479,9 +542,9 @@ func (c *kubeControllersComponent) controllersDeployment() *appsv1.Deployment {
 		{Name: "DISABLE_KUBE_CONTROLLERS_CONFIG_API", Value: strconv.FormatBool(c.cfg.Tenant.MultiTenant() && c.kubeControllerConfigName == "elasticsearch")},
 	}
 
-	env = append(env, c.cfg.K8sServiceEp.EnvVars(false, c.cfg.Installation.KubernetesProvider)...)
+	env = append(env, c.cfg.K8sServiceEpPodNetwork.EnvVars()...)
 
-	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if c.cfg.Installation.Variant.IsEnterprise() {
 		if c.cfg.Tenant != nil {
 			env = append(env, corev1.EnvVar{Name: "TENANT_ID", Value: c.cfg.Tenant.Spec.ID})
 		}
@@ -523,8 +586,8 @@ func (c *kubeControllersComponent) controllersDeployment() *appsv1.Deployment {
 
 	// UID 999 is used in kube-controller Dockerfile.
 	sc := securitycontext.NewNonRootContext()
-	sc.RunAsUser = ptr.Int64ToPtr(999)
-	sc.RunAsGroup = ptr.Int64ToPtr(0)
+	sc.RunAsUser = ptr.To(int64(999))
+	sc.RunAsGroup = ptr.To(int64(0))
 
 	container := corev1.Container{
 		Name:            c.kubeControllerName,
@@ -729,7 +792,7 @@ func (c *kubeControllersComponent) kubeControllersVolumes() []corev1.Volume {
 	return volumes
 }
 
-func kubeControllersAllowTigeraPolicy(cfg *KubeControllersConfiguration) *v3.NetworkPolicy {
+func kubeControllersCalicoSystemPolicy(cfg *KubeControllersConfiguration) *v3.NetworkPolicy {
 	egressRules := []v3.Rule{}
 	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.Installation.KubernetesProvider.IsOpenShift())
 	egressRules = append(egressRules, []v3.Rule{
@@ -784,7 +847,7 @@ func kubeControllersAllowTigeraPolicy(cfg *KubeControllersConfiguration) *v3.Net
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
+			Tier:     networkpolicy.CalicoTierName,
 			Selector: networkpolicy.KubernetesAppSelector(KubeController),
 			Types:    []v3.PolicyType{v3.PolicyTypeEgress, v3.PolicyTypeIngress},
 			Egress:   egressRules,
@@ -793,7 +856,7 @@ func kubeControllersAllowTigeraPolicy(cfg *KubeControllersConfiguration) *v3.Net
 	}
 }
 
-func esKubeControllersAllowTigeraPolicy(cfg *KubeControllersConfiguration) *v3.NetworkPolicy {
+func esKubeControllersCalicoSystemPolicy(cfg *KubeControllersConfiguration) *v3.NetworkPolicy {
 	if cfg.ManagementClusterConnection != nil {
 		return nil
 	}
@@ -835,7 +898,7 @@ func esKubeControllersAllowTigeraPolicy(cfg *KubeControllersConfiguration) *v3.N
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
+			Tier:     networkpolicy.CalicoTierName,
 			Selector: networkpolicy.KubernetesAppSelector(EsKubeController),
 			Types:    []v3.PolicyType{v3.PolicyTypeEgress},
 			Egress:   egressRules,

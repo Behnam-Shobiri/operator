@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -60,11 +60,15 @@ func CreateSelfSignedSecret(secretName, namespace, cn string, altNames []string)
 	if err := pem.Encode(&certPem, &pem.Block{Type: blockTypeCert, Bytes: cert}); err != nil {
 		panic(err)
 	}
+	labels, annotations := tlsSecretMetadata(certPem.Bytes())
+
 	return &corev1.Secret{
 		TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      secretName,
-			Namespace: namespace,
+			Name:        secretName,
+			Namespace:   namespace,
+			Labels:      labels,
+			Annotations: annotations,
 		},
 		Data: map[string][]byte{
 			corev1.TLSCertKey:       certPem.Bytes(),
@@ -82,7 +86,7 @@ func template(cn string, altNames []string) *x509.Certificate {
 		Subject:               pkix.Name{CommonName: cn},
 		NotBefore:             time.Now(),
 		// For now use the same lifetime as the other certs we generate. This will change when we implement rotation.
-		NotAfter: time.Now().AddDate(0, 0, crypto.DefaultCACertificateLifetimeInDays),
+		NotAfter: time.Now().Add(crypto.DefaultCACertificateLifetimeDuration),
 		KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign | x509.KeyUsageKeyEncipherment,
 	}
 }

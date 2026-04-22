@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -92,7 +92,7 @@ func CreateCSRInitContainer(
 
 // ResolveCsrInitImage resolves the image needed for the CSR init image taking into account the specified ImageSet
 func ResolveCSRInitImage(inst *operatorv1.InstallationSpec, is *operatorv1.ImageSet) (string, error) {
-	if inst.Variant == operatorv1.TigeraSecureEnterprise {
+	if inst.Variant.IsEnterprise() {
 		return components.GetReference(
 			components.ComponentTigeraCSRInitContainer,
 			inst.Registry,

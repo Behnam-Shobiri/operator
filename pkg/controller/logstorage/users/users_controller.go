@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -68,7 +68,7 @@ type UsersCleanupController struct {
 	elasticExternal bool
 }
 
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	if !opts.EnterpriseCRDExists {
 		return nil
 	}
@@ -181,7 +181,7 @@ func (r *UserController) Reconcile(ctx context.Context, request reconcile.Reques
 
 	// Get LogStorage resource.
 	logStorage := &operatorv1.LogStorage{}
-	err = r.client.Get(ctx, utils.DefaultTSEEInstanceKey, logStorage)
+	err = r.client.Get(ctx, utils.DefaultEnterpriseInstanceKey, logStorage)
 	if err != nil {
 		// Not finding the LogStorage CR is not an error, as a Managed cluster will not have this CR available but
 		// there are still "LogStorage" related items that need to be set up
@@ -281,7 +281,7 @@ func (r *UserController) Reconcile(ctx context.Context, request reconcile.Reques
 		credentialSecrets = append(credentialSecrets, secret.CopyToNamespace(helper.InstallNamespace(), &linseedUserSecret)[0])
 		credentialSecrets = append(credentialSecrets, secret.CopyToNamespace(helper.InstallNamespace(), &dashboardUserSecret)[0])
 	}
-	credentialComponent := render.NewPassthrough(credentialSecrets...)
+	credentialComponent := render.NewCreationPassthrough(credentialSecrets...)
 
 	// In standard installs, the LogStorage owns the secret. For multi-tenant, it's owned by the tenant.
 	var hdler utils.ComponentHandler

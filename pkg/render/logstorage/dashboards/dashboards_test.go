@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2024-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,7 @@ import (
 	"context"
 	"fmt"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -29,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/google/go-cmp/cmp"
@@ -42,7 +42,6 @@ import (
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/dns"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rtest "github.com/tigera/operator/pkg/render/common/test"
 	"github.com/tigera/operator/pkg/render/logstorage"
@@ -94,6 +93,7 @@ var _ = Describe("Dashboards rendering tests", func() {
 				KibanaHost:    "tigera-secure-kb-http.tigera-kibana.svc",
 				KibanaScheme:  "https",
 				KibanaPort:    5601,
+				KibanaEnabled: true,
 			}
 		})
 
@@ -161,10 +161,10 @@ var _ = Describe("Dashboards rendering tests", func() {
 			Expect(job.Spec.Template.Spec.Tolerations).To(ConsistOf(t))
 		})
 
-		Context("allow-tigera rendering", func() {
-			policyName := types.NamespacedName{Name: "allow-tigera.dashboards-installer", Namespace: "tigera-elasticsearch"}
+		Context("calico-system rendering", func() {
+			policyName := types.NamespacedName{Name: "calico-system.dashboards-installer", Namespace: "tigera-elasticsearch"}
 
-			getExpectedPolicy := func(scenario testutils.AllowTigeraScenario) *v3.NetworkPolicy {
+			getExpectedPolicy := func(scenario testutils.CalicoSystemScenario) *v3.NetworkPolicy {
 				if scenario.ManagedCluster {
 					return nil
 				}
@@ -172,8 +172,8 @@ var _ = Describe("Dashboards rendering tests", func() {
 				return testutils.SelectPolicyByProvider(scenario, expectedPolicy, expectedPolicyForOpenshift)
 			}
 
-			DescribeTable("should render allow-tigera policy",
-				func(scenario testutils.AllowTigeraScenario) {
+			DescribeTable("should render calico-system policy",
+				func(scenario testutils.CalicoSystemScenario) {
 					if scenario.OpenShift {
 						cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
 					} else {
@@ -182,7 +182,7 @@ var _ = Describe("Dashboards rendering tests", func() {
 					component := Dashboards(cfg)
 					resources, _ := component.Objects()
 
-					policy := testutils.GetAllowTigeraPolicyFromResources(policyName, resources)
+					policy := testutils.GetCalicoSystemPolicyFromResources(policyName, resources)
 					expectedPolicy := getExpectedPolicy(scenario)
 					if !cmp.Equal(policy, expectedPolicy) {
 						cmp.Diff(policy, expectedPolicy)
@@ -191,8 +191,8 @@ var _ = Describe("Dashboards rendering tests", func() {
 				},
 				// Dashboards only renders in the presence of an LogStorage CR and absence of a ManagementClusterConnection CR, therefore
 				// does not have a config option for managed clusters.
-				Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false}),
-				Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true}),
+				Entry("for management/standalone, kube-dns", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: false}),
+				Entry("for management/standalone, openshift-dns", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: true}),
 			)
 		})
 	})
@@ -235,6 +235,7 @@ var _ = Describe("Dashboards rendering tests", func() {
 				KibanaHost:    "external-kibana",
 				KibanaScheme:  "https",
 				KibanaPort:    443,
+				KibanaEnabled: true,
 			}
 		})
 
@@ -291,7 +292,7 @@ var _ = Describe("Dashboards rendering tests", func() {
 			Expect(job).NotTo(BeNil())
 			sa := rtest.GetResource(resources, Name, cfg.Namespace, corev1.GroupName, "v1", "ServiceAccount").(*corev1.ServiceAccount)
 			Expect(sa).NotTo(BeNil())
-			netPol := rtest.GetResource(resources, fmt.Sprintf("allow-tigera.%s", Name), cfg.Namespace, "projectcalico.org", "v3", "NetworkPolicy").(*v3.NetworkPolicy)
+			netPol := rtest.GetResource(resources, fmt.Sprintf("calico-system.%s", Name), cfg.Namespace, "projectcalico.org", "v3", "NetworkPolicy").(*v3.NetworkPolicy)
 			Expect(netPol).NotTo(BeNil())
 		})
 
@@ -341,7 +342,6 @@ var _ = Describe("Dashboards rendering tests", func() {
 			Expect(job.Spec.Template.Spec.Containers[0].Name).To(Equal(Name))
 			Expect(job.Spec.Template.Spec.Containers[0].Resources).To(Equal(dashboardsJobResources))
 		})
-
 	})
 
 	Context("single-tenant with external elastic rendering", func() {
@@ -377,6 +377,7 @@ var _ = Describe("Dashboards rendering tests", func() {
 				KibanaHost:    "external-kibana",
 				KibanaScheme:  "https",
 				KibanaPort:    443,
+				KibanaEnabled: true,
 			}
 		})
 
@@ -423,7 +424,7 @@ var _ = Describe("Dashboards rendering tests", func() {
 			Expect(d.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
 				Name: "KIBANA_MTLS_ENABLED", Value: "true",
 			}))
-			netPol := rtest.GetResource(createResources, fmt.Sprintf("allow-tigera.%s", Name), render.ElasticsearchNamespace, "projectcalico.org", "v3", "NetworkPolicy").(*v3.NetworkPolicy)
+			netPol := rtest.GetResource(createResources, fmt.Sprintf("calico-system.%s", Name), render.ElasticsearchNamespace, "projectcalico.org", "v3", "NetworkPolicy").(*v3.NetworkPolicy)
 			Expect(netPol).NotTo(BeNil())
 			Expect(netPol.Spec.Egress).To(HaveLen(2))
 			Expect(netPol.Spec.Egress[1].Destination).To(Equal(v3.EntityRule{
@@ -440,7 +441,7 @@ var _ = Describe("Dashboards rendering tests", func() {
 			Expect(job).NotTo(BeNil())
 			sa := rtest.GetResource(resources, Name, render.ElasticsearchNamespace, corev1.GroupName, "v1", "ServiceAccount").(*corev1.ServiceAccount)
 			Expect(sa).NotTo(BeNil())
-			netPol := rtest.GetResource(resources, fmt.Sprintf("allow-tigera.%s", Name), render.ElasticsearchNamespace, "projectcalico.org", "v3", "NetworkPolicy").(*v3.NetworkPolicy)
+			netPol := rtest.GetResource(resources, fmt.Sprintf("calico-system.%s", Name), render.ElasticsearchNamespace, "projectcalico.org", "v3", "NetworkPolicy").(*v3.NetworkPolicy)
 			Expect(netPol).NotTo(BeNil())
 			Expect(netPol.Spec.Egress).To(HaveLen(2))
 			Expect(netPol.Spec.Egress[1].Destination).To(Equal(kibana.EntityRule))
@@ -492,6 +493,7 @@ var _ = Describe("Dashboards rendering tests", func() {
 				KibanaHost:    "tigera-secure-kb-http.tigera-kibana.svc",
 				KibanaScheme:  "https",
 				KibanaPort:    5601,
+				KibanaEnabled: true,
 			}
 		})
 
@@ -503,7 +505,7 @@ var _ = Describe("Dashboards rendering tests", func() {
 			Expect(job).NotTo(BeNil())
 			sa := rtest.GetResource(resources, Name, render.ElasticsearchNamespace, corev1.GroupName, "v1", "ServiceAccount").(*corev1.ServiceAccount)
 			Expect(sa).NotTo(BeNil())
-			netPol := rtest.GetResource(resources, fmt.Sprintf("allow-tigera.%s", Name), render.ElasticsearchNamespace, "projectcalico.org", "v3", "NetworkPolicy").(*v3.NetworkPolicy)
+			netPol := rtest.GetResource(resources, fmt.Sprintf("calico-system.%s", Name), render.ElasticsearchNamespace, "projectcalico.org", "v3", "NetworkPolicy").(*v3.NetworkPolicy)
 			Expect(netPol).NotTo(BeNil())
 		})
 
@@ -523,7 +525,7 @@ var _ = Describe("Dashboards rendering tests", func() {
 
 func getBundle(installation *operatorv1.InstallationSpec) certificatemanagement.TrustedBundle {
 	scheme := runtime.NewScheme()
-	Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+	Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 	cli := ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 
 	certificateManager, err := certificatemanager.Create(cli, installation, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
@@ -611,11 +613,11 @@ func expectedContainers() []corev1.Container {
 			ImagePullPolicy: render.ImagePullPolicy(),
 			SecurityContext: &corev1.SecurityContext{
 				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-				AllowPrivilegeEscalation: ptr.BoolToPtr(false),
-				Privileged:               ptr.BoolToPtr(false),
-				RunAsNonRoot:             ptr.BoolToPtr(true),
-				RunAsGroup:               ptr.Int64ToPtr(10001),
-				RunAsUser:                ptr.Int64ToPtr(10001),
+				AllowPrivilegeEscalation: ptr.To(false),
+				Privileged:               ptr.To(false),
+				RunAsNonRoot:             ptr.To(true),
+				RunAsGroup:               ptr.To(int64(10001)),
+				RunAsUser:                ptr.To(int64(10001)),
 				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			Env: []corev1.EnvVar{
@@ -686,7 +688,8 @@ func expectedContainers() []corev1.Container {
 							Key: "password",
 						},
 					},
-				}},
+				},
+			},
 			VolumeMounts: []corev1.VolumeMount{
 				{
 					Name:      "tigera-ca-bundle",

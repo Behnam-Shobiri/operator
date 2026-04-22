@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@ package render_test
 import (
 	"fmt"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -29,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
@@ -38,7 +38,6 @@ import (
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/dns"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/common/authentication"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
@@ -47,6 +46,8 @@ import (
 	"github.com/tigera/operator/pkg/tls"
 	"github.com/tigera/operator/pkg/tls/certificatemanagement"
 	"github.com/tigera/operator/test"
+
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 )
 
 var _ = Describe("Rendering tests for PacketCapture API component", func() {
@@ -59,7 +60,7 @@ var _ = Describe("Rendering tests for PacketCapture API component", func() {
 	var cli client.Client
 	BeforeEach(func() {
 		scheme := runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 		cli = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 
 		certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
@@ -194,14 +195,14 @@ var _ = Describe("Rendering tests for PacketCapture API component", func() {
 				Image:           fmt.Sprintf("%s%s%s:%s", components.TigeraRegistry, components.TigeraImagePath, components.ComponentPacketCapture.Image, components.ComponentPacketCapture.Version),
 				ImagePullPolicy: render.ImagePullPolicy(),
 				SecurityContext: &corev1.SecurityContext{
-					AllowPrivilegeEscalation: ptr.BoolToPtr(false),
+					AllowPrivilegeEscalation: ptr.To(false),
 					Capabilities: &corev1.Capabilities{
 						Drop: []corev1.Capability{"ALL"},
 					},
-					Privileged:   ptr.BoolToPtr(false),
-					RunAsGroup:   ptr.Int64ToPtr(10001),
-					RunAsNonRoot: ptr.BoolToPtr(true),
-					RunAsUser:    ptr.Int64ToPtr(10001),
+					Privileged:   ptr.To(false),
+					RunAsGroup:   ptr.To(int64(10001)),
+					RunAsNonRoot: ptr.To(true),
+					RunAsUser:    ptr.To(int64(10001)),
 					SeccompProfile: &corev1.SeccompProfile{
 						Type: corev1.SeccompProfileTypeRuntimeDefault,
 					},
@@ -250,7 +251,7 @@ var _ = Describe("Rendering tests for PacketCapture API component", func() {
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
 						SecretName:  render.PacketCaptureServerCert,
-						DefaultMode: ptr.Int32ToPtr(420),
+						DefaultMode: ptr.To(int32(420)),
 					},
 				},
 			})
@@ -416,11 +417,11 @@ var _ = Describe("Rendering tests for PacketCapture API component", func() {
 		checkPacketCaptureResources(resources, false, true)
 	})
 
-	Context("allow-tigera rendering", func() {
-		policyName := types.NamespacedName{Name: "allow-tigera.tigera-packetcapture", Namespace: "tigera-packetcapture"}
+	Context("calico-system rendering", func() {
+		policyName := types.NamespacedName{Name: "calico-system.tigera-packetcapture", Namespace: "tigera-packetcapture"}
 
-		DescribeTable("should render allow-tigera policy",
-			func(scenario testutils.AllowTigeraScenario) {
+		DescribeTable("should render calico-system policy",
+			func(scenario testutils.CalicoSystemScenario) {
 				cfg := &render.PacketCaptureApiConfiguration{
 					PullSecrets:      pullSecrets,
 					Installation:     &defaultInstallation,
@@ -436,20 +437,22 @@ var _ = Describe("Rendering tests for PacketCapture API component", func() {
 				component := render.PacketCaptureAPIPolicy(cfg)
 				resources, _ := component.Objects()
 
-				policy := testutils.GetAllowTigeraPolicyFromResources(policyName, resources)
+				policy := testutils.GetCalicoSystemPolicyFromResources(policyName, resources)
 				expectedPolicy := testutils.SelectPolicyByClusterTypeAndProvider(
 					scenario,
-					pcPolicyForUnmanaged,
-					pcPolicyForUnmanagedOCP,
-					pcPolicyForManaged,
-					pcPolicyForManagedOCP,
+					map[string]*v3.NetworkPolicy{
+						"unmanaged":           pcPolicyForUnmanaged,
+						"unmanaged-openshift": pcPolicyForUnmanagedOCP,
+						"managed":             pcPolicyForManaged,
+						"managed-openshift":   pcPolicyForManagedOCP,
+					},
 				)
 				Expect(policy).To(Equal(expectedPolicy))
 			},
-			Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false}),
-			Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true}),
-			Entry("for managed, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: true, OpenShift: false}),
-			Entry("for managed, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: true, OpenShift: true}),
+			Entry("for management/standalone, kube-dns", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: false}),
+			Entry("for management/standalone, openshift-dns", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: true}),
+			Entry("for managed, kube-dns", testutils.CalicoSystemScenario{ManagedCluster: true, OpenShift: false}),
+			Entry("for managed, openshift-dns", testutils.CalicoSystemScenario{ManagedCluster: true, OpenShift: true}),
 		)
 	})
 

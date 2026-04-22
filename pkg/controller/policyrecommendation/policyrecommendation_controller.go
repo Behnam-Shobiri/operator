@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in policy recommendation with the License.
@@ -57,7 +57,7 @@ var log = logf.Log.WithName("controller_policy_recommendation")
 
 // Add creates a new PolicyRecommendation Controller and adds it to the Manager. The Manager will
 // set fields on the Controller and Start it when the Manager is Started.
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	if !opts.EnterpriseCRDExists {
 		// No need to start this controller
 		return nil
@@ -87,10 +87,10 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 
 	go utils.WaitToAddLicenseKeyWatch(c, opts.K8sClientset, log, licenseAPIReady)
 	go utils.WaitToAddPolicyRecommendationScopeWatch(c, opts.K8sClientset, log, policyRecScopeWatchReady)
-	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, opts.K8sClientset, log, tierWatchReady)
+	go utils.WaitToAddTierWatch(networkpolicy.CalicoTierName, c, opts.K8sClientset, log, tierWatchReady)
 	go utils.WaitToAddNetworkPolicyWatches(c, opts.K8sClientset, log, []types.NamespacedName{
 		{Name: render.PolicyRecommendationPolicyName, Namespace: installNS},
-		{Name: networkpolicy.TigeraComponentDefaultDenyPolicyName, Namespace: installNS},
+		{Name: networkpolicy.CalicoComponentDefaultDenyPolicyName, Namespace: installNS},
 	})
 
 	err = c.WatchObject(&operatorv1.PolicyRecommendation{}, &handler.EnqueueRequestForObject{})
@@ -144,7 +144,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 // newReconciler returns a new *reconcile.Reconciler.
 func newReconciler(
 	mgr manager.Manager,
-	opts options.AddOptions,
+	opts options.ControllerOptions,
 	licenseAPIReady *utils.ReadyFlag,
 	tierWatchReady *utils.ReadyFlag,
 	policyRecScopeWatchReady *utils.ReadyFlag,
@@ -152,14 +152,11 @@ func newReconciler(
 	r := &ReconcilePolicyRecommendation{
 		client:                   mgr.GetClient(),
 		scheme:                   mgr.GetScheme(),
-		provider:                 opts.DetectedProvider,
 		status:                   status.New(mgr.GetClient(), "policy-recommendation", opts.KubernetesVersion),
-		clusterDomain:            opts.ClusterDomain,
 		licenseAPIReady:          licenseAPIReady,
 		tierWatchReady:           tierWatchReady,
 		policyRecScopeWatchReady: policyRecScopeWatchReady,
-		multiTenant:              opts.MultiTenant,
-		externalElastic:          opts.ElasticExternal,
+		opts:                     opts,
 	}
 
 	r.status.Run(opts.ShutdownContext)
@@ -175,15 +172,12 @@ type ReconcilePolicyRecommendation struct {
 	// This client, initialized using mgr.Client() above, is a split client
 	// that reads objects from the cache and writes to the apiserver
 	client                   client.Client
-	clusterDomain            string
 	licenseAPIReady          *utils.ReadyFlag
 	scheme                   *runtime.Scheme
 	status                   status.StatusManager
 	tierWatchReady           *utils.ReadyFlag
 	policyRecScopeWatchReady *utils.ReadyFlag
-	provider                 operatorv1.Provider
-	multiTenant              bool
-	externalElastic          bool
+	opts                     options.ControllerOptions
 }
 
 func GetPolicyRecommendation(ctx context.Context, cli client.Client, mt bool, ns string) (*operatorv1.PolicyRecommendation, error) {
@@ -207,17 +201,17 @@ func GetPolicyRecommendation(ctx context.Context, cli client.Client, mt bool, ns
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
-	helper := utils.NewNamespaceHelper(r.multiTenant, render.PolicyRecommendationNamespace, request.Namespace)
+	helper := utils.NewNamespaceHelper(r.opts.MultiTenant, render.PolicyRecommendationNamespace, request.Namespace)
 	logc := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name, "installNS", helper.InstallNamespace(), "truthNS", helper.TruthNamespace())
 	logc.Info("Reconciling PolicyRecommendation")
 
 	// We skip requests without a namespace specified in multi-tenant setups.
-	if r.multiTenant && request.Namespace == "" {
+	if r.opts.MultiTenant && request.Namespace == "" {
 		return reconcile.Result{}, nil
 	}
 
 	// Check if this is a tenant-scoped request.
-	tenant, _, err := utils.GetTenant(ctx, r.multiTenant, r.client, request.Namespace)
+	tenant, _, err := utils.GetTenant(ctx, r.opts.MultiTenant, r.client, request.Namespace)
 	if errors.IsNotFound(err) {
 		logc.Info("No Tenant in this Namespace, skip")
 		return reconcile.Result{}, nil
@@ -227,7 +221,7 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 	}
 
 	// Fetch the PolicyRecommendation instance
-	policyRecommendation, err := GetPolicyRecommendation(ctx, r.client, r.multiTenant, request.Namespace)
+	policyRecommendation, err := GetPolicyRecommendation(ctx, r.client, r.opts.MultiTenant, request.Namespace)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			// Request object not found, could have been deleted after reconcile request.
@@ -247,7 +241,7 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 	// SetMetaData in the TigeraStatus such as observedGenerations
 	defer r.status.SetMetaData(&policyRecommendation.ObjectMeta)
 
-	if !utils.IsAPIServerReady(r.client, logc) {
+	if !utils.IsProjectCalicoV3Available(r.client, r.opts, logc) {
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for Tigera API server to be ready", nil, logc)
 		return reconcile.Result{}, err
 	}
@@ -264,14 +258,14 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
-	// Ensure the allow-tigera tier exists, before rendering any network policies within it.
-	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.TigeraComponentTierName}, &v3.Tier{}); err != nil {
+	// Ensure the calico-system tier exists, before rendering any network policies within it.
+	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.CalicoTierName}, &v3.Tier{}); err != nil {
 		if errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for allow-tigera tier to be created, see the 'tiers' TigeraStatus for more information", err, logc)
+			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for calico-system tier to be created, see the 'tiers' TigeraStatus for more information", err, logc)
 			return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 		} else {
-			log.Error(err, "Error querying allow-tigera tier")
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying allow-tigera tier", err, logc)
+			log.Error(err, "Error querying calico-system tier")
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying calico-system tier", err, logc)
 			return reconcile.Result{}, err
 		}
 	}
@@ -303,7 +297,7 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 	}
 
 	// Query for the installation object.
-	variant, installation, err := utils.GetInstallation(ctx, r.client)
+	variant, installationSpec, err := utils.GetInstallationSpec(ctx, r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotFound, "Installation not found", err, logc)
@@ -313,7 +307,7 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 		return reconcile.Result{}, err
 	}
 
-	pullSecrets, err := utils.GetNetworkingPullSecrets(installation, r.client)
+	pullSecrets, err := utils.GetInstallationPullSecrets(installationSpec, r.client)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Failed to retrieve pull secrets", err, logc)
 		return reconcile.Result{}, err
@@ -362,7 +356,7 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 			certificatemanager.WithLogger(logc),
 			certificatemanager.WithTenant(tenant),
 		}
-		certificateManager, err := certificatemanager.Create(r.client, installation, r.clusterDomain, helper.TruthNamespace(), opts...)
+		certificateManager, err := certificatemanager.Create(r.client, installationSpec, r.opts.ClusterDomain, helper.TruthNamespace(), opts...)
 		if err != nil {
 			r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the Tigera CA", err, logc)
 			return reconcile.Result{}, err
@@ -397,7 +391,7 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 
 		certificateManager.AddToStatusManager(r.status, helper.InstallNamespace())
 
-		if !r.multiTenant {
+		if !r.opts.MultiTenant {
 			// Zero-tenant and single tenant setups install resources inside calico-system namespace. Thus,
 			// we need to create a tigera-ca-bundle (named policy-recommendation-ca-bundle) inside this namespace in order to allow communication with Linseed
 			trustedBundleRW, err = certificateManager.CreateNamedTrustedBundleFromSecrets(ResourceName, r.client,
@@ -448,16 +442,16 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 	}
 
 	policyRecommendationCfg := &render.PolicyRecommendationConfiguration{
-		ClusterDomain:                  r.clusterDomain,
-		Installation:                   installation,
+		ClusterDomain:                  r.opts.ClusterDomain,
+		Installation:                   installationSpec,
 		ManagedCluster:                 isManagedCluster,
 		ManagementCluster:              managementCluster != nil,
 		PullSecrets:                    pullSecrets,
-		OpenShift:                      r.provider.IsOpenShift(),
+		OpenShift:                      r.opts.DetectedProvider.IsOpenShift(),
 		Namespace:                      helper.InstallNamespace(),
 		Tenant:                         tenant,
 		BindingNamespaces:              bindNamespaces,
-		ExternalElastic:                r.externalElastic,
+		ExternalElastic:                r.opts.ElasticExternal,
 		TrustedBundle:                  trustedBundleRO,
 		PolicyRecommendationCertSecret: policyRecommendationKeyPair,
 		PolicyRecommendation:           policyRecommendation,
@@ -473,13 +467,17 @@ func (r *ReconcilePolicyRecommendation) Reconcile(ctx context.Context, request r
 
 	// Prepend PolicyRecommendation before certificate creation
 	components = append([]render.Component{component}, components...)
-
 	for _, cmp := range components {
 		if err := defaultHandler.CreateOrUpdateOrDelete(context.Background(), cmp, r.status); err != nil {
 			r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating resource", err, logc)
 			return reconcile.Result{}, err
 		}
 	}
+
+	// Check BYO certificate expiry warnings.
+	certificatemanagement.CheckKeyPairWarnings(map[string]certificatemanagement.KeyPairInterface{
+		render.PolicyRecommendationTLSSecretName: policyRecommendationKeyPair,
+	}, r.status)
 
 	// Clear the degraded bit if we've reached this far.
 	r.status.ClearDegraded()
@@ -523,7 +521,7 @@ func (r *ReconcilePolicyRecommendation) createDefaultPolicyRecommendationScope(c
 	prs.Name = "default"
 	prs.Spec.NamespaceSpec.RecStatus = "Disabled"
 	prs.Spec.NamespaceSpec.Selector = "!(projectcalico.org/name starts with 'tigera-') && !(projectcalico.org/name starts with 'calico-') && !(projectcalico.org/name starts with 'kube-')"
-	if r.provider.IsOpenShift() {
+	if r.opts.DetectedProvider.IsOpenShift() {
 		prs.Spec.NamespaceSpec.Selector += " && !(projectcalico.org/name starts with 'openshift-')"
 	}
 

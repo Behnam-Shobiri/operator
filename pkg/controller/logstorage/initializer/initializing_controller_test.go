@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ import (
 	"reflect"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
 
@@ -54,7 +54,7 @@ func NewTestInitializer(
 	provider operatorv1.Provider,
 	clusterDomain string,
 ) (*LogStorageInitializer, error) {
-	opts := options.AddOptions{
+	opts := options.ControllerOptions{
 		DetectedProvider: provider,
 		ClusterDomain:    clusterDomain,
 		ShutdownContext:  context.TODO(),
@@ -83,7 +83,7 @@ var _ = Describe("LogStorage Initializing controller", func() {
 
 	BeforeEach(func() {
 		scheme = runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).ShouldNot(HaveOccurred())
 		Expect(storagev1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -106,12 +106,12 @@ var _ = Describe("LogStorage Initializing controller", func() {
 					Name: "default",
 				},
 				Status: operatorv1.InstallationStatus{
-					Variant:  operatorv1.TigeraSecureEnterprise,
+					Variant:  operatorv1.CalicoEnterprise,
 					Computed: &operatorv1.InstallationSpec{},
 				},
 				Spec: operatorv1.InstallationSpec{
 					ControlPlaneReplicas: &replicas,
-					Variant:              operatorv1.TigeraSecureEnterprise,
+					Variant:              operatorv1.CalicoEnterprise,
 					ImagePullSecrets: []corev1.LocalObjectReference{{
 						Name: "tigera-pull-secret",
 					}},
@@ -182,6 +182,26 @@ var _ = Describe("LogStorage Initializing controller", func() {
 			ls = &operatorv1.LogStorage{}
 			Expect(cli.Get(ctx, client.ObjectKey{Name: "tigera-secure"}, ls)).ShouldNot(HaveOccurred())
 			Expect(ls.Status.State).Should(Equal(operatorv1.TigeraStatusReady))
+		})
+
+		It("sets a degraded status when replicas >= node count", func() {
+			var replicas int32 = 1
+			ls := &operatorv1.LogStorage{}
+			ls.Name = "tigera-secure"
+			FillDefaults(ls)
+			ls.Spec.Indices.Replicas = &replicas
+			ls.Spec.Nodes.Count = 1
+			Expect(cli.Create(ctx, ls)).ShouldNot(HaveOccurred())
+
+			r, err := NewTestInitializer(cli, scheme, mockStatus, operatorv1.ProviderNone, dns.DefaultClusterDomain)
+			Expect(err).ShouldNot(HaveOccurred())
+			_, err = r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).Should(HaveOccurred())
+			Expect(mockStatus.AssertNumberOfCalls(GinkgoT(), "SetDegraded", 1)).Should(BeTrue())
+
+			ls = &operatorv1.LogStorage{}
+			Expect(cli.Get(ctx, client.ObjectKey{Name: "tigera-secure"}, ls)).ShouldNot(HaveOccurred())
+			Expect(ls.Status.State).Should(Equal(operatorv1.TigeraStatusDegraded))
 		})
 
 		It("handles LogStorage deletion", func() {
@@ -352,6 +372,59 @@ var _ = Describe("LogStorage Initializing controller", func() {
 		})
 	})
 
+	Context("validateReplicasForNodeCount", func() {
+		It("should return an error when replicas is 1 and node count is 1", func() {
+			var replicas int32 = 1
+			spec := &operatorv1.LogStorageSpec{
+				Nodes:   &operatorv1.Nodes{Count: 1},
+				Indices: &operatorv1.Indices{Replicas: &replicas},
+			}
+			Expect(validateReplicasForNodeCount(spec)).NotTo(BeNil())
+		})
+
+		It("should return an error when replicas equals node count", func() {
+			var replicas int32 = 2
+			spec := &operatorv1.LogStorageSpec{
+				Nodes:   &operatorv1.Nodes{Count: 2},
+				Indices: &operatorv1.Indices{Replicas: &replicas},
+			}
+			Expect(validateReplicasForNodeCount(spec)).NotTo(BeNil())
+		})
+
+		It("should return no error when node count exceeds replicas", func() {
+			var replicas int32 = 1
+			spec := &operatorv1.LogStorageSpec{
+				Nodes:   &operatorv1.Nodes{Count: 3},
+				Indices: &operatorv1.Indices{Replicas: &replicas},
+			}
+			Expect(validateReplicasForNodeCount(spec)).To(BeNil())
+		})
+
+		It("should return no error when replicas is 0 and node count is 1", func() {
+			var replicas int32 = 0
+			spec := &operatorv1.LogStorageSpec{
+				Nodes:   &operatorv1.Nodes{Count: 1},
+				Indices: &operatorv1.Indices{Replicas: &replicas},
+			}
+			Expect(validateReplicasForNodeCount(spec)).To(BeNil())
+		})
+
+		It("should return no error when indices is nil", func() {
+			spec := &operatorv1.LogStorageSpec{
+				Nodes: &operatorv1.Nodes{Count: 1},
+			}
+			Expect(validateReplicasForNodeCount(spec)).To(BeNil())
+		})
+
+		It("should return no error when nodes is nil", func() {
+			var replicas int32 = 1
+			spec := &operatorv1.LogStorageSpec{
+				Indices: &operatorv1.Indices{Replicas: &replicas},
+			}
+			Expect(validateReplicasForNodeCount(spec)).To(BeNil())
+		})
+	})
+
 	Context("validateComponentResources", func() {
 		ls := operatorv1.LogStorage{Spec: operatorv1.LogStorageSpec{}}
 
@@ -435,6 +508,7 @@ var _ = Describe("LogStorage Initializing controller", func() {
 			var dlr int32 = 8
 			var bgp int32 = 8
 			var replicas int32 = render.DefaultElasticsearchReplicas
+			var kibanaReplicas int32 = 1
 			limits := corev1.ResourceList{}
 			requests := corev1.ResourceList{}
 			limits[corev1.ResourceMemory] = resource.MustParse(defaultEckOperatorMemorySetting)
@@ -452,6 +526,11 @@ var _ = Describe("LogStorage Initializing controller", func() {
 				},
 				Indices: &operatorv1.Indices{
 					Replicas: &replicas,
+				},
+				Kibana: &operatorv1.Kibana{
+					Spec: &operatorv1.KibanaSpec{
+						Replicas: &kibanaReplicas,
+					},
 				},
 				StorageClassName: DefaultElasticsearchStorageClass,
 				ComponentResources: []operatorv1.LogStorageComponentResource{

@@ -1,4 +1,4 @@
-// Copyright (c) 2024-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2024-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 package nonclusterhost_test
 
 import (
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
@@ -33,7 +33,7 @@ var _ = Describe("NonClusterHost rendering tests", func() {
 
 	BeforeEach(func() {
 		scheme := runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 
 		cfg = &nonclusterhost.Config{
 			NonClusterHost: operatorv1.NonClusterHostSpec{
@@ -111,7 +111,7 @@ var _ = Describe("NonClusterHost rendering tests", func() {
 				Verbs:     []string{"get"},
 			},
 			rbacv1.PolicyRule{
-				APIGroups: []string{"crd.projectcalico.org"},
+				APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 				Resources: []string{
 					"bfdconfigurations",
 					"bgpconfigurations",
@@ -163,7 +163,7 @@ var _ = Describe("NonClusterHost rendering tests", func() {
 				ResourceNames: []string{"typha-server-noncluster-host"},
 			},
 			rbacv1.PolicyRule{
-				APIGroups: []string{"projectcalico.org"},
+				APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 				Resources: []string{"hostendpoints"},
 				Verbs:     []string{"list", "update"},
 			},

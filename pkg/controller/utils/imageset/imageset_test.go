@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,7 @@ import (
 	"context"
 	"fmt"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	//"k8s.io/client-go/kubernetes/fake"
@@ -35,7 +34,7 @@ import (
 
 var _ = Describe("imageset tests", func() {
 	BeforeEach(func() {
-		Expect(apis.AddToScheme(kscheme.Scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(kscheme.Scheme, false)).NotTo(HaveOccurred())
 	})
 
 	Context("no imageset is fine", func() {
@@ -48,7 +47,7 @@ var _ = Describe("imageset tests", func() {
 			Expect(e).To(BeNil())
 		})
 		It("should not error for Enterprise", func() {
-			e := ApplyImageSet(context.Background(), c, operator.TigeraSecureEnterprise)
+			e := ApplyImageSet(context.Background(), c, operator.CalicoEnterprise)
 			Expect(e).To(BeNil())
 		})
 	})
@@ -56,7 +55,7 @@ var _ = Describe("imageset tests", func() {
 	Context("Test imageset validation", func() {
 		DescribeTable("", func(v operator.ProductVariant) {
 			nm := fmt.Sprintf("calico-%s", components.CalicoRelease)
-			if v == operator.TigeraSecureEnterprise {
+			if v.IsEnterprise() {
 				nm = fmt.Sprintf("enterprise-%s", components.EnterpriseRelease)
 			}
 			c := fake.NewClientBuilder().WithScheme(kscheme.Scheme).WithObjects(
@@ -109,7 +108,7 @@ var _ = Describe("imageset tests", func() {
 			Expect(err.Error()).To(ContainSubstring("bad digest images"))
 		},
 			Entry("Calico variant", operator.Calico),
-			Entry("Enterprise variant", operator.TigeraSecureEnterprise),
+			Entry("Enterprise variant", operator.CalicoEnterprise),
 		)
 	})
 
@@ -118,7 +117,7 @@ var _ = Describe("imageset tests", func() {
 			isName := fmt.Sprintf("calico-%s", components.CalicoRelease)
 			nonVariantISName := fmt.Sprintf("enterprise-%s", components.EnterpriseRelease)
 			isNameWrongVer := "calico-wrong"
-			if v == operator.TigeraSecureEnterprise {
+			if v.IsEnterprise() {
 				isName = fmt.Sprintf("enterprise-%s", components.EnterpriseRelease)
 				nonVariantISName = fmt.Sprintf("calico-%s", components.CalicoRelease)
 				isNameWrongVer = "enterprise-wrong"
@@ -206,7 +205,7 @@ var _ = Describe("imageset tests", func() {
 			Expect(ApplyImageSet(context.Background(), c, v)).To(BeNil())
 		},
 			Entry("Calico variant", operator.Calico),
-			Entry("Enterprise variant", operator.TigeraSecureEnterprise),
+			Entry("Enterprise variant", operator.CalicoEnterprise),
 		)
 	})
 })

@@ -2,17 +2,17 @@
   "apiVersion": "projectcalico.org/v3",
   "kind": "NetworkPolicy",
   "metadata": {
-    "name": "allow-tigera.cluster-dns",
+    "name": "calico-system.cluster-dns",
     "namespace": "kube-system"
   },
   "spec": {
-    "tier": "allow-tigera",
+    "tier": "calico-system",
     "order": 1,
     "ingress": [
       {
         "action": "Allow",
         "source": {
-          "selector": "projectcalico.org/namespace in {'calico-system','tigera-compliance','tigera-dex','tigera-elasticsearch','tigera-fluentd','tigera-intrusion-detection','tigera-kibana','tigera-manager','tigera-eck-operator','tigera-packetcapture','tigera-prometheus','tigera-skraper'}",
+          "selector": "projectcalico.org/namespace in {'calico-system','tigera-compliance','tigera-dex','tigera-elasticsearch','tigera-fluentd','tigera-intrusion-detection','tigera-kibana','tigera-eck-operator','tigera-packetcapture','tigera-prometheus','tigera-skraper'}",
           "namespaceSelector": "all()"
         },
         "destination": {}
@@ -30,7 +30,7 @@
         "destination": {}
       }
     ],
-    "selector": "k8s-app == 'kube-dns'",
+    "selector": "k8s-app in { 'kube-dns', 'coredns' }",
     "types": [
       "Ingress",
       "Egress"

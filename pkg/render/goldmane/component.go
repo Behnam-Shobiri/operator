@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,10 +19,11 @@ import (
 	"fmt"
 	"path/filepath"
 
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
+	"github.com/tigera/operator/pkg/render/common/networkpolicy"
 	"github.com/tigera/operator/pkg/render/common/securitycontext"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -30,6 +31,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
@@ -48,13 +50,15 @@ const (
 	GoldmaneRoleName           = GoldmaneName
 	GoldmaneServicePort        = 7443
 	GoldmaneContainerName      = "goldmane"
+	GoldmanePolicyName         = networkpolicy.CalicoComponentPolicyPrefix + GoldmaneName
 
 	GoldmaneKeyPairSecret = "goldmane-key-pair"
 	GoldmaneServiceName   = "goldmane"
 
-	GoldmaneConfigVolumeName = "config"
-	GoldmaneConfigFilePath   = "/config"
-	GoldmaneConfigFileName   = "config.json"
+	GoldmaneConfigVolumeName   = "config"
+	GoldmaneConfigFilePath     = "/config"
+	GoldmaneConfigFileName     = "config.json"
+	GoldmaneMetricsServiceName = "goldmane-metrics"
 )
 
 func Goldmane(cfg *Configuration) render.Component {
@@ -116,14 +120,27 @@ func (c *Component) Objects() ([]client.Object, []client.Object) {
 		c.networkPolicy(),
 	}
 
+	// Conditionally create or delete the metrics service based on whether a metrics port is configured.
+	if c.metricsPort() != 0 {
+		objs = append(objs, c.metricsService())
+	}
+
 	objs = append(objs, secret.ToRuntimeObjects(secret.CopyToNamespace(GoldmaneNamespace, c.cfg.PullSecrets...)...)...)
 
 	// Goldmane needs to be removed if the installation is not Calico, since it's not supported (yet!) for any other variant.
+	var objsToDelete []client.Object
 	if c.cfg.Installation.Variant == operatorv1.Calico {
-		return objs, nil
+		if c.metricsPort() == 0 {
+			objsToDelete = append(objsToDelete, c.metricsService())
+		}
 	} else {
-		return nil, objs
+		objsToDelete = objs
+		objs = nil
 	}
+
+	objsToDelete = append(objsToDelete, c.deprecatedObjects()...)
+
+	return objs, objsToDelete
 }
 
 func (c *Component) Ready() bool {
@@ -158,6 +175,43 @@ func (c *Component) hotReloadConfigMap() *corev1.ConfigMap {
 	}
 }
 
+// metricsPort returns the configured metrics port, or 0 if metrics are disabled.
+func (c *Component) metricsPort() int32 {
+	if c.cfg.Goldmane != nil && c.cfg.Goldmane.Spec.MetricsPort != nil {
+		return *c.cfg.Goldmane.Spec.MetricsPort
+	}
+	return 0
+}
+
+// metricsService creates a headless Service for Prometheus to scrape Goldmane metrics.
+func (c *Component) metricsService() *corev1.Service {
+	port := c.metricsPort()
+	return &corev1.Service{
+		TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      GoldmaneMetricsServiceName,
+			Namespace: GoldmaneNamespace,
+			Annotations: map[string]string{
+				"prometheus.io/scrape": "true",
+				"prometheus.io/port":   fmt.Sprintf("%d", port),
+			},
+			Labels: map[string]string{"k8s-app": GoldmaneDeploymentName},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector:  map[string]string{"k8s-app": GoldmaneDeploymentName},
+			ClusterIP: "None",
+			Ports: []corev1.ServicePort{
+				{
+					Name:       "metrics-port",
+					Port:       port,
+					TargetPort: intstr.FromInt32(port),
+					Protocol:   corev1.ProtocolTCP,
+				},
+			},
+		},
+	}
+}
+
 func (c *Component) goldmaneContainer() corev1.Container {
 	guardianSvc := render.GuardianService(c.cfg.ClusterDomain)
 	env := []corev1.EnvVar{
@@ -169,6 +223,9 @@ func (c *Component) goldmaneContainer() corev1.Container {
 		{Name: "PUSH_URL", Value: fmt.Sprintf("%s/api/v1/flows/bulk", guardianSvc)},
 		{Name: "FILE_CONFIG_PATH", Value: filepath.Join(GoldmaneConfigFilePath, GoldmaneConfigFileName)},
 		{Name: "HEALTH_ENABLED", Value: "true"},
+	}
+	if port := c.metricsPort(); port != 0 {
+		env = append(env, corev1.EnvVar{Name: "PROMETHEUS_PORT", Value: fmt.Sprintf("%d", port)})
 	}
 
 	volumeMounts := []corev1.VolumeMount{c.cfg.GoldmaneServerKeyPair.VolumeMount(c.SupportedOSType())}
@@ -250,7 +307,7 @@ func (c *Component) deployment() *appsv1.Deployment {
 			Annotations: annotations,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.ToPtr(int32(1)),
+			Replicas: ptr.To(int32(1)),
 			Strategy: appsv1.DeploymentStrategy{
 				Type: appsv1.RecreateDeploymentStrategyType,
 			},
@@ -312,29 +369,45 @@ func (c *Component) role() *rbacv1.Role {
 	}
 }
 
-func (c *Component) deploymentSelector() *metav1.LabelSelector {
-	return &metav1.LabelSelector{
-		MatchLabels: map[string]string{
-			"app.kubernetes.io/name": GoldmaneDeploymentName,
+func (c *Component) networkPolicy() *v3.NetworkPolicy {
+	ingressRules := []v3.Rule{
+		{
+			Action:   v3.Allow,
+			Protocol: &networkpolicy.TCPProtocol,
+			Destination: v3.EntityRule{
+				Ports: networkpolicy.Ports(GoldmaneServicePort),
+			},
+		},
+	}
+	if port := c.metricsPort(); port != 0 {
+		ingressRules = append(ingressRules, v3.Rule{
+			Action:   v3.Allow,
+			Protocol: &networkpolicy.TCPProtocol,
+			Destination: v3.EntityRule{
+				Ports: networkpolicy.Ports(uint16(port)),
+			},
+		})
+	}
+	return &v3.NetworkPolicy{
+		TypeMeta:   metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"},
+		ObjectMeta: metav1.ObjectMeta{Name: GoldmanePolicyName, Namespace: GoldmaneNamespace},
+		Spec: v3.NetworkPolicySpec{
+			Tier:     networkpolicy.CalicoTierName,
+			Selector: networkpolicy.KubernetesAppSelector(GoldmaneDeploymentName),
+			Types:    []v3.PolicyType{v3.PolicyTypeIngress},
+			Ingress:  ingressRules,
 		},
 	}
 }
 
-func (c *Component) networkPolicy() *netv1.NetworkPolicy {
-	return &netv1.NetworkPolicy{
-		TypeMeta:   metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "networking.k8s.io/v1"},
-		ObjectMeta: metav1.ObjectMeta{Name: GoldmaneName, Namespace: GoldmaneNamespace},
-		Spec: netv1.NetworkPolicySpec{
-			PodSelector: *c.deploymentSelector(),
-			PolicyTypes: []netv1.PolicyType{netv1.PolicyTypeIngress},
-			Ingress: []netv1.NetworkPolicyIngressRule{
-				{
-					Ports: []netv1.NetworkPolicyPort{{
-						Protocol: ptr.ToPtr(corev1.ProtocolTCP),
-						Port:     ptr.ToPtr(intstr.FromInt32(GoldmaneServicePort)),
-					}},
-				},
-			},
+// deprecatedObjects returns any objects that should be removed when Goldmane is enabled, but were used in
+// previous versions of the operator.
+func (c *Component) deprecatedObjects() []client.Object {
+	return []client.Object{
+		// Deprecates k8s NetworkPolicy because Calico components now also have Tiers component enabled.
+		&netv1.NetworkPolicy{
+			TypeMeta:   metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "networking.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: "goldmane", Namespace: GoldmaneNamespace},
 		},
 	}
 }

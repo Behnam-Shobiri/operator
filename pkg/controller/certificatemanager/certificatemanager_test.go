@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ import (
 	"strings"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"k8s.io/apimachinery/pkg/util/sets"
 
@@ -54,67 +54,73 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-var _ = Describe("Test CertificateManagement suite", func() {
-	const (
-		appSecretName       = "my-app-tls"
-		appSecretName2      = "my-app-tls-2"
-		legacySecretName    = "legacy-secret"
-		appNs               = "my-app"
-		legacyKeyFieldName  = "key"
-		legacyCertFieldName = "cert"
-	)
+const (
+	appSecretName       = "my-app-tls"
+	appSecretName2      = "my-app-tls-2"
+	legacySecretName    = "legacy-secret"
+	appNs               = "my-app"
+	legacyKeyFieldName  = "key"
+	legacyCertFieldName = "cert"
 
-	var (
-		cli                      client.Client
-		scheme                   *k8sruntime.Scheme
-		installation             *operatorv1.InstallationSpec
-		cm                       *operatorv1.CertificateManagement
-		clusterDomain            = "cluster.local"
-		appDNSNames              = []string{appSecretName}
-		ctx                      = context.TODO()
-		certificateManager       certificatemanager.CertificateManager
-		expiredSecret            *corev1.Secret
-		legacySecret             *corev1.Secret
-		expiredLegacySecret      *corev1.Secret
-		byoSecret                *corev1.Secret
-		expiredBYOSecret         *corev1.Secret
-		legacyBYOSecret          *corev1.Secret
-		legacyWithClientKeyUsage *corev1.Secret
-	)
+	certValidity = 365 * 24 * time.Hour
+)
+
+var (
 	// Configure certs to match legacy operator-generated cert extensions - i.e., only valid for use as a server certificate.
-	legacyOpts := []crypto.CertificateExtensionFunc{tls.SetServerAuth}
-	modernOpts := []crypto.CertificateExtensionFunc{tls.SetServerAuth, tls.SetClientAuth}
+	legacyOpts = []crypto.CertificateExtensionFunc{tls.SetServerAuth}
+	modernOpts = []crypto.CertificateExtensionFunc{tls.SetServerAuth, tls.SetClientAuth}
 
-	// Precompute expensive operations once.
-	BeforeSuite(func() {
-		var err error
+	legacySecret             *corev1.Secret
+	expiredLegacySecret      *corev1.Secret
+	byoSecret                *corev1.Secret
+	expiredBYOSecret         *corev1.Secret
+	legacyBYOSecret          *corev1.Secret
+	legacyWithClientKeyUsage *corev1.Secret
+)
 
-		certkeyusage.SetCertKeyUsage(legacySecretName, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth})
-		// Create a legacy secret (how certs were before v1.24) with non-standardized legacy key and cert name, and no CA.
-		// Use a secret
-		legacySecret, err = secret.CreateTLSSecret(nil, legacySecretName, appNs, legacyKeyFieldName, legacyCertFieldName, time.Hour, legacyOpts, legacySecretName)
-		Expect(err).NotTo(HaveOccurred())
+// Precompute expensive operations once.
+var _ = BeforeSuite(func() {
+	var err error
 
-		// This is a special case, which may or may not exist in the wild. It's a legacy-style certificate signed by tigera-operator but also with client usage.
-		legacyWithClientKeyUsage, err = secret.CreateTLSSecret(nil, appSecretName, appNs, legacyKeyFieldName, legacyCertFieldName, time.Hour, modernOpts, appSecretName)
-		Expect(err).NotTo(HaveOccurred())
+	certkeyusage.SetCertKeyUsage(legacySecretName, []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth})
+	// Create a legacy secret (how certs were before v1.24) with non-standardized legacy key and cert name, and no CA.
+	// Use a secret
+	legacySecret, err = secret.CreateTLSSecret(nil, legacySecretName, appNs, legacyKeyFieldName, legacyCertFieldName, certValidity, legacyOpts, legacySecretName)
+	Expect(err).NotTo(HaveOccurred())
 
-		// Create a byo secret with non-standardized legacy key and cert name (like our docs for felix/typha).
-		cryptoCA, err := tls.MakeCA("byo-ca")
-		Expect(err).NotTo(HaveOccurred())
-		byoSecret, err = secret.CreateTLSSecret(cryptoCA, appSecretName, appNs, "key.key", "cert.crt", time.Hour, modernOpts, appSecretName)
-		Expect(err).NotTo(HaveOccurred())
-		legacyBYOSecret, err = secret.CreateTLSSecret(cryptoCA, legacySecretName, appNs, "key.key", "cert.crt", time.Hour, legacyOpts, legacySecretName)
-		Expect(err).NotTo(HaveOccurred())
-		expiredBYOSecret, err = secret.CreateTLSSecret(cryptoCA, appSecretName, appNs, "key.key", "cert.crt", -time.Hour, modernOpts, appSecretName)
-		Expect(err).NotTo(HaveOccurred())
+	// This is a special case, which may or may not exist in the wild. It's a legacy-style certificate signed by tigera-operator but also with client usage.
+	legacyWithClientKeyUsage, err = secret.CreateTLSSecret(nil, legacySecretName, appNs, legacyKeyFieldName, legacyCertFieldName, certValidity, modernOpts, appSecretName)
+	Expect(err).NotTo(HaveOccurred())
 
-		// Create a CA in the manner of older operator versions.
-		legacyCryptoCA, err := tls.MakeCA(rmeta.TigeraOperatorCAIssuerPrefix + "@some-hash")
-		Expect(err).NotTo(HaveOccurred())
-		expiredLegacySecret, err = secret.CreateTLSSecret(legacyCryptoCA, appSecretName, appNs, legacyKeyFieldName, legacyCertFieldName, -time.Hour, legacyOpts, appSecretName)
-		Expect(err).NotTo(HaveOccurred())
-	})
+	// Create a byo secret with non-standardized legacy key and cert name (like our docs for felix/typha).
+	cryptoCA, err := tls.MakeCA("byo-ca")
+	Expect(err).NotTo(HaveOccurred())
+	byoSecret, err = secret.CreateTLSSecret(cryptoCA, appSecretName, appNs, "key.key", "cert.crt", certValidity, modernOpts, appSecretName)
+	Expect(err).NotTo(HaveOccurred())
+	legacyBYOSecret, err = secret.CreateTLSSecret(cryptoCA, legacySecretName, appNs, "key.key", "cert.crt", certValidity, legacyOpts, legacySecretName)
+	Expect(err).NotTo(HaveOccurred())
+	expiredBYOSecret, err = secret.CreateTLSSecret(cryptoCA, appSecretName, appNs, "key.key", "cert.crt", -time.Hour, modernOpts, appSecretName)
+	Expect(err).NotTo(HaveOccurred())
+
+	// Create a CA in the manner of older operator versions.
+	legacyCryptoCA, err := tls.MakeCA(rmeta.TigeraOperatorCAIssuerPrefix + "@some-hash")
+	Expect(err).NotTo(HaveOccurred())
+	expiredLegacySecret, err = secret.CreateTLSSecret(legacyCryptoCA, appSecretName, appNs, legacyKeyFieldName, legacyCertFieldName, -time.Hour, legacyOpts, appSecretName)
+	Expect(err).NotTo(HaveOccurred())
+})
+
+var _ = Describe("Test CertificateManagement suite", func() {
+	var (
+		cli                client.Client
+		scheme             *k8sruntime.Scheme
+		installation       *operatorv1.InstallationSpec
+		cm                 *operatorv1.CertificateManagement
+		clusterDomain      = "cluster.local"
+		appDNSNames        = []string{appSecretName}
+		ctx                = context.TODO()
+		certificateManager certificatemanager.CertificateManager
+		expiredSecret      *corev1.Secret
+	)
 
 	BeforeEach(func() {
 		for _, secret := range []*corev1.Secret{legacySecret, byoSecret, legacyWithClientKeyUsage, legacyBYOSecret, expiredBYOSecret, expiredLegacySecret} {
@@ -123,7 +129,7 @@ var _ = Describe("Test CertificateManagement suite", func() {
 		}
 		// Create a Kubernetes client.
 		scheme = k8sruntime.NewScheme()
-		err := apis.AddToScheme(scheme)
+		err := apis.AddToScheme(scheme, false)
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(corev1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -154,13 +160,13 @@ var _ = Describe("Test CertificateManagement suite", func() {
 			keyPair, err := certificateManager.GetOrCreateKeyPair(cli, appSecretName, appNs, appDNSNames)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(keyPair).NotTo(BeNil())
-			Expect(keyPair.GetIssuer()).To(Equal(certificateManager.KeyPair()))
+			Expect(keyPair.GetIssuer().GetCertificatePEM()).To(Equal(certificateManager.KeyPair().GetCertificatePEM()))
 
 			By("reconstructing certificateManager2 from the secret that was stored")
 			certificateManager2, err := certificatemanager.Create(cli, installation, clusterDomain, common.OperatorNamespace())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(certificateManager2).NotTo(BeNil())
-			Expect(keyPair.GetIssuer()).To(Equal(certificateManager2.KeyPair())) // Proves that certificateManager & certificateManager2 are identical
+			Expect(keyPair.GetIssuer().GetCertificatePEM()).To(Equal(certificateManager2.KeyPair().GetCertificatePEM())) // Proves that certificateManager & certificateManager2 are identical
 
 			By("deleting the tigera-ca-secret")
 			Expect(cli.Delete(ctx, certificateManager.KeyPair().Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
@@ -169,7 +175,7 @@ var _ = Describe("Test CertificateManagement suite", func() {
 			certificateManager3, err := certificatemanager.Create(cli, installation, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
 			Expect(err).NotTo(HaveOccurred())
 			Expect(certificateManager3).NotTo(BeNil())
-			Expect(keyPair.GetIssuer()).NotTo(Equal(certificateManager3.KeyPair())) // Proves that certificateManager & certificateManager3 are different
+			Expect(keyPair.GetIssuer().GetCertificatePEM()).NotTo(Equal(certificateManager3.KeyPair().GetCertificatePEM())) // Proves that certificateManager & certificateManager3 are different
 
 			By("Constructing a certificateManager with Certificate management enabled and verifying differences")
 			installation.CertificateManagement = cm
@@ -408,7 +414,7 @@ var _ = Describe("Test CertificateManagement suite", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(keyPair.UseCertificateManagement()).To(BeFalse())
 			Expect(keyPair.BYO()).To(BeFalse())
-			Expect(keyPair.GetIssuer()).To(Equal(certificateManager.KeyPair()))
+			Expect(keyPair.GetIssuer().GetCertificatePEM()).To(Equal(certificateManager.KeyPair().GetCertificatePEM()))
 
 			By("verifying the volume is correct")
 			volume := keyPair.Volume()
@@ -424,6 +430,52 @@ var _ = Describe("Test CertificateManagement suite", func() {
 			By("verifying the annotations")
 			Expect(keyPair.HashAnnotationKey()).To(Equal("my-app.hash.operator.tigera.io/my-app-tls"))
 			Expect(len(keyPair.HashAnnotationValue())).NotTo(BeNil())
+		})
+
+		It("should add cert metadata labels and annotations to the secret", func() {
+			By("creating a key pair signed by certificateManager")
+			keyPair, err := certificateManager.GetOrCreateKeyPair(cli, appSecretName, appNs, appDNSNames)
+			Expect(err).NotTo(HaveOccurred())
+			secret := keyPair.Secret(appNs)
+
+			By("verifying the signer label is set")
+			Expect(secret.Labels).To(HaveKey("certificates.operator.tigera.io/signer"))
+			signerLabel := secret.Labels["certificates.operator.tigera.io/signer"]
+			Expect(signerLabel).To(ContainSubstring("tigera-operator-signer"))
+
+			By("verifying cert metadata annotations are present and correct")
+			Expect(secret.Annotations).To(HaveKey("certificates.operator.tigera.io/issuer"))
+			Expect(secret.Annotations).To(HaveKey("certificates.operator.tigera.io/signer"))
+			Expect(secret.Annotations).To(HaveKey("certificates.operator.tigera.io/expiry"))
+			Expect(secret.Annotations["certificates.operator.tigera.io/issuer"]).To(ContainSubstring("tigera-operator-signer"))
+			Expect(secret.Annotations["certificates.operator.tigera.io/signer"]).To(Equal(secret.Annotations["certificates.operator.tigera.io/issuer"]))
+			Expect(secret.Annotations["certificates.operator.tigera.io/expiry"]).To(MatchRegexp(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$`))
+
+			By("verifying DNS names annotation contains expected names")
+			Expect(secret.Annotations).To(HaveKey("certificates.operator.tigera.io/dns-names"))
+			Expect(secret.Annotations["certificates.operator.tigera.io/dns-names"]).To(ContainSubstring(appSecretName))
+
+			By("verifying the hash annotation is on the secret")
+			Expect(secret.Annotations).To(HaveKey(keyPair.HashAnnotationKey()))
+			Expect(secret.Annotations[keyPair.HashAnnotationKey()]).To(Equal(keyPair.HashAnnotationValue()))
+		})
+
+		It("should add cert metadata for BYO secrets", func() {
+			By("creating a BYO secret and fetching it via certificateManager")
+			Expect(cli.Create(ctx, byoSecret)).NotTo(HaveOccurred())
+			keyPair, err := certificateManager.GetOrCreateKeyPair(cli, appSecretName, appNs, appDNSNames)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(keyPair.BYO()).To(BeTrue())
+			secret := keyPair.Secret(appNs)
+
+			By("verifying the signer label reflects the BYO CA")
+			Expect(secret.Labels).To(HaveKey("certificates.operator.tigera.io/signer"))
+			Expect(secret.Labels["certificates.operator.tigera.io/signer"]).To(ContainSubstring("byo-ca"))
+
+			By("verifying cert metadata annotations reflect the BYO certificate")
+			Expect(secret.Annotations).To(HaveKey("certificates.operator.tigera.io/issuer"))
+			Expect(secret.Annotations["certificates.operator.tigera.io/issuer"]).To(ContainSubstring("byo-ca"))
+			Expect(secret.Annotations).To(HaveKey("certificates.operator.tigera.io/expiry"))
 		})
 
 		It("renders the right spec for certificate management", func() {
@@ -502,13 +554,24 @@ var _ = Describe("Test CertificateManagement suite", func() {
 			By("verifying it does replace a secret when dns names are missing")
 			keyPair, err := certificateManager.GetOrCreateKeyPair(cli, appSecretName, appNs, appDNSNames)
 			Expect(err).NotTo(HaveOccurred())
+			Expect(cli.Create(ctx, keyPair.Secret(appNs))).NotTo(HaveOccurred())
+			Expect(err).NotTo(HaveOccurred())
 			test.VerifyCertSANs(keyPair.GetCertificatePEM(), appDNSNames...)
 			keyPair, err = certificateManager.GetOrCreateKeyPair(cli, appSecretName, appNs, missingDNSNames)
 			Expect(err).NotTo(HaveOccurred())
 			test.VerifyCertSANs(keyPair.GetCertificatePEM(), missingDNSNames...)
 
+			By("verifying it does replace a legacy secret when dns names are missing")
+			Expect(cli.Create(ctx, legacyWithClientKeyUsage)).NotTo(HaveOccurred())
+			keyPair, err = certificateManager.GetOrCreateKeyPair(cli, legacySecretName, appNs, appDNSNames)
+			Expect(err).NotTo(HaveOccurred())
+			test.VerifyCertSANs(keyPair.GetCertificatePEM(), appDNSNames...)
+			keyPair, err = certificateManager.GetOrCreateKeyPair(cli, legacySecretName, appNs, missingDNSNames)
+			Expect(err).NotTo(HaveOccurred())
+			test.VerifyCertSANs(keyPair.GetCertificatePEM(), missingDNSNames...)
+
 			By("verifying it does not replace a BYO secret, nor throw an error")
-			Expect(cli.Create(ctx, byoSecret)).NotTo(HaveOccurred())
+			Expect(cli.Update(ctx, byoSecret)).NotTo(HaveOccurred())
 			keyPair, err = certificateManager.GetOrCreateKeyPair(cli, appSecretName, appNs, missingDNSNames)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(keyPair.UseCertificateManagement()).To(BeFalse())
@@ -527,7 +590,7 @@ var _ = Describe("Test CertificateManagement suite", func() {
 			// the new issuer.
 			Expect(keyPair.UseCertificateManagement()).To(BeFalse())
 			Expect(keyPair.BYO()).NotTo(BeTrue())
-			Expect(keyPair.GetIssuer()).To(Equal(certificateManager.KeyPair()))
+			Expect(keyPair.GetIssuer().GetCertificatePEM()).To(Equal(certificateManager.KeyPair().GetCertificatePEM()))
 
 			By("verifying the volume is correct")
 			volume := keyPair.Volume()
@@ -615,13 +678,13 @@ var _ = Describe("Test CertificateManagement suite", func() {
 			legacy, err := certificateManager.GetCertificate(cli, legacySecret.Name, common.OperatorNamespace())
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(cert.GetIssuer()).To(Equal(certificateManager.KeyPair()))
-			Expect(cert2.GetIssuer()).To(Equal(certificateManager.KeyPair()))
+			Expect(cert.GetIssuer().GetCertificatePEM()).To(Equal(certificateManager.KeyPair().GetCertificatePEM()))
+			Expect(cert2.GetIssuer().GetCertificatePEM()).To(Equal(certificateManager.KeyPair().GetCertificatePEM()))
 			Expect(byo.GetIssuer()).NotTo(Equal(certificateManager.KeyPair()))
 			Expect(lwcku.GetIssuer()).NotTo(Equal(certificateManager.KeyPair()))
 
 			// The legacy certificate will have been reissued, and so will match the operator CA.
-			Expect(legacy.GetIssuer()).To(Equal(certificateManager.KeyPair()))
+			Expect(legacy.GetIssuer().GetCertificatePEM()).To(Equal(certificateManager.KeyPair().GetCertificatePEM()))
 
 			By("creating and validating a trusted certificate bundle")
 			trustedBundle := certificateManager.CreateTrustedBundle(cert, cert2, byo, legacy, lwcku)
@@ -728,7 +791,6 @@ var _ = Describe("Test CertificateManagement suite", func() {
 
 		It("should create a hash for both secrets even if the same pem is used twice", func() {
 			By("creating 2 secrets with identical pem in the datastore", func() {
-
 				byoSecretCopy := byoSecret.DeepCopyObject().(*corev1.Secret)
 
 				byoSecret.Name, byoSecret.Namespace = "byo-secret", common.OperatorNamespace()

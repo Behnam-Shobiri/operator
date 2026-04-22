@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@ package status
 import (
 	"context"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -53,7 +52,7 @@ var _ = Describe("Status reporting tests", func() {
 		// Setup Scheme for all resources
 		scheme := runtime.NewScheme()
 		Expect(certV1.AddToScheme(scheme)).ShouldNot(HaveOccurred())
-		err := apis.AddToScheme(scheme)
+		err := apis.AddToScheme(scheme, false)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(appsv1.AddToScheme(scheme)).NotTo(HaveOccurred())
 		Expect(corev1.AddToScheme(scheme)).NotTo(HaveOccurred())
@@ -64,7 +63,7 @@ var _ = Describe("Status reporting tests", func() {
 
 		oldScheme := runtime.NewScheme()
 		Expect(certV1beta1.AddToScheme(oldScheme)).ShouldNot(HaveOccurred())
-		err = apis.AddToScheme(oldScheme)
+		err = apis.AddToScheme(oldScheme, false)
 		Expect(err).NotTo(HaveOccurred())
 		oldVersionClient = fake.NewClientBuilder().WithScheme(oldScheme).Build()
 
@@ -391,6 +390,155 @@ var _ = Describe("Status reporting tests", func() {
 			})
 		})
 
+		Context("when pod is crash looping", func() {
+			var gen int64
+
+			createCrashLoopPodAndDeployment := func(lastTermination *corev1.ContainerStateTerminated) {
+				sm.ReadyToMonitor()
+				podStatus := corev1.PodStatus{
+					Phase: corev1.PodRunning,
+					ContainerStatuses: []corev1.ContainerStatus{
+						{
+							Name: "test-container",
+							State: corev1.ContainerState{
+								Waiting: &corev1.ContainerStateWaiting{
+									Reason: "CrashLoopBackOff",
+								},
+							},
+							LastTerminationState: corev1.ContainerState{
+								Terminated: lastTermination,
+							},
+						},
+					},
+				}
+				Expect(client.Create(ctx, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "NS1",
+						Name:      "DP1pod-crash",
+						Labels:    map[string]string{"dp1Key": "dp1Value"},
+					},
+					Spec:   corev1.PodSpec{},
+					Status: podStatus,
+				})).NotTo(HaveOccurred())
+
+				gen = 5
+				replicas := int32(1)
+				sm.AddDeployments([]types.NamespacedName{{Namespace: "NS1", Name: "DP1"}})
+				Expect(client.Create(ctx, &appsv1.Deployment{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace:  "NS1",
+						Name:       "DP1",
+						Generation: gen,
+					},
+					Spec: appsv1.DeploymentSpec{
+						Selector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{"dp1Key": "dp1Value"},
+						},
+						Replicas: &replicas,
+					},
+					Status: appsv1.DeploymentStatus{
+						ObservedGeneration:  gen,
+						UnavailableReplicas: 1,
+						AvailableReplicas:   0,
+						ReadyReplicas:       0,
+					},
+				})).NotTo(HaveOccurred())
+			}
+
+			It("should include OOMKilled reason in degraded message", func() {
+				createCrashLoopPodAndDeployment(&corev1.ContainerStateTerminated{
+					Reason:   "OOMKilled",
+					ExitCode: 137,
+				})
+				sm.updateStatus()
+				Expect(sm.IsDegraded()).To(BeTrue())
+				Expect(sm.failing).To(ContainElement(ContainSubstring("(OOMKilled, exit code 137)")))
+			})
+
+			It("should suggest liveness probe failure for exit code 137 with Error reason", func() {
+				createCrashLoopPodAndDeployment(&corev1.ContainerStateTerminated{
+					Reason:   "Error",
+					ExitCode: 137,
+				})
+				sm.updateStatus()
+				Expect(sm.IsDegraded()).To(BeTrue())
+				Expect(sm.failing).To(ContainElement(ContainSubstring("possible liveness probe failure")))
+			})
+
+			It("should include exit code for other termination reasons", func() {
+				createCrashLoopPodAndDeployment(&corev1.ContainerStateTerminated{
+					Reason:   "Error",
+					ExitCode: 1,
+				})
+				sm.updateStatus()
+				Expect(sm.IsDegraded()).To(BeTrue())
+				Expect(sm.failing).To(ContainElement(ContainSubstring("(Error, exit code 1)")))
+			})
+
+			It("should report crash loop without detail when no last termination state", func() {
+				createCrashLoopPodAndDeployment(nil)
+				sm.updateStatus()
+				Expect(sm.IsDegraded()).To(BeTrue())
+				Expect(sm.failing).To(ContainElement(And(
+					ContainSubstring("crash looping container"),
+					Not(ContainSubstring("exit code")),
+				)))
+			})
+		})
+
+		Context("when pod is running but not ready", func() {
+			var gen int64
+			BeforeEach(func() {
+				sm.ReadyToMonitor()
+				Expect(client.Create(ctx, &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "NS1",
+						Name:      "DP1pod-notready",
+						Labels: map[string]string{
+							"dp1Key": "dp1Value",
+						},
+					},
+					Spec: corev1.PodSpec{},
+					Status: corev1.PodStatus{
+						Phase: corev1.PodRunning,
+						Conditions: []corev1.PodCondition{
+							{
+								Type:   corev1.ContainersReady,
+								Status: corev1.ConditionFalse,
+							},
+						},
+					},
+				})).NotTo(HaveOccurred())
+				gen = 5
+			})
+			It("should degrade when the deployment does not have the correct pod counts", func() {
+				sm.AddDeployments([]types.NamespacedName{{Namespace: "NS1", Name: "DP1"}})
+				replicas := int32(1)
+
+				Expect(client.Create(ctx, &appsv1.Deployment{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "NS1", Name: "DP1",
+						Generation: gen,
+					},
+					Spec: appsv1.DeploymentSpec{
+						Selector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{"dp1Key": "dp1Value"},
+						},
+						Replicas: &replicas,
+					},
+					Status: appsv1.DeploymentStatus{
+						ObservedGeneration:  gen,
+						UnavailableReplicas: 1,
+						AvailableReplicas:   0,
+						ReadyReplicas:       0,
+					},
+				})).NotTo(HaveOccurred())
+				sm.updateStatus()
+				Expect(sm.IsDegraded()).To(BeTrue())
+				Expect(sm.failing).To(ContainElement(ContainSubstring("running but not ready")))
+			})
+		})
+
 		It("Should handle basic state changes", func() {
 			// We expect no state to be "True" at boot.
 			Expect(sm.IsAvailable()).To(BeFalse())
@@ -443,6 +591,48 @@ var _ = Describe("Status reporting tests", func() {
 			Expect(sm.IsProgressing()).To(BeFalse())
 		})
 
+		It("should include warnings in Available message", func() {
+			sm.ReadyToMonitor()
+			Expect(sm.IsAvailable()).To(BeTrue())
+
+			sm.SetWarning("cert-a", "BYO certificate \"a\" expires in 10 days")
+			sm.updateStatus()
+
+			stat := &operator.TigeraStatus{}
+			err := client.Get(context.TODO(), types.NamespacedName{Name: "test-component"}, stat)
+			Expect(err).NotTo(HaveOccurred())
+			for _, c := range stat.Status.Conditions {
+				if c.Type == operator.ComponentAvailable && c.Status == operator.ConditionTrue {
+					Expect(c.Message).To(ContainSubstring("All objects available"))
+					Expect(c.Message).To(ContainSubstring("BYO certificate \"a\" expires in 10 days"))
+				}
+			}
+		})
+
+		It("should clear warnings from Available message", func() {
+			sm.ReadyToMonitor()
+			sm.SetWarning("cert-a", "BYO certificate \"a\" expires in 10 days")
+			sm.updateStatus()
+			sm.ClearWarning("cert-a")
+			sm.updateStatus()
+
+			stat := &operator.TigeraStatus{}
+			err := client.Get(context.TODO(), types.NamespacedName{Name: "test-component"}, stat)
+			Expect(err).NotTo(HaveOccurred())
+			for _, c := range stat.Status.Conditions {
+				if c.Type == operator.ComponentAvailable && c.Status == operator.ConditionTrue {
+					Expect(c.Message).To(Equal("All objects available"))
+				}
+			}
+		})
+
+		It("should sort multiple warnings deterministically", func() {
+			sm.ReadyToMonitor()
+			sm.SetWarning("cert-b", "warning B")
+			sm.SetWarning("cert-a", "warning A")
+			Expect(sm.warningMessage()).To(Equal("warning A; warning B"))
+		})
+
 		It("should prioritize explicit degraded reason over pod failure", func() {
 			Expect(sm.degradedReason()).To(Equal(operator.Unknown))
 			sm.failing = []string{"This pod has died"}
@@ -456,7 +646,7 @@ var _ = Describe("Status reporting tests", func() {
 			sm.failing = []string{"This pod has died"}
 			Expect(sm.degradedMessage()).To(Equal("This pod has died"))
 			sm.SetDegraded(operator.ResourceNotFound, "Controller set us degraded", nil, log)
-			Expect(sm.degradedMessage()).To(Equal("Controller set us degraded: \nThis pod has died"))
+			Expect(sm.degradedMessage()).To(Equal("Controller set us degraded\nThis pod has died"))
 		})
 
 		It("should contain all the NamespacesNames for all the resources added by multiple calls to Set<Resources>", func() {
@@ -548,44 +738,67 @@ var _ = Describe("Status reporting tests", func() {
 			Entry("no CSR is present - k8s v1.18", nil, false, false),
 			Entry("1 pending CSR is present - k8s v1.18",
 				[]*certV1beta1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels}}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels}},
+				},
 				false, true),
 			Entry("1 pending CSR is present, but no labels - k8s v1.18",
 				[]*certV1beta1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1"}}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "csr1"}},
+				},
 				false, false),
 			Entry("1 approved CSR is present - k8s v1.18",
 				[]*certV1beta1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
-						Status: certV1beta1.CertificateSigningRequestStatus{Certificate: []byte("cert"),
-							Conditions: []certV1beta1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1beta1.CertificateApproved}}}},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
+						Status: certV1beta1.CertificateSigningRequestStatus{
+							Certificate: []byte("cert"),
+							Conditions:  []certV1beta1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1beta1.CertificateApproved}},
+						},
+					},
 				}, false, false),
 			Entry("2 approved CSR are present - k8s v1.18",
 				[]*certV1beta1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
-						Status: certV1beta1.CertificateSigningRequestStatus{Certificate: []byte("cert"),
-							Conditions: []certV1beta1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1beta1.CertificateApproved}}}},
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr2", Labels: labels},
-						Status: certV1beta1.CertificateSigningRequestStatus{Certificate: []byte("cert"),
-							Conditions: []certV1beta1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1beta1.CertificateApproved}}}},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
+						Status: certV1beta1.CertificateSigningRequestStatus{
+							Certificate: []byte("cert"),
+							Conditions:  []certV1beta1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1beta1.CertificateApproved}},
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "csr2", Labels: labels},
+						Status: certV1beta1.CertificateSigningRequestStatus{
+							Certificate: []byte("cert"),
+							Conditions:  []certV1beta1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1beta1.CertificateApproved}},
+						},
+					},
 				}, false, false),
 			Entry("1 approved, 1 pending CSR are present - k8s v1.18",
 				[]*certV1beta1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
-						Status: certV1beta1.CertificateSigningRequestStatus{Certificate: []byte("cert"),
-							Conditions: []certV1beta1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1beta1.CertificateApproved}}}},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
+						Status: certV1beta1.CertificateSigningRequestStatus{
+							Certificate: []byte("cert"),
+							Conditions:  []certV1beta1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1beta1.CertificateApproved}},
+						},
+					},
 					{ObjectMeta: metav1.ObjectMeta{Name: "csr2", Labels: labels}},
 				}, false, true),
 			Entry("1 pending CSR are present (approved: no, cert: yes) - k8s v1.18",
 				[]*certV1beta1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
-						Status: certV1beta1.CertificateSigningRequestStatus{Certificate: []byte("cert")}},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
+						Status:     certV1beta1.CertificateSigningRequestStatus{Certificate: []byte("cert")},
+					},
 				}, false, true),
 			Entry("1 pending CSR are present (approved: yes, cert: no) - k8s v1.18",
 				[]*certV1beta1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
 						Status: certV1beta1.CertificateSigningRequestStatus{
-							Conditions: []certV1beta1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1beta1.CertificateApproved}}}},
+							Conditions: []certV1beta1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1beta1.CertificateApproved}},
+						},
+					},
 					{ObjectMeta: metav1.ObjectMeta{Name: "csr2", Labels: labels}},
 				}, false, true),
 		)
@@ -602,44 +815,67 @@ var _ = Describe("Status reporting tests", func() {
 			Entry("no CSR is present - k8s v1.19", nil, false, false),
 			Entry("1 pending CSR is present - k8s v1.19",
 				[]*certV1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels}}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels}},
+				},
 				false, true),
 			Entry("1 pending CSR is present, but no labels - k8s v1.19",
 				[]*certV1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1"}}},
+					{ObjectMeta: metav1.ObjectMeta{Name: "csr1"}},
+				},
 				false, false),
 			Entry("1 approved CSR is present - k8s v1.19",
 				[]*certV1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
-						Status: certV1.CertificateSigningRequestStatus{Certificate: []byte("cert"),
-							Conditions: []certV1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1.CertificateApproved}}}},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
+						Status: certV1.CertificateSigningRequestStatus{
+							Certificate: []byte("cert"),
+							Conditions:  []certV1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1.CertificateApproved}},
+						},
+					},
 				}, false, false),
 			Entry("2 approved CSR are present - k8s v1.19",
 				[]*certV1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
-						Status: certV1.CertificateSigningRequestStatus{Certificate: []byte("cert"),
-							Conditions: []certV1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1.CertificateApproved}}}},
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr2", Labels: labels},
-						Status: certV1.CertificateSigningRequestStatus{Certificate: []byte("cert"),
-							Conditions: []certV1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1.CertificateApproved}}}},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
+						Status: certV1.CertificateSigningRequestStatus{
+							Certificate: []byte("cert"),
+							Conditions:  []certV1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1.CertificateApproved}},
+						},
+					},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "csr2", Labels: labels},
+						Status: certV1.CertificateSigningRequestStatus{
+							Certificate: []byte("cert"),
+							Conditions:  []certV1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1.CertificateApproved}},
+						},
+					},
 				}, false, false),
 			Entry("1 approved, 1 pending CSR are present - k8s v1.19",
 				[]*certV1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
-						Status: certV1.CertificateSigningRequestStatus{Certificate: []byte("cert"),
-							Conditions: []certV1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1.CertificateApproved}}}},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
+						Status: certV1.CertificateSigningRequestStatus{
+							Certificate: []byte("cert"),
+							Conditions:  []certV1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1.CertificateApproved}},
+						},
+					},
 					{ObjectMeta: metav1.ObjectMeta{Name: "csr2", Labels: labels}},
 				}, false, true),
 			Entry("1 pending CSR are present (approved: no, cert: yes) - k8s v1.19",
 				[]*certV1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
-						Status: certV1.CertificateSigningRequestStatus{Certificate: []byte("cert")}},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
+						Status:     certV1.CertificateSigningRequestStatus{Certificate: []byte("cert")},
+					},
 				}, false, true),
 			Entry("1 pending CSR are present (approved: yes, cert: no) - k8s v1.19",
 				[]*certV1.CertificateSigningRequest{
-					{ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
+					{
+						ObjectMeta: metav1.ObjectMeta{Name: "csr1", Labels: labels},
 						Status: certV1.CertificateSigningRequestStatus{
-							Conditions: []certV1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1.CertificateApproved}}}},
+							Conditions: []certV1.CertificateSigningRequestCondition{{Status: corev1.ConditionTrue, Type: certV1.CertificateApproved}},
+						},
+					},
 					{ObjectMeta: metav1.ObjectMeta{Name: "csr2", Labels: labels}},
 				}, false, true),
 		)

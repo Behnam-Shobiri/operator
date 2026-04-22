@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,7 @@ import (
 	"context"
 	"fmt"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -31,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apiserver/pkg/authentication/serviceaccount"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
@@ -41,7 +41,6 @@ import (
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/dns"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	"github.com/tigera/operator/pkg/render/common/podaffinity"
@@ -371,13 +370,12 @@ var _ = Describe("Linseed rendering tests", func() {
 			initContainer = test.GetContainer(d.Spec.Template.Spec.InitContainers, "tigera-secure-linseed-cert-key-cert-provisioner")
 			Expect(initContainer).NotTo(BeNil())
 			Expect(initContainer.Resources).To(Equal(linseedResources))
-
 		})
 
-		Context("allow-tigera rendering", func() {
-			policyName := types.NamespacedName{Name: "allow-tigera.linseed-access", Namespace: "tigera-elasticsearch"}
+		Context("calico-system rendering", func() {
+			policyName := types.NamespacedName{Name: "calico-system.linseed-access", Namespace: "tigera-elasticsearch"}
 
-			getExpectedPolicy := func(scenario testutils.AllowTigeraScenario) *v3.NetworkPolicy {
+			getExpectedPolicy := func(scenario testutils.CalicoSystemScenario) *v3.NetworkPolicy {
 				if scenario.ManagedCluster {
 					return nil
 				}
@@ -389,8 +387,8 @@ var _ = Describe("Linseed rendering tests", func() {
 				return testutils.SelectPolicyByProvider(scenario, expectedPolicy, expectedPolicyForOpenshift)
 			}
 
-			DescribeTable("should render allow-tigera policy",
-				func(scenario testutils.AllowTigeraScenario) {
+			DescribeTable("should render calico-system policy",
+				func(scenario testutils.CalicoSystemScenario) {
 					if scenario.OpenShift {
 						cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
 					} else {
@@ -400,16 +398,16 @@ var _ = Describe("Linseed rendering tests", func() {
 					component := Linseed(cfg)
 					resources, _ := component.Objects()
 
-					policy := testutils.GetAllowTigeraPolicyFromResources(policyName, resources)
+					policy := testutils.GetCalicoSystemPolicyFromResources(policyName, resources)
 					expectedPolicy := getExpectedPolicy(scenario)
 					Expect(policy).To(Equal(expectedPolicy))
 				},
 				// Linseed only renders in the presence of an LogStorage CR and absence of a ManagementClusterConnection CR, therefore
 				// does not have a config option for managed clusters.
-				Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false}),
-				Entry("for management/standalone, kube-dns with dpi", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false, DPIEnabled: true}),
-				Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true}),
-				Entry("for management/standalone, openshift-dns with dpi", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true, DPIEnabled: true}),
+				Entry("for management/standalone, kube-dns", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: false}),
+				Entry("for management/standalone, kube-dns with dpi", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: false, DPIEnabled: true}),
+				Entry("for management/standalone, openshift-dns", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: true}),
+				Entry("for management/standalone, openshift-dns with dpi", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: true, DPIEnabled: true}),
 			)
 		})
 	})
@@ -488,6 +486,10 @@ var _ = Describe("Linseed rendering tests", func() {
 						{
 							BaseIndexName: "calico_waflogs_standard",
 							DataType:      "WAFLogs",
+						},
+						{
+							BaseIndexName: "calico_policy_activity_standard",
+							DataType:      "PolicyActivity",
 						},
 					},
 				},
@@ -579,7 +581,7 @@ var _ = Describe("Linseed rendering tests", func() {
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MANAGEMENT_OPERATOR_NS", Value: "tigera-operator"}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "BACKEND", Value: "elastic-single-index"}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "LINSEED_EXPECTED_TENANT_ID", Value: cfg.Tenant.Spec.ID}))
-			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "LINSEED_MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: fmt.Sprintf("https://tigera-manager.%s.svc:9443", cfg.Tenant.Namespace)}))
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "LINSEED_MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: render.ManagerService(cfg.Tenant)}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "ELASTIC_ALERTS_BASE_INDEX_NAME", Value: "calico_alerts_standard"}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "ELASTIC_AUDIT_LOGS_BASE_INDEX_NAME", Value: "calico_auditlogs_standard"}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "ELASTIC_COMPLIANCE_BENCHMARKS_BASE_INDEX_NAME", Value: "calico_compliance_benchmarks_standard"}))
@@ -593,6 +595,7 @@ var _ = Describe("Linseed rendering tests", func() {
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "ELASTIC_THREAT_FEEDS_DOMAIN_SET_BASE_INDEX_NAME", Value: "calico_threat_feeds_domain_set_standard"}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "ELASTIC_THREAT_FEEDS_IP_SET_BASE_INDEX_NAME", Value: "calico_threat_feeds_ip_set_standard"}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "ELASTIC_WAF_LOGS_BASE_INDEX_NAME", Value: "calico_waflogs_standard"}))
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "ELASTIC_POLICY_ACTIVITY_BASE_INDEX_NAME", Value: "calico_policy_activity_standard"}))
 		})
 
 		Describe("product variant", func() {
@@ -605,10 +608,10 @@ var _ = Describe("Linseed rendering tests", func() {
 			})
 			It("should set LINSEED_PRODUCT_VARIANT to enterprise", func() {
 				cfg.ManagementCluster = true
-				cfg.Tenant.Spec.ManagedClusterVariant = &operatorv1.TigeraSecureEnterprise
+				cfg.Tenant.Spec.ManagedClusterVariant = &operatorv1.CalicoEnterprise
 				resources, _ := Linseed(cfg).Objects()
 				d := rtest.GetResource(resources, DeploymentName, cfg.Namespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
-				Expect(d.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "LINSEED_PRODUCT_VARIANT", Value: string(operatorv1.TigeraSecureEnterprise)}))
+				Expect(d.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{Name: "LINSEED_PRODUCT_VARIANT", Value: string(operatorv1.CalicoEnterprise)}))
 			})
 			It("should not panic if ManagedClusterVariant is not set", func() {
 				cfg.ManagementCluster = true
@@ -620,17 +623,17 @@ var _ = Describe("Linseed rendering tests", func() {
 		})
 
 		It("should override replicas with the value from TenantSpec's controlPlaneReplicas when available", func() {
-			cfg.Tenant.Spec.ControlPlaneReplicas = ptr.Int32ToPtr(3)
+			cfg.Tenant.Spec.ControlPlaneReplicas = ptr.To(int32(3))
 			component := Linseed(cfg)
 
 			resources, _ := component.Objects()
 			d := rtest.GetResource(resources, DeploymentName, cfg.Namespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
-			Expect(d.Spec.Replicas).To(Equal(ptr.Int32ToPtr(3)))
+			Expect(d.Spec.Replicas).To(Equal(ptr.To(int32(3))))
 		})
 
 		It("should render PodAffinity when TenantSpec ControlPlaneReplicas is greater than 1", func() {
-			installation.ControlPlaneReplicas = ptr.Int32ToPtr(1)
-			cfg.Tenant.Spec.ControlPlaneReplicas = ptr.Int32ToPtr(3)
+			installation.ControlPlaneReplicas = ptr.To(int32(1))
+			cfg.Tenant.Spec.ControlPlaneReplicas = ptr.To(int32(3))
 			component := Linseed(cfg)
 
 			resources, _ := component.Objects()
@@ -804,11 +807,12 @@ var _ = Describe("Linseed rendering tests", func() {
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MANAGEMENT_OPERATOR_NS", Value: "tigera-operator"}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "LINSEED_EXPECTED_TENANT_ID", Value: cfg.Tenant.Spec.ID}))
 
-			// These are only set for multi-tenant clusters. Make sure they aren't set here.
+			// These are only set for multi-tenant clusters or internal ES. Make sure they aren't set here.
 			for _, env := range envs {
 				Expect(env.Name).NotTo(Equal("LINSEED_MULTI_CLUSTER_FORWARDING_ENDPOINT"))
 				Expect(env.Name).NotTo(Equal("LINSEED_TENANT_NAMESPACE"))
 				Expect(env.Name).NotTo(Equal("BACKEND"))
+				Expect(env.Name).NotTo(Equal("ELASTIC_MULTI_INDEX_TENANT_SUFFIX_ENABLED"))
 			}
 		})
 
@@ -822,6 +826,12 @@ var _ = Describe("Linseed rendering tests", func() {
 			envs := d.Spec.Template.Spec.Containers[0].Env
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MANAGEMENT_OPERATOR_NS", Value: "tigera-operator"}))
 
+			// Tenant ID is always set when a tenant is configured.
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "LINSEED_EXPECTED_TENANT_ID", Value: cfg.Tenant.Spec.ID}))
+
+			// For internal ES, tenant suffix is disabled in multi-index names for backward compatibility.
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "ELASTIC_MULTI_INDEX_TENANT_SUFFIX_ENABLED", Value: "false"}))
+
 			// These are only set for multi-tenant clusters. Make sure they aren't set here.
 			for _, env := range envs {
 				Expect(env.Name).NotTo(Equal("LINSEED_MULTI_CLUSTER_FORWARDING_ENDPOINT"))
@@ -834,7 +844,7 @@ var _ = Describe("Linseed rendering tests", func() {
 
 func getTLS(installation *operatorv1.InstallationSpec) (certificatemanagement.KeyPairInterface, certificatemanagement.KeyPairInterface, certificatemanagement.TrustedBundle) {
 	scheme := runtime.NewScheme()
-	Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+	Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 	cli := ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 
 	certificateManager, err := certificatemanager.Create(cli, installation, dns.DefaultClusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
@@ -872,8 +882,8 @@ func compareResources(resources []client.Object, expectedResources []resourceTes
 	deployment := rtest.GetResource(resources, DeploymentName, render.ElasticsearchNamespace, "apps", "v1", "Deployment").(*appsv1.Deployment)
 	ExpectWithOffset(1, deployment).NotTo(BeNil())
 	ExpectWithOffset(1, deployment.Spec.Strategy.Type).To(Equal(appsv1.RollingUpdateDeploymentStrategyType))
-	ExpectWithOffset(1, deployment.Spec.Strategy.RollingUpdate.MaxSurge).To(Equal(ptr.IntOrStrPtr("100%")))
-	ExpectWithOffset(1, deployment.Spec.Strategy.RollingUpdate.MaxUnavailable).To(Equal(ptr.IntOrStrPtr("0")))
+	ExpectWithOffset(1, deployment.Spec.Strategy.RollingUpdate.MaxSurge).To(Equal(ptr.To(intstr.FromString("100%"))))
+	ExpectWithOffset(1, deployment.Spec.Strategy.RollingUpdate.MaxUnavailable).To(Equal(ptr.To(intstr.FromInt(0))))
 
 	// Check containers
 	expected := expectedContainers()
@@ -986,7 +996,7 @@ func expectedVolumes(useCSR bool) []corev1.Volume {
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
 						SecretName:  render.TigeraLinseedSecret,
-						DefaultMode: ptr.Int32ToPtr(420),
+						DefaultMode: ptr.To(int32(420)),
 					},
 				},
 			},
@@ -995,7 +1005,7 @@ func expectedVolumes(useCSR bool) []corev1.Volume {
 				VolumeSource: corev1.VolumeSource{
 					Secret: &corev1.SecretVolumeSource{
 						SecretName:  "tigera-secure-linseed-token-tls",
-						DefaultMode: ptr.Int32ToPtr(420),
+						DefaultMode: ptr.To(int32(420)),
 					},
 				},
 			},
@@ -1022,11 +1032,11 @@ func expectedContainers() []corev1.Container {
 			ImagePullPolicy: render.ImagePullPolicy(),
 			SecurityContext: &corev1.SecurityContext{
 				Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
-				AllowPrivilegeEscalation: ptr.BoolToPtr(false),
-				Privileged:               ptr.BoolToPtr(false),
-				RunAsNonRoot:             ptr.BoolToPtr(true),
-				RunAsGroup:               ptr.Int64ToPtr(10001),
-				RunAsUser:                ptr.Int64ToPtr(10001),
+				AllowPrivilegeEscalation: ptr.To(false),
+				Privileged:               ptr.To(false),
+				RunAsNonRoot:             ptr.To(true),
+				RunAsGroup:               ptr.To(int64(10001)),
+				RunAsUser:                ptr.To(int64(10001)),
 				SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
 			ReadinessProbe: &corev1.Probe{
@@ -1124,6 +1134,10 @@ func expectedContainers() []corev1.Container {
 				},
 				{
 					Name:  "ELASTIC_RUNTIME_INDEX_SHARDS",
+					Value: "1",
+				},
+				{
+					Name:  "ELASTIC_POLICY_ACTIVITY_INDEX_SHARDS",
 					Value: "1",
 				},
 				{

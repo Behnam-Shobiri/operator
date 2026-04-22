@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import (
 	"github.com/go-logr/logr"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -34,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
 
 	"github.com/tigera/operator/pkg/common"
@@ -55,20 +57,21 @@ var log = logf.Log.WithName("controller_tiers")
 
 // Add creates a new Tiers Controller and adds it to the Manager.
 // The Manager will set fields on the Controller and Start it when the Manager is Started.
-func Add(mgr manager.Manager, opts options.AddOptions) error {
-	if !opts.EnterpriseCRDExists {
-		// No need to start this controller.
-		return nil
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
+	r := &ReconcileTiers{
+		client: mgr.GetClient(),
+		scheme: mgr.GetScheme(),
+		status: status.New(mgr.GetClient(), "tiers", opts.KubernetesVersion),
+		opts:   opts,
 	}
+	r.status.Run(opts.ShutdownContext)
 
-	reconciler := newReconciler(mgr, opts)
-
-	c, err := ctrlruntime.NewController("tiers-controller", mgr, controller.Options{Reconciler: reconciler})
+	c, err := ctrlruntime.NewController("tiers-controller", mgr, controller.Options{Reconciler: r})
 	if err != nil {
 		return err
 	}
 
-	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, opts.K8sClientset, log, nil)
+	go utils.WaitToAddTierWatch(networkpolicy.CalicoTierName, c, opts.K8sClientset, log, nil)
 
 	go utils.WaitToAddNetworkPolicyWatches(c, opts.K8sClientset, log, []types.NamespacedName{
 		{Name: tiers.ClusterDNSPolicyName, Namespace: "openshift-dns"},
@@ -81,38 +84,8 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		}
 	}
 
-	return add(mgr, c)
-}
-
-// newReconciler returns a new reconcile.Reconciler
-func newReconciler(mgr manager.Manager, opts options.AddOptions) reconcile.Reconciler {
-	r := &ReconcileTiers{
-		client:      mgr.GetClient(),
-		scheme:      mgr.GetScheme(),
-		provider:    opts.DetectedProvider,
-		status:      status.New(mgr.GetClient(), "tiers", opts.KubernetesVersion),
-		multiTenant: opts.MultiTenant,
-	}
-	r.status.Run(opts.ShutdownContext)
-	return r
-}
-
-var _ reconcile.Reconciler = &ReconcileTiers{}
-
-type ReconcileTiers struct {
-	client             client.Client
-	scheme             *runtime.Scheme
-	provider           operatorv1.Provider
-	status             status.StatusManager
-	tierWatchReady     *utils.ReadyFlag
-	policyWatchesReady *utils.ReadyFlag
-	multiTenant        bool
-}
-
-// add adds watches for resources that are available at startup.
-func add(mgr manager.Manager, c ctrlruntime.Controller) error {
 	if err := utils.AddInstallationWatch(c); err != nil {
-		return fmt.Errorf("tiers-controller failed to watch Tigera network resource: %v", err)
+		return fmt.Errorf("tiers-controller failed to watch Installation resource: %v", err)
 	}
 
 	if err := utils.AddAPIServerWatch(c); err != nil {
@@ -126,6 +99,17 @@ func add(mgr manager.Manager, c ctrlruntime.Controller) error {
 	return nil
 }
 
+var _ reconcile.Reconciler = &ReconcileTiers{}
+
+type ReconcileTiers struct {
+	client             client.Client
+	scheme             *runtime.Scheme
+	status             status.StatusManager
+	tierWatchReady     *utils.ReadyFlag
+	policyWatchesReady *utils.ReadyFlag
+	opts               options.ControllerOptions
+}
+
 func (r *ReconcileTiers) Reconcile(ctx context.Context, request reconcile.Request) (reconcile.Result, error) {
 	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 	reqLogger.Info("Reconciling Tiers")
@@ -133,23 +117,8 @@ func (r *ReconcileTiers) Reconcile(ctx context.Context, request reconcile.Reques
 	// Mark CR as found even though this controller is not associated with a CR, as OnCRFound() enables TigeraStatus reporting.
 	r.status.OnCRFound()
 
-	if !utils.IsAPIServerReady(r.client, reqLogger) {
+	if !utils.IsProjectCalicoV3Available(r.client, r.opts, reqLogger) {
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for Tigera API server to be ready", nil, reqLogger)
-		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
-	}
-
-	// Ensure a license is present that enables this controller to create/manage tiers.
-	license, err := utils.FetchLicenseKey(ctx, r.client)
-	if err != nil {
-		if apierrors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceNotFound, "License not found", err, reqLogger)
-			return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
-		}
-		r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying license", err, reqLogger)
-		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
-	}
-	if !utils.IsFeatureActive(license, common.TiersFeature) {
-		r.status.SetDegraded(operatorv1.ResourceValidationError, "Feature is not active - License does not support feature: tiers", err, reqLogger)
 		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
@@ -161,10 +130,19 @@ func (r *ReconcileTiers) Reconcile(ctx context.Context, request reconcile.Reques
 	component := tiers.Tiers(tiersConfig)
 
 	componentHandler := utils.NewComponentHandler(log, r.client, r.scheme, nil)
-	err = componentHandler.CreateOrUpdateOrDelete(ctx, component, nil)
+	err := componentHandler.CreateOrUpdateOrDelete(ctx, component, nil)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating resource", err, reqLogger)
 		return reconcile.Result{}, err
+	}
+
+	// Try to delete allow-tigera deprecated tier
+	err = componentHandler.CreateOrUpdateOrDelete(ctx, render.NewDeletionPassthrough(&v3.Tier{
+		TypeMeta:   metav1.TypeMeta{Kind: "Tier", APIVersion: "projectcalico.org/v3"},
+		ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"},
+	}), nil)
+	if err != nil {
+		log.V(1).Info("Unable to delete deprecated allow-tigera tier at this time", "error", err)
 	}
 
 	r.status.ReadyToMonitor()
@@ -174,7 +152,7 @@ func (r *ReconcileTiers) Reconcile(ctx context.Context, request reconcile.Reques
 
 func (r *ReconcileTiers) prepareTiersConfig(ctx context.Context, reqLogger logr.Logger) (*tiers.Config, *reconcile.Result) {
 	tiersConfig := tiers.Config{
-		OpenShift:      r.provider.IsOpenShift(),
+		OpenShift:      r.opts.DetectedProvider.IsOpenShift(),
 		DNSEgressCIDRs: tiers.DNSEgressCIDR{},
 	}
 
@@ -182,19 +160,22 @@ func (r *ReconcileTiers) prepareTiersConfig(ctx context.Context, reqLogger logr.
 	// well-known list of namespaces that contain product code.
 	namespaces := []string{
 		common.CalicoNamespace,
-		render.ComplianceNamespace,
-		render.DexNamespace,
-		render.ElasticsearchNamespace,
-		render.LogCollectorNamespace,
-		render.IntrusionDetectionNamespace,
-		kibana.Namespace,
-		render.ManagerNamespace,
-		eck.OperatorNamespace,
-		render.PacketCaptureNamespace,
-		common.TigeraPrometheusNamespace,
-		"tigera-skraper",
 	}
-	if r.multiTenant {
+	if r.opts.EnterpriseCRDExists {
+		namespaces = append(namespaces,
+			render.ComplianceNamespace,
+			render.DexNamespace,
+			render.ElasticsearchNamespace,
+			render.LogCollectorNamespace,
+			render.IntrusionDetectionNamespace,
+			kibana.Namespace,
+			eck.OperatorNamespace,
+			render.PacketCaptureNamespace,
+			common.TigeraPrometheusNamespace,
+			"tigera-skraper",
+		)
+	}
+	if r.opts.MultiTenant {
 		// For multi-tenant clusters, we need to include well-known namespaces as well as per-tenant namespaces.
 		tenantNamespaces, err := utils.TenantNamespaces(ctx, r.client, nil)
 		if err != nil {
@@ -206,13 +187,13 @@ func (r *ReconcileTiers) prepareTiersConfig(ctx context.Context, reqLogger logr.
 	tiersConfig.CalicoNamespaces = namespaces
 
 	// node-local-dns is not supported on openshift
-	if r.provider != operatorv1.ProviderOpenShift {
+	if r.opts.DetectedProvider != operatorv1.ProviderOpenShift {
 		nodeLocalDNSExists, err := utils.IsNodeLocalDNSAvailable(ctx, r.client)
 		if err != nil {
 			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying node-local-dns pods", err, reqLogger)
 			return nil, &reconcile.Result{RequeueAfter: utils.StandardRetry}
 		} else if nodeLocalDNSExists {
-			dnsServiceIPs, err := utils.GetDNSServiceIPs(ctx, r.client, r.provider)
+			dnsServiceIPs, err := utils.GetDNSServiceIPs(ctx, r.client, r.opts.DetectedProvider)
 			if err != nil {
 				if apierrors.IsNotFound(err) {
 					r.status.SetDegraded(operatorv1.ResourceNotFound, "Unable to find DNS service", err, reqLogger)

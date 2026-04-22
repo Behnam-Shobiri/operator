@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,9 +33,9 @@ type MonitorSpec struct {
 	// +optional
 	Prometheus *Prometheus `json:"prometheus,omitempty"`
 
-	// AlertManager is the configuration for the AlertManager.
+	// Alertmanager is the configuration for the Alertmanager.
 	// +optional
-	AlertManager *AlertManager `json:"alertManager,omitempty"`
+	Alertmanager *Alertmanager `json:"alertmanager,omitempty"`
 }
 
 type ExternalPrometheus struct {
@@ -116,6 +116,8 @@ type MonitorStatus struct {
 
 // Monitor is the Schema for the monitor API. At most one instance
 // of this resource is supported. It must be named "tigera-secure".
+//
+// +kubebuilder:validation:XValidation:rule="self.metadata.name == 'tigera-secure'",message="resource name must be 'tigera-secure'"
 type Monitor struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -143,7 +145,6 @@ type PrometheusSpec struct {
 	CommonPrometheusFields *CommonPrometheusFields `json:"commonPrometheusFields,omitempty"`
 }
 type CommonPrometheusFields struct {
-
 	// Containers is a list of Prometheus containers.
 	// If specified, this overrides the specified Prometheus Deployment containers.
 	// If omitted, the Prometheus Deployment will use its default values for its containers.
@@ -166,20 +167,34 @@ type PrometheusContainer struct {
 	// If omitted, the Prometheus will use its default value for this container's resources.
 	// +optional
 	Resources *corev1.ResourceRequirements `json:"resources,omitempty"`
+
+	// ReadinessProbe allows customization of the readiness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	ReadinessProbe *ProbeOverride `json:"readinessProbe,omitempty"`
+
+	// LivenessProbe allows customization of the liveness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	LivenessProbe *ProbeOverride `json:"livenessProbe,omitempty"`
 }
 
-type AlertManager struct {
+type Alertmanager struct {
 	// Spec is the specification of the Alertmanager.
 	// +optional
-	AlertManagerSpec *AlertManagerSpec `json:"spec,omitempty"`
+	AlertmanagerSpec *AlertmanagerSpec `json:"spec,omitempty"`
 }
-type AlertManagerSpec struct {
+type AlertmanagerSpec struct {
+	// Replicas defines the number of Alertmanager replicas. When set to 0, Alertmanager is not rendered.
+	// Default: 0
+	// +optional
+	Replicas *int32 `json:"replicas,omitempty"`
+
 	// Define resources requests and limits for single Pods.
 	Resources corev1.ResourceRequirements `json:"resources,omitempty"`
 }
 
 func (c *Prometheus) GetContainers() []corev1.Container {
-
 	if c.PrometheusSpec != nil {
 		if c.PrometheusSpec.CommonPrometheusFields != nil {
 			if c.PrometheusSpec.CommonPrometheusFields.Containers != nil {

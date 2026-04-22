@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,16 +23,27 @@ import (
 // CalicoNodeWindowsDaemonSetContainer is a calico-node-windows DaemonSet container.
 type CalicoNodeWindowsDaemonSetContainer struct {
 	// Name is an enum which identifies the calico-node-windows DaemonSet container by name.
-	// Supported values are: calico-node-windows
-	// +kubebuilder:validation:Enum=calico-node-windows
+	// Supported values are: node, felix, confd
+	// calico-node-windows is allowed because it was previously allowed.
+	// +kubebuilder:validation:Enum=calico-node-windows;node;felix;confd
 	Name string `json:"name"`
 
 	// Resources allows customization of limits and requests for compute resources such as cpu and memory.
-	// If specified, this overrides the named calico-node-windows DaemonSet container's resources.
-	// If omitted, the calico-node-windows DaemonSet will use its default value for this container's resources.
+	// If specified, this overrides the named DaemonSet container's resources.
+	// If omitted, the DaemonSet will use its default value for this container's resources.
 	// If used in conjunction with the deprecated ComponentResources, then this value takes precedence.
 	// +optional
 	Resources *v1.ResourceRequirements `json:"resources,omitempty"`
+
+	// ReadinessProbe allows customization of the readiness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	ReadinessProbe *ProbeOverride `json:"readinessProbe,omitempty"`
+
+	// LivenessProbe allows customization of the liveness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	LivenessProbe *ProbeOverride `json:"livenessProbe,omitempty"`
 }
 
 // CalicoNodeWindowsDaemonSetInitContainer is a calico-node-windows DaemonSet init container.

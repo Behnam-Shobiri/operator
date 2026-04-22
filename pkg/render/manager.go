@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -49,55 +49,70 @@ import (
 )
 
 const (
-	managerPort           = 9443
-	managerTargetPort     = 9443
-	ManagerServiceName    = "tigera-manager"
-	ManagerDeploymentName = "tigera-manager"
-	ManagerNamespace      = "tigera-manager"
-	ManagerServiceAccount = "tigera-manager"
+	ManagerPort                 = 9443
+	managerTargetPort           = 9443
+	ManagerServiceName          = "calico-manager"
+	LegacyManagerServiceName    = "tigera-manager"
+	ManagerDeploymentName       = "calico-manager"
+	LegacyManagerDeploymentName = "tigera-manager"
+	ManagerNamespace            = common.CalicoNamespace
+	LegacyManagerNamespace      = "tigera-manager"
+	ManagerServiceAccount       = "calico-manager"
+	LegacyManagerServiceAccount = "tigera-manager"
 
 	// Default manager RBAC resources.
-	ManagerClusterRole        = "tigera-manager-role"
-	ManagerClusterRoleBinding = "tigera-manager-binding"
+	ManagerClusterRole              = "calico-manager-role"
+	LegacyManagerClusterRole        = "tigera-manager-role"
+	ManagerClusterRoleBinding       = "calico-manager-binding"
+	LegacyManagerClusterRoleBinding = "tigera-manager-binding"
 
 	// Manager RBAC resources for Calico managed clusters.
-	ManagerManagedCalicoClusterRole        = "tigera-manager-managed-calico"
-	ManagerManagedCalicoClusterRoleBinding = "tigera-manager-managed-calico"
+	ManagerManagedCalicoClusterRole              = "calico-manager-managed-calico"
+	LegacyManagerManagedCalicoClusterRole        = "tigera-manager-managed-calico"
+	ManagerManagedCalicoClusterRoleBinding       = "calico-manager-managed-calico"
+	LegacyManagerManagedCalicoClusterRoleBinding = "tigera-manager-managed-calico"
 
 	ManagerTLSSecretName         = "manager-tls"
 	ManagerInternalTLSSecretName = "internal-manager-tls"
-	ManagerPolicyName            = networkpolicy.TigeraComponentPolicyPrefix + "manager-access"
+	ManagerPolicyName            = networkpolicy.CalicoComponentPolicyPrefix + "manager-access"
 
 	// The name of the TLS certificate used by Voltron to authenticate connections from managed
 	// cluster clients talking to Linseed.
-	VoltronLinseedTLS        = "tigera-voltron-linseed-tls"
-	VoltronLinseedPublicCert = "tigera-voltron-linseed-certs-public"
+	VoltronLinseedTLS              = "calico-voltron-linseed-tls"
+	VoltronLinseedPublicCert       = "calico-voltron-linseed-certs-public"
+	LegacyVoltronLinseedPublicCert = "tigera-voltron-linseed-certs-public"
 
 	ManagerClusterSettings            = "cluster-settings"
 	ManagerUserSettings               = "user-settings"
 	ManagerClusterSettingsLayerTigera = "cluster-settings.layer.tigera-infrastructure"
 	ManagerClusterSettingsViewDefault = "cluster-settings.view.default"
 
-	ElasticsearchManagerUserSecret                                = "tigera-ee-manager-elasticsearch-access"
-	TlsSecretHashAnnotation                                       = "hash.operator.tigera.io/tls-secret"
-	KibanaTLSHashAnnotation                                       = "hash.operator.tigera.io/kibana-secrets"
-	ElasticsearchUserHashAnnotation                               = "hash.operator.tigera.io/elasticsearch-user"
-	ManagerMultiTenantManagedClustersAccessClusterRoleBindingName = "tigera-manager-managed-cluster-access"
-	ManagerManagedClustersWatchRoleBindingName                    = "tigera-manager-managed-cluster-watch"
-	ManagerManagedClustersUpdateRBACName                          = "tigera-manager-managed-cluster-write-access"
+	ElasticsearchUserHashAnnotation                                     = "hash.operator.tigera.io/elasticsearch-user"
+	ManagerMultiTenantManagedClustersAccessClusterRoleBindingName       = "calico-manager-managed-cluster-access"
+	LegacyManagerMultiTenantManagedClustersAccessClusterRoleBindingName = "tigera-manager-managed-cluster-access"
+	ManagerManagedClustersWatchRoleBindingName                          = "calico-manager-managed-cluster-watch"
+	LegacyManagerManagedClustersWatchRoleBindingName                    = "tigera-manager-managed-cluster-watch"
+	ManagerManagedClustersUpdateRBACName                                = "calico-manager-managed-cluster-write-access"
+	LegacyManagerManagedClustersUpdateRBACName                          = "tigera-manager-managed-cluster-write-access"
 )
 
 // ManagementClusterConnection configuration constants
 const (
-	ManagerName              = "tigera-manager"
-	UIAPIsName               = "tigera-ui-apis"
-	VoltronName              = "tigera-voltron"
-	VoltronTunnelSecretName  = "tigera-management-cluster-connection"
+	ManagerName              = "calico-manager"
+	UIAPIsName               = "calico-ui-apis"
+	VoltronName              = "calico-voltron"
+	VoltronTunnelSecretName  = "calico-management-cluster-connection"
 	defaultVoltronPort       = "9443"
 	defaultTunnelVoltronPort = "9449"
 	DashboardAPIPort         = "8444"
 	DashboardAPIHealthPort   = "8090"
-	DashboardAPIName         = "tigera-dashboard-api"
+	DashboardAPIName         = "calico-dashboard-api"
+
+	// VoltronAdditionalTunnelSecretName is the name of an optional, pre-provisioned secret
+	// in the truth namespace that holds an additional CA used by Voltron for tunnel server
+	// certificates. When the secret is present the manager controller wires it into the
+	// Voltron deployment. It is managed out-of-band; the operator only consumes it.
+	VoltronAdditionalTunnelSecretName = "calico-management-additional-cluster-connection"
 )
 
 // Manager returns a component for rendering namespaced manager resources.
@@ -126,6 +141,9 @@ func Manager(cfg *ManagerConfiguration) (Component, error) {
 	tlsAnnotations[cfg.InternalTLSKeyPair.HashAnnotationKey()] = cfg.InternalTLSKeyPair.HashAnnotationValue()
 	if cfg.ManagementCluster != nil {
 		tlsAnnotations[cfg.TunnelServerCert.HashAnnotationKey()] = cfg.TunnelServerCert.HashAnnotationValue()
+		if cfg.AdditionalTunnelServerCert != nil {
+			tlsAnnotations[cfg.AdditionalTunnelServerCert.HashAnnotationKey()] = cfg.AdditionalTunnelServerCert.HashAnnotationValue()
+		}
 	}
 
 	return &managerComponent{
@@ -157,6 +175,12 @@ type ManagerConfiguration struct {
 	// KeyPair used by Voltron as the server certificate when establishing an mTLS tunnel with Guardian.
 	TunnelServerCert certificatemanagement.KeyPairInterface
 
+	// AdditionalTunnelServerCert is an optional additional CA used by Voltron for tunnel server
+	// certificates. It is populated by the manager controller when a pre-provisioned secret named
+	// VoltronAdditionalTunnelSecretName exists in the truth namespace, and is mounted into the
+	// Voltron container so Voltron can serve TLS from it.
+	AdditionalTunnelServerCert certificatemanagement.KeyPairInterface
+
 	// TLS KeyPair used by both Voltron and ui-apis, presented by each as part of the mTLS handshake with
 	// other services within the cluster. This is used in both management and standalone clusters.
 	InternalTLSKeyPair certificatemanagement.KeyPairInterface
@@ -186,7 +210,12 @@ type ManagerConfiguration struct {
 	Tenant          *operatorv1.Tenant
 	ExternalElastic bool
 
-	Manager *operatorv1.Manager
+	Manager       *operatorv1.Manager
+	KibanaEnabled bool
+
+	// CACertCommonName is the CommonName from the CA certificate used for operator-managed certificates.
+	// Passed to Voltron so it can identify the correct CA issuer public key.
+	CACertCommonName string
 }
 
 type managerComponent struct {
@@ -215,7 +244,6 @@ func (c *managerComponent) ResolveImages(is *operatorv1.ImageSet) error {
 	}
 
 	c.uiAPIsImage, err = components.GetReference(components.ComponentUIAPIs, reg, path, prefix, is)
-
 	if err != nil {
 		errMsgs = append(errMsgs, err.Error())
 	}
@@ -231,57 +259,74 @@ func (c *managerComponent) SupportedOSType() rmeta.OSType {
 }
 
 func (c *managerComponent) Objects() ([]client.Object, []client.Object) {
-	objs := []client.Object{}
+	objsToCreate := []client.Object{}
+	var objsToDelete []client.Object
 
 	if !c.cfg.Tenant.MultiTenant() {
 		// For multi-tenant environments, the management cluster itself isn't shown in the UI so we only need to create these
 		// when there is no tenant.
-		objs = append(objs,
+		objsToCreate = append(objsToCreate,
 			managerClusterWideSettingsGroup(),
 			managerUserSpecificSettingsGroup(),
 			managerClusterWideTigeraLayer(),
 			managerClusterWideDefaultView(),
 		)
+		// Continue to create the legacy namespace so that we can create our external name service that points to the new
+		// manager service. This will help ease transition for customers and avoid outages caused by the name and namespace
+		// changes.
+		objsToCreate = append(objsToCreate, c.managerLegacyNamespace())
 	}
 
-	objs = append(objs,
+	objsToDelete = c.deprecatedResources(c.cfg.Tenant, c.cfg.Namespace, c.cfg.TruthNamespace)
+
+	objsToCreate = append(objsToCreate,
 		managerClusterRoleBinding(c.cfg.Tenant, c.cfg.BindingNamespaces, c.cfg.OSSTenantNamespaces),
 		managerClusterRole(false, c.cfg.Installation.KubernetesProvider, c.cfg.Tenant),
 		c.managedClustersWatchRoleBinding(),
 	)
-	objs = append(objs, c.managedClustersUpdateRBAC()...)
+	objsToCreate = append(objsToCreate, c.managedClustersUpdateRBAC()...)
 	if c.cfg.Tenant.MultiTenant() {
-		objs = append(objs, c.multiTenantManagedClustersAccess()...)
+		objsToCreate = append(objsToCreate, c.multiTenantManagedClustersAccess()...)
 	}
 
-	objs = append(objs,
-		c.managerAllowTigeraNetworkPolicy(),
-		networkpolicy.AllowTigeraDefaultDeny(c.cfg.Namespace),
+	objsToCreate = append(objsToCreate,
+		c.managerCalicoSystemNetworkPolicy(),
 		managerServiceAccount(c.cfg.Namespace),
 	)
-	objs = append(objs, c.getTLSObjects()...)
-	objs = append(objs, c.managerService())
+	// The default-deny policy in calico-system is owned by the Installation
+	// controller, which uses a selector that excludes calico-apiserver so the
+	// API server remains reachable. Skip rendering it here when the Manager is
+	// being installed into calico-system (single-tenant), otherwise the two
+	// controllers fight over the policy's selector. In multi-tenant mode the
+	// Manager lives in a tenant namespace that Installation doesn't manage, so
+	// the Manager is responsible for the default-deny there.
+	if c.cfg.Namespace != common.CalicoNamespace {
+		objsToCreate = append(objsToCreate, networkpolicy.CalicoSystemDefaultDeny(c.cfg.Namespace))
+	}
+	objsToCreate = append(objsToCreate, c.getTLSObjects()...)
+	objsToCreate = append(objsToCreate, c.managerService())
+	objsToCreate = append(objsToCreate, c.managerExternalNameService())
 
 	if c.cfg.VoltronRouteConfig != nil {
-		objs = append(objs, c.cfg.VoltronRouteConfig.RoutesConfigMap(c.cfg.Namespace))
+		objsToCreate = append(objsToCreate, c.cfg.VoltronRouteConfig.RoutesConfigMap(c.cfg.Namespace))
 	}
 
-	objs = append(objs, c.managerDeployment())
+	objsToCreate = append(objsToCreate, c.managerDeployment())
 	if c.cfg.KeyValidatorConfig != nil {
-		objs = append(objs, configmap.ToRuntimeObjects(c.cfg.KeyValidatorConfig.RequiredConfigMaps(c.cfg.Namespace)...)...)
+		objsToCreate = append(objsToCreate, configmap.ToRuntimeObjects(c.cfg.KeyValidatorConfig.RequiredConfigMaps(c.cfg.Namespace)...)...)
 	}
 
 	// The following secret is read by kube controllers and sent to managed clusters so that linseed clients in the managed cluster
 	// can authenticate the certificate presented by Voltron.
 	if c.cfg.VoltronLinseedKeyPair != nil {
 		if c.cfg.VoltronLinseedKeyPair.UseCertificateManagement() {
-			objs = append(objs, CreateCertificateSecret(c.cfg.Installation.CertificateManagement.CACert, VoltronLinseedPublicCert, c.cfg.TruthNamespace))
+			objsToCreate = append(objsToCreate, CreateCertificateSecret(c.cfg.Installation.CertificateManagement.CACert, VoltronLinseedPublicCert, c.cfg.TruthNamespace))
 		} else {
-			objs = append(objs, CreateCertificateSecret(c.cfg.VoltronLinseedKeyPair.GetCertificatePEM(), VoltronLinseedPublicCert, c.cfg.TruthNamespace))
+			objsToCreate = append(objsToCreate, CreateCertificateSecret(c.cfg.VoltronLinseedKeyPair.GetCertificatePEM(), VoltronLinseedPublicCert, c.cfg.TruthNamespace))
 		}
 	}
 
-	return objs, nil
+	return objsToCreate, objsToDelete
 }
 
 func (c *managerComponent) Ready() bool {
@@ -332,7 +377,7 @@ func (c *managerComponent) managerDeployment() *appsv1.Deployment {
 	}
 
 	if c.cfg.Replicas != nil && *c.cfg.Replicas > 1 {
-		podTemplate.Spec.Affinity = podaffinity.NewPodAntiAffinity("tigera-manager", []string{c.cfg.Namespace})
+		podTemplate.Spec.Affinity = podaffinity.NewPodAntiAffinity(ManagerName, []string{c.cfg.Namespace})
 	}
 
 	d := &appsv1.Deployment{
@@ -378,6 +423,9 @@ func (c *managerComponent) managerVolumes() []corev1.Volume {
 			c.cfg.TunnelServerCert.Volume(),
 			c.cfg.VoltronLinseedKeyPair.Volume(),
 		)
+		if c.cfg.AdditionalTunnelServerCert != nil {
+			v = append(v, c.cfg.AdditionalTunnelServerCert.Volume())
+		}
 	}
 	if c.cfg.KeyValidatorConfig != nil {
 		v = append(v, c.cfg.KeyValidatorConfig.RequiredVolumes()...)
@@ -396,7 +444,7 @@ func (c *managerComponent) managerProbe() *corev1.Probe {
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
 				Path:   "/",
-				Port:   intstr.FromInt(managerPort),
+				Port:   intstr.FromInt(ManagerPort),
 				Scheme: corev1.URISchemeHTTPS,
 			},
 		},
@@ -410,7 +458,7 @@ func (c *managerComponent) managerUIAPIsProbe() *corev1.Probe {
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
 				Path:   "/tigera-elasticsearch/version",
-				Port:   intstr.FromInt(managerPort),
+				Port:   intstr.FromInt(ManagerPort),
 				Scheme: corev1.URISchemeHTTPS,
 			},
 		},
@@ -424,7 +472,7 @@ func (c *managerComponent) managerProxyProbe() *corev1.Probe {
 		ProbeHandler: corev1.ProbeHandler{
 			HTTPGet: &corev1.HTTPGetAction{
 				Path:   "/voltron/api/health",
-				Port:   intstr.FromInt(managerPort),
+				Port:   intstr.FromInt(ManagerPort),
 				Scheme: corev1.URISchemeHTTPS,
 			},
 		},
@@ -447,7 +495,7 @@ func (c *managerComponent) managerEnvVars() []corev1.EnvVar {
 		{Name: "CNX_CLUSTER_NAME", Value: "cluster"},
 		{Name: "CNX_POLICY_RECOMMENDATION_SUPPORT", Value: "true"},
 		{Name: "ENABLE_MULTI_CLUSTER_MANAGEMENT", Value: strconv.FormatBool(c.cfg.ManagementCluster != nil)},
-		{Name: "ENABLE_KIBANA", Value: strconv.FormatBool(!c.cfg.Tenant.MultiTenant())},
+		{Name: "ENABLE_KIBANA", Value: strconv.FormatBool(c.cfg.KibanaEnabled)},
 	}
 
 	envs = append(envs, c.managerOAuth2EnvVars()...)
@@ -547,6 +595,19 @@ func (c *managerComponent) voltronContainer() corev1.Container {
 		env = append(env, corev1.EnvVar{Name: "VOLTRON_USE_HTTPS_CERT_ON_TUNNEL", Value: strconv.FormatBool(c.cfg.ManagementCluster.Spec.TLS != nil && c.cfg.ManagementCluster.Spec.TLS.SecretName == ManagerTLSSecretName)})
 		env = append(env, corev1.EnvVar{Name: "VOLTRON_LINSEED_SERVER_KEY", Value: linseedKeyPath})
 		env = append(env, corev1.EnvVar{Name: "VOLTRON_LINSEED_SERVER_CERT", Value: linseedCertPath})
+		if c.cfg.AdditionalTunnelServerCert != nil {
+			// Voltron scans a single parent directory for additional cert/key pairs. Each
+			// cert/key pair is mounted into its own subdirectory so multiple can coexist.
+			// The tls.crt from each pair is also used as an additional CA to verify
+			// client (guardian) connections.
+			env = append(env,
+				corev1.EnvVar{Name: "VOLTRON_ADDITIONAL_CERT_KEY_PAIRS_PATH", Value: "/additional-tunnel-certificates"},
+			)
+		}
+	}
+
+	if c.cfg.CACertCommonName != "" {
+		env = append(env, corev1.EnvVar{Name: "VOLTRON_CA_SIGNER_NAME", Value: c.cfg.CACertCommonName})
 	}
 
 	if c.cfg.KeyValidatorConfig != nil {
@@ -563,6 +624,13 @@ func (c *managerComponent) voltronContainer() corev1.Container {
 		if c.cfg.ManagementCluster != nil {
 			mounts = append(mounts, c.cfg.TunnelServerCert.VolumeMount(c.SupportedOSType()))
 			mounts = append(mounts, c.cfg.VoltronLinseedKeyPair.VolumeMount(c.SupportedOSType()))
+			if c.cfg.AdditionalTunnelServerCert != nil {
+				mounts = append(mounts, corev1.VolumeMount{
+					Name:      c.cfg.AdditionalTunnelServerCert.GetName(),
+					MountPath: fmt.Sprintf("/additional-tunnel-certificates/%s", c.cfg.AdditionalTunnelServerCert.GetName()),
+					ReadOnly:  true,
+				})
+			}
 		}
 	}
 
@@ -622,7 +690,7 @@ func (c *managerComponent) dashboardContainer() corev1.Container {
 		{Name: "LINSEED_URL", Value: fmt.Sprintf("https://tigera-linseed.%s.svc.%s", ElasticsearchNamespace, c.cfg.ClusterDomain)},
 		{Name: "LINSEED_CLIENT_KEY", Value: keyPath},
 		{Name: "LINSEED_CLIENT_CERT", Value: certPath},
-		{Name: "MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: fmt.Sprintf("https://tigera-manager.%s.svc:%s", c.cfg.Namespace, defaultVoltronPort)},
+		{Name: "MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: ManagerService(c.cfg.Tenant)},
 		{Name: "HEALTH_PORT", Value: DashboardAPIHealthPort},
 	}
 
@@ -679,7 +747,7 @@ func (c *managerComponent) managerUIAPIsContainer() corev1.Container {
 		{Name: "LINSEED_CLIENT_CERT", Value: certPath},
 		{Name: "LINSEED_CLIENT_KEY", Value: keyPath},
 		{Name: "ELASTIC_KIBANA_DISABLED", Value: strconv.FormatBool(c.cfg.Tenant.MultiTenant())},
-		{Name: "VOLTRON_URL", Value: fmt.Sprintf("https://tigera-manager.%s.svc:9443", c.cfg.Namespace)},
+		{Name: "VOLTRON_URL", Value: ManagerService(c.cfg.Tenant)},
 	}
 
 	// Determine the Linseed location. Use code default unless in multi-tenant mode,
@@ -753,7 +821,7 @@ func (c *managerComponent) managerService() *corev1.Service {
 		Spec: corev1.ServiceSpec{
 			Ports: []corev1.ServicePort{
 				{
-					Port:       managerPort,
+					Port:       ManagerPort,
 					Protocol:   corev1.ProtocolTCP,
 					TargetPort: intstr.FromInt(managerTargetPort),
 				},
@@ -761,6 +829,34 @@ func (c *managerComponent) managerService() *corev1.Service {
 			Selector: map[string]string{
 				"k8s-app": ManagerDeploymentName,
 			},
+		},
+	}
+}
+
+func (c *managerComponent) managerLegacyNamespace() *corev1.Namespace {
+	return CreateNamespace(LegacyManagerNamespace, c.cfg.Installation.KubernetesProvider, PSSRestricted, c.cfg.Installation.Azure)
+}
+
+// managerExternalNameService acts as a safety net for migration of manager service from legacy namespace (tigera-manager)
+// to new namespace (calico-system) and from legacy name (tigera-manager) to new name (calico-manager)
+func (c *managerComponent) managerExternalNameService() *corev1.Service {
+	var legacyNamespace string
+	if c.cfg.Tenant.MultiTenant() {
+		// For multi-tenant case the old service reference will be to the same namespace just with a different name eg.
+		// tigera-manager.cc-tenant-1234 vs calico-manager.cc-tenant-1234
+		legacyNamespace = c.cfg.Namespace
+	} else {
+		legacyNamespace = LegacyManagerNamespace
+	}
+	return &corev1.Service{
+		TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      LegacyManagerServiceName,
+			Namespace: legacyNamespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Type:         corev1.ServiceTypeExternalName,
+			ExternalName: fmt.Sprintf("%s.%s.svc.cluster.local", ManagerServiceName, c.cfg.Namespace),
 		},
 	}
 }
@@ -898,6 +994,18 @@ func managerClusterRole(managedCluster bool, kubernetesProvider operatorv1.Provi
 				Verbs: []string{"list"},
 			},
 			{
+				// ui-apis needs broad read access to UISettings and UISettingsGroups to serve
+				// requests on behalf of users. It performs SubjectAccessReviews to enforce
+				// per-group RBAC before returning results.
+				APIGroups: []string{"projectcalico.org"},
+				Resources: []string{
+					"uisettings",
+					"uisettingsgroups",
+					"uisettingsgroups/data",
+				},
+				Verbs: []string{"get", "list", "watch"},
+			},
+			{
 				APIGroups: []string{"projectcalico.org"},
 				Resources: []string{
 					"stagednetworkpolicies",
@@ -1010,6 +1118,7 @@ func managerClusterRole(managedCluster bool, kubernetesProvider operatorv1.Provi
 					"l7logs-multi-cluster",
 					"events",
 					"processes",
+					"policyactivity",
 				},
 				Verbs: []string{"get"},
 			},
@@ -1020,6 +1129,13 @@ func managerClusterRole(managedCluster bool, kubernetesProvider operatorv1.Provi
 					"events",
 				},
 				Verbs: []string{"dismiss", "delete"},
+			},
+			{
+				// Required by the AuthorizationReview calculator in ui-apis to evaluate
+				// RBAC permissions for users.
+				APIGroups: []string{"rbac.authorization.k8s.io"},
+				Resources: []string{"clusterroles", "clusterrolebindings", "roles", "rolebindings"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 		},
 	}
@@ -1068,7 +1184,7 @@ func (c *managerComponent) getTLSObjects() []client.Object {
 }
 
 // Allow users to access Calico Enterprise Manager.
-func (c *managerComponent) managerAllowTigeraNetworkPolicy() *v3.NetworkPolicy {
+func (c *managerComponent) managerCalicoSystemNetworkPolicy() *v3.NetworkPolicy {
 	networkpolicyHelper := networkpolicy.Helper(c.cfg.Tenant.MultiTenant(), c.cfg.Namespace)
 	egressRules := []v3.Rule{
 		{
@@ -1111,7 +1227,7 @@ func (c *managerComponent) managerAllowTigeraNetworkPolicy() *v3.NetworkPolicy {
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.KubeAPIServerServiceSelectorEntityRule,
+			Destination: networkpolicy.KubeAPIServerEntityRule,
 		},
 	}
 
@@ -1183,7 +1299,7 @@ func (c *managerComponent) managerAllowTigeraNetworkPolicy() *v3.NetworkPolicy {
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
+			Tier:     networkpolicy.CalicoTierName,
 			Selector: networkpolicy.KubernetesAppSelector(ManagerDeploymentName),
 			Types:    []v3.PolicyType{v3.PolicyTypeIngress, v3.PolicyTypeEgress},
 			Ingress:  ingressRules,
@@ -1326,4 +1442,111 @@ func managerClusterWideDefaultView() *v3.UISettings {
 			},
 		},
 	}
+}
+
+// These resources became deprecated in Calico Enterprise v3.23 which corresponds to operator version <todo>. This function
+// can be removed for Calico Enterprise v3.26 which corresponds to operator version <todo> when the legacy names will no
+// longer be valid in our official support window
+func (m *managerComponent) deprecatedResources(tenant *operatorv1.Tenant, installNS, truthNS string) []client.Object {
+	objs := []client.Object{}
+	clusterRoleName := LegacyManagerClusterRole
+	clusterRoleBindingName := LegacyManagerClusterRoleBinding
+	managedClustersWatchRoleBindingName := LegacyManagerManagedClustersWatchRoleBindingName
+	managedClustersUpdateRBACName := LegacyManagerManagedClustersUpdateRBACName
+	multiTenantManagedClustersAccessName := LegacyManagerMultiTenantManagedClustersAccessClusterRoleBindingName
+	if tenant.ManagedClusterIsCalico() {
+		clusterRoleName = LegacyManagerManagedCalicoClusterRole
+		clusterRoleBindingName = LegacyManagerManagedCalicoClusterRoleBinding
+	}
+
+	var legacyNamespace string
+	if m.cfg.Tenant.MultiTenant() {
+		// For multi-tenant case the old service reference will be to the same namespace just with a different name eg.
+		// tigera-manager.cc-tenant-1234 vs calico-manager.cc-tenant-1234
+		legacyNamespace = installNS
+	} else {
+		legacyNamespace = LegacyManagerNamespace
+	}
+
+	var managedClustersWatchObj client.Object
+	var managedClustersUpdateRBACObjs []client.Object
+	if tenant.MultiTenant() {
+		managedClustersWatchObj = &rbacv1.RoleBinding{
+			TypeMeta:   metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: legacyNamespace},
+		}
+
+		managedClustersUpdateRBACObjs = []client.Object{
+			&rbacv1.Role{
+				TypeMeta:   metav1.TypeMeta{Kind: "Role", APIVersion: "rbac.authorization.k8s.io/v1"},
+				ObjectMeta: metav1.ObjectMeta{Namespace: legacyNamespace},
+			},
+			&rbacv1.RoleBinding{
+				TypeMeta:   metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+				ObjectMeta: metav1.ObjectMeta{Namespace: legacyNamespace},
+			},
+		}
+
+		objs = append(objs,
+			&rbacv1.RoleBinding{
+				TypeMeta:   metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+				ObjectMeta: metav1.ObjectMeta{Name: multiTenantManagedClustersAccessName, Namespace: legacyNamespace},
+			},
+		)
+	} else {
+		managedClustersWatchObj = &rbacv1.ClusterRoleBinding{
+			TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+		}
+		managedClustersUpdateRBACObjs = []client.Object{
+			&rbacv1.ClusterRole{
+				TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
+			},
+			&rbacv1.ClusterRoleBinding{
+				TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+			},
+		}
+		objs = append(objs,
+			networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("manager-access", legacyNamespace),
+			networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("default-deny", legacyNamespace),
+		)
+	}
+
+	managedClustersWatchObj.SetName(managedClustersWatchRoleBindingName)
+	for _, o := range managedClustersUpdateRBACObjs {
+		o.SetName(managedClustersUpdateRBACName)
+	}
+
+	objs = append(objs, managedClustersWatchObj)
+	objs = append(objs, managedClustersUpdateRBACObjs...)
+
+	objs = append(objs,
+		&rbacv1.ClusterRole{
+			TypeMeta:   metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: clusterRoleName},
+		},
+		&rbacv1.ClusterRoleBinding{
+			TypeMeta:   metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: clusterRoleBindingName},
+		},
+		&appsv1.Deployment{
+			TypeMeta:   metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: LegacyManagerServiceName, Namespace: legacyNamespace},
+		},
+		&corev1.ServiceAccount{
+			TypeMeta:   metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: LegacyManagerServiceName, Namespace: legacyNamespace},
+		},
+		&corev1.Secret{
+			TypeMeta:   metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: LegacyVoltronLinseedPublicCert, Namespace: truthNS},
+		},
+	)
+
+	// allow-tigera Tier was renamed to calico-system
+	objs = append(objs,
+		networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("manager-access", installNS),
+		networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("default-deny", installNS),
+	)
+
+	return objs
 }

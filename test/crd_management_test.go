@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	//"github.com/operator-framework/operator-sdk/pkg/restmapper"
@@ -46,9 +46,10 @@ var _ = Describe("CRD management tests", func() {
 	var npCRD *apiextenv1.CustomResourceDefinition
 	var scheme *runtime.Scheme
 	var operatorDone chan struct{}
+
 	BeforeEach(func() {
 		scheme = runtime.NewScheme()
-		err := apis.AddToScheme(scheme)
+		err := apis.AddToScheme(scheme, false)
 		Expect(err).NotTo(HaveOccurred())
 		cfg, err := config.GetConfig()
 		Expect(err).NotTo(HaveOccurred())
@@ -56,16 +57,18 @@ var _ = Describe("CRD management tests", func() {
 			Scheme: scheme,
 		})
 		Expect(err).NotTo(HaveOccurred())
-		verifyCRDsExist(c, operator.TigeraSecureEnterprise)
+		verifyCRDsExist(c, operator.CalicoEnterprise)
 
 		// Save the networkpolicies CRD so we can restore it when finished
 		npCRD = &apiextenv1.CustomResourceDefinition{
 			TypeMeta:   metav1.TypeMeta{Kind: "CustomResourceDefinition", APIVersion: "apiextensions.k8s.io/v1"},
 			ObjectMeta: metav1.ObjectMeta{Name: "networkpolicies.crd.projectcalico.org"},
 		}
+
 		k := client.ObjectKey{Name: npCRD.Name}
 		err = c.Get(context.Background(), k, npCRD)
 		Expect(err).NotTo(HaveOccurred())
+
 		ns := &corev1.Namespace{
 			TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
 			ObjectMeta: metav1.ObjectMeta{Name: "tigera-operator"},
@@ -183,7 +186,7 @@ var _ = Describe("CRD management tests", func() {
 		})
 		It("Should add tier to networkpolicy CRD", func() {
 			c, shutdownContext, cancel, mgr = setupManager(ManageCRDsEnable, SingleTenant, EnterpriseCRDsExist)
-			operatorDone = createInstallation(c, mgr, shutdownContext, &operator.InstallationSpec{Variant: operator.TigeraSecureEnterprise})
+			operatorDone = createInstallation(c, mgr, shutdownContext, &operator.InstallationSpec{Variant: operator.CalicoEnterprise})
 
 			By("Checking that the networkpolicies CRD is updated with tier")
 			Eventually(func() error {

@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,7 +46,7 @@ type ClusterCAController struct {
 	log           logr.Logger
 }
 
-func AddClusterCAController(mgr manager.Manager, opts options.AddOptions) error {
+func AddClusterCAController(mgr manager.Manager, opts options.ControllerOptions) error {
 	r := &ClusterCAController{
 		client:        mgr.GetClient(),
 		scheme:        mgr.GetScheme(),
@@ -82,7 +82,7 @@ func (r *ClusterCAController) Reconcile(ctx context.Context, request reconcile.R
 	logc := r.log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 
 	// Get Installation resource.
-	_, instance, err := utils.GetInstallation(ctx, r.client)
+	_, installationSpec, err := utils.GetInstallationSpec(ctx, r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			logc.Info("Installation not found")
@@ -99,7 +99,7 @@ func (r *ClusterCAController) Reconcile(ctx context.Context, request reconcile.R
 		certificatemanager.AllowCACreation(),
 		certificatemanager.WithLogger(logc),
 	}
-	cm, err := certificatemanager.Create(r.client, instance, r.clusterDomain, common.OperatorNamespace(), opts...)
+	cm, err := certificatemanager.Create(r.client, installationSpec, r.clusterDomain, common.OperatorNamespace(), opts...)
 	if err != nil {
 		return reconcile.Result{}, err
 	}

@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,8 +18,7 @@ import (
 	"context"
 
 	"github.com/go-logr/logr"
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	. "github.com/onsi/gomega/gstruct"
 	"github.com/stretchr/testify/mock"
@@ -37,9 +36,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/yaml" // gopkg.in/yaml.v2 didn't parse all the fields but this package did
 
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
-	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
 	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
@@ -58,7 +57,7 @@ var _ = Describe("Gateway API controller tests", func() {
 	BeforeEach(func() {
 		// The schema contains all objects that should be known to the fake client when the test runs.
 		scheme = runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 		Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(batchv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -71,11 +70,11 @@ var _ = Describe("Gateway API controller tests", func() {
 		installation = &operatorv1.Installation{
 			ObjectMeta: metav1.ObjectMeta{Name: "default"},
 			Spec: operatorv1.InstallationSpec{
-				Variant:  operatorv1.TigeraSecureEnterprise,
+				Variant:  operatorv1.CalicoEnterprise,
 				Registry: "some.registry.org/",
 			},
 			Status: operatorv1.InstallationStatus{
-				Variant: operatorv1.TigeraSecureEnterprise,
+				Variant: operatorv1.CalicoEnterprise,
 				Computed: &operatorv1.InstallationSpec{
 					Registry: "my-reg",
 					// The test is provider agnostic.
@@ -156,7 +155,7 @@ var _ = Describe("Gateway API controller tests", func() {
 
 				if gwapi.Spec.CRDManagement == nil {
 					By("checking that CRDManagement field has been updated to PreferExisting")
-					Expect(c.Get(ctx, utils.DefaultTSEEInstanceKey, gwapi)).NotTo(HaveOccurred())
+					Expect(c.Get(ctx, utils.DefaultEnterpriseInstanceKey, gwapi)).NotTo(HaveOccurred())
 					Expect(gwapi.Spec.CRDManagement).NotTo(BeNil())
 					Expect(*gwapi.Spec.CRDManagement).To(Equal(operatorv1.CRDManagementPreferExisting))
 				}
@@ -427,7 +426,7 @@ var _ = Describe("Gateway API controller tests", func() {
 			},
 			Spec: envoyapi.EnvoyProxySpec{
 				Provider: &envoyapi.EnvoyProxyProvider{
-					Type: envoyapi.ProviderTypeKubernetes,
+					Type: envoyapi.EnvoyProxyProviderTypeKubernetes,
 					Kubernetes: &envoyapi.EnvoyProxyKubernetesProvider{
 						EnvoyDaemonSet: &envoyapi.KubernetesDaemonSetSpec{
 							Pod: &envoyapi.KubernetesPodSpec{
@@ -558,7 +557,7 @@ var _ = Describe("Gateway API controller tests", func() {
 					},
 				},
 				Provider: &envoyapi.EnvoyProxyProvider{
-					Type: envoyapi.ProviderTypeKubernetes,
+					Type: envoyapi.EnvoyProxyProviderTypeKubernetes,
 					Kubernetes: &envoyapi.EnvoyProxyKubernetesProvider{
 						EnvoyDeployment: &envoyapi.KubernetesDeploymentSpec{
 							Replicas: &three,
@@ -612,7 +611,7 @@ var _ = Describe("Gateway API controller tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		By("re-reading the GatewayAPI")
-		err = c.Get(ctx, utils.DefaultTSEEInstanceKey, gwapi)
+		err = c.Get(ctx, utils.DefaultEnterpriseInstanceKey, gwapi)
 		Expect(err).NotTo(HaveOccurred())
 
 		By("checking default GatewayClasses")
@@ -632,9 +631,9 @@ var _ = Describe("Gateway API controller tests", func() {
 	It("Check felix configuration patching is set if it's not alreadyconfigured", func() {
 		Expect(c.Create(ctx, installation)).NotTo(HaveOccurred())
 
-		felixConfig := &crdv1.FelixConfiguration{
+		felixConfig := &v3.FelixConfiguration{
 			ObjectMeta: metav1.ObjectMeta{Name: "default"},
-			Spec:       crdv1.FelixConfigurationSpec{
+			Spec:       v3.FelixConfigurationSpec{
 				// PolicySyncPathPrefix is not set.
 			},
 		}
@@ -652,19 +651,18 @@ var _ = Describe("Gateway API controller tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		By("checking felix configuration has been patched")
-		actualFelixConfig := &crdv1.FelixConfiguration{}
+		actualFelixConfig := &v3.FelixConfiguration{}
 		err = c.Get(ctx, client.ObjectKey{Name: "default"}, actualFelixConfig)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(actualFelixConfig.Spec.PolicySyncPathPrefix).To(Equal(DefaultPolicySyncPrefix))
-
 	})
 
 	It("Check felix configuration patching is set if it's not set", func() {
 		Expect(c.Create(ctx, installation)).NotTo(HaveOccurred())
 
-		felixConfig := &crdv1.FelixConfiguration{
+		felixConfig := &v3.FelixConfiguration{
 			ObjectMeta: metav1.ObjectMeta{Name: "default"},
-			Spec: crdv1.FelixConfigurationSpec{
+			Spec: v3.FelixConfigurationSpec{
 				// PolicySyncPathPrefix is not set.
 				PolicySyncPathPrefix: "/dev/null",
 			},
@@ -683,12 +681,11 @@ var _ = Describe("Gateway API controller tests", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		By("checking felix configuration has been patched")
-		actualFelixConfig := &crdv1.FelixConfiguration{}
+		actualFelixConfig := &v3.FelixConfiguration{}
 		err = c.Get(ctx, client.ObjectKey{Name: "default"}, actualFelixConfig)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(actualFelixConfig.Spec.PolicySyncPathPrefix).ToNot(Equal(DefaultPolicySyncPrefix))
 		Expect(actualFelixConfig.Spec.PolicySyncPathPrefix).To(Equal("/dev/null"))
-
 	})
 })
 

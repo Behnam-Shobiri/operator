@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package utils
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
@@ -24,7 +25,6 @@ import (
 
 	esv1 "github.com/elastic/cloud-on-k8s/v2/pkg/apis/elasticsearch/v1"
 	"github.com/elastic/cloud-on-k8s/v2/pkg/utils/stringsutil"
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	csiv1 "sigs.k8s.io/secrets-store-csi-driver/apis/v1"
 
 	"github.com/go-logr/logr"
@@ -41,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -52,13 +53,12 @@ import (
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
-	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/controller/k8sapi"
+	"github.com/tigera/operator/pkg/controller/options"
 	"github.com/tigera/operator/pkg/ctrlruntime"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/logstorage/eck"
-	"github.com/tigera/operator/pkg/render/monitor"
 )
 
 const (
@@ -69,10 +69,10 @@ const (
 )
 
 var (
-	DefaultInstanceKey     = client.ObjectKey{Name: "default"}
-	DefaultTSEEInstanceKey = client.ObjectKey{Name: "tigera-secure"}
-	OverlayInstanceKey     = client.ObjectKey{Name: "overlay"}
-	KubeProxyInstanceKey   = client.ObjectKey{Name: "kube-proxy", Namespace: "kube-system"}
+	DefaultInstanceKey           = client.ObjectKey{Name: "default"}
+	DefaultEnterpriseInstanceKey = client.ObjectKey{Name: "tigera-secure"}
+	OverlayInstanceKey           = client.ObjectKey{Name: "overlay"}
+	KubeProxyInstanceKey         = client.ObjectKey{Name: "kube-proxy", Namespace: "kube-system"}
 
 	PeriodicReconcileTime = 5 * time.Minute
 
@@ -108,6 +108,22 @@ func IgnoreObject(obj runtime.Object) bool {
 		return true
 	}
 	return false
+}
+
+// V3Client creates a new controller-runtime client that can be used to interact with projectcalico.org/v3 resources.
+// In some cases it is necessary to use a separate client from the default provisioned by the manager, as we interact with two different
+// API groups (crd.projectcalico.org and projectcalico.org/v3) that may use the same underlying Go types.
+func V3Client(config *rest.Config) (client.Client, error) {
+	scheme := runtime.NewScheme()
+	if err := v3.AddToScheme(scheme); err != nil {
+		return nil, fmt.Errorf("failed to add projectcalico.org/v3 to scheme: %w", err)
+	}
+
+	c, err := client.New(config, client.Options{Scheme: scheme})
+	if err != nil {
+		return nil, fmt.Errorf("failed to create API client: %w", err)
+	}
+	return c, nil
 }
 
 func AddInstallationWatch(c ctrlruntime.Controller) error {
@@ -241,10 +257,6 @@ func createPeriodicReconcileChannel(period time.Duration) chan event.GenericEven
 	return periodicReconcileEvents
 }
 
-func WaitToAddLicenseKeyWatch(controller ctrlruntime.Controller, c kubernetes.Interface, log logr.Logger, flag *ReadyFlag) {
-	WaitToAddResourceWatch(controller, c, log, flag, []client.Object{&v3.LicenseKey{TypeMeta: metav1.TypeMeta{Kind: v3.KindLicenseKey}}})
-}
-
 func WaitToAddClusterInformationWatch(controller ctrlruntime.Controller, c kubernetes.Interface, log logr.Logger, flag *ReadyFlag) {
 	WaitToAddResourceWatch(controller, c, log, flag, []client.Object{&v3.ClusterInformation{TypeMeta: metav1.TypeMeta{Kind: v3.KindClusterInformation}}})
 }
@@ -294,7 +306,12 @@ func AddClusterWatch(c ctrlruntime.Controller, obj client.Object, h handler.Even
 	return AddNamespacedWatch(c, obj, h)
 }
 
-func IsAPIServerReady(client client.Client, l logr.Logger) bool {
+// IsProjectCalicoV3Available checks if projectcalico.org/v3 APIs are available. If the v3 parameter is true, it will skip the check and return true.
+func IsProjectCalicoV3Available(client client.Client, opts options.ControllerOptions, l logr.Logger) bool {
+	if opts.UseV3CRDs {
+		return true
+	}
+
 	instance, msg, err := GetAPIServer(context.Background(), client)
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -314,7 +331,7 @@ func IsAPIServerReady(client client.Client, l logr.Logger) bool {
 
 func LogStorageExists(ctx context.Context, cli client.Client) (bool, error) {
 	instance := &operatorv1.LogStorage{}
-	err := cli.Get(ctx, DefaultTSEEInstanceKey, instance)
+	err := cli.Get(ctx, DefaultEnterpriseInstanceKey, instance)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return false, nil
@@ -327,7 +344,7 @@ func LogStorageExists(ctx context.Context, cli client.Client) (bool, error) {
 
 func GetLogCollector(ctx context.Context, cli client.Client) (*operatorv1.LogCollector, error) {
 	logCollector := &operatorv1.LogCollector{}
-	err := cli.Get(ctx, DefaultTSEEInstanceKey, logCollector)
+	err := cli.Get(ctx, DefaultEnterpriseInstanceKey, logCollector)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil, nil
@@ -337,31 +354,11 @@ func GetLogCollector(ctx context.Context, cli client.Client) (*operatorv1.LogCol
 	return logCollector, nil
 }
 
-// FetchLicenseKey returns the license if it has been installed. It's useful
-// to prevent rollout of TSEE components that might require it.
-// It will return an error if the license is not installed/cannot be read
-func FetchLicenseKey(ctx context.Context, cli client.Client) (v3.LicenseKey, error) {
-	instance := &v3.LicenseKey{}
-	err := cli.Get(ctx, DefaultInstanceKey, instance)
-	return *instance, err
-}
-
 // FetchClusterInformation fetches and returns the clusterinformation.
 func FetchClusterInformation(ctx context.Context, cli client.Client) (v3.ClusterInformation, error) {
 	instance := &v3.ClusterInformation{}
 	err := cli.Get(ctx, DefaultInstanceKey, instance)
 	return *instance, err
-}
-
-// IsFeatureActive return true if the feature is listed in LicenseStatusKey
-func IsFeatureActive(license v3.LicenseKey, featureName string) bool {
-	for _, v := range license.Status.Features {
-		if v == featureName || v == "all" {
-			return true
-		}
-	}
-
-	return false
 }
 
 // ValidateCertPair checks if the given secret exists in the given
@@ -430,11 +427,13 @@ func PopulateK8sServiceEndPoint(client client.Client) error {
 	} else {
 		k8sapi.Endpoint.Host = cm.Data["KUBERNETES_SERVICE_HOST"]
 		k8sapi.Endpoint.Port = cm.Data["KUBERNETES_SERVICE_PORT"]
+		k8sapi.PodNetworkEndpoint.Host = cm.Data["KUBERNETES_SERVICE_HOST_POD_NETWORK"]
+		k8sapi.PodNetworkEndpoint.Port = cm.Data["KUBERNETES_SERVICE_PORT_POD_NETWORK"]
 	}
 	return nil
 }
 
-func GetNetworkingPullSecrets(i *operatorv1.InstallationSpec, c client.Client) ([]*corev1.Secret, error) {
+func GetInstallationPullSecrets(i *operatorv1.InstallationSpec, c client.Client) ([]*corev1.Secret, error) {
 	secrets := []*corev1.Secret{}
 	for _, ps := range i.ImagePullSecrets {
 		s := &corev1.Secret{}
@@ -453,7 +452,7 @@ func GetNetworkingPullSecrets(i *operatorv1.InstallationSpec, c client.Client) (
 func GetApplicationLayer(ctx context.Context, c client.Client) (*operatorv1.ApplicationLayer, error) {
 	applicationLayer := &operatorv1.ApplicationLayer{}
 
-	err := c.Get(ctx, DefaultTSEEInstanceKey, applicationLayer)
+	err := c.Get(ctx, DefaultEnterpriseInstanceKey, applicationLayer)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil, nil
@@ -468,7 +467,7 @@ func GetApplicationLayer(ctx context.Context, c client.Client) (*operatorv1.Appl
 func GetManagementCluster(ctx context.Context, c client.Client) (*operatorv1.ManagementCluster, error) {
 	managementCluster := &operatorv1.ManagementCluster{}
 
-	err := c.Get(ctx, DefaultTSEEInstanceKey, managementCluster)
+	err := c.Get(ctx, DefaultEnterpriseInstanceKey, managementCluster)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil, nil
@@ -483,7 +482,7 @@ func GetManagementCluster(ctx context.Context, c client.Client) (*operatorv1.Man
 func GetManagementClusterConnection(ctx context.Context, c client.Client) (*operatorv1.ManagementClusterConnection, error) {
 	managementClusterConnection := &operatorv1.ManagementClusterConnection{}
 
-	err := c.Get(ctx, DefaultTSEEInstanceKey, managementClusterConnection)
+	err := c.Get(ctx, DefaultEnterpriseInstanceKey, managementClusterConnection)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil, nil
@@ -517,7 +516,7 @@ func GetIfExists[E any, ClientObj ClientObjType[E]](ctx context.Context, key cli
 func GetNonClusterHost(ctx context.Context, cli client.Client) (*operatorv1.NonClusterHost, error) {
 	nonclusterhost := &operatorv1.NonClusterHost{}
 
-	err := cli.Get(ctx, DefaultTSEEInstanceKey, nonclusterhost)
+	err := cli.Get(ctx, DefaultEnterpriseInstanceKey, nonclusterhost)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return nil, nil
@@ -531,7 +530,7 @@ func GetNonClusterHost(ctx context.Context, cli client.Client) (*operatorv1.NonC
 // GetAuthentication finds the authentication CR in your cluster.
 func GetAuthentication(ctx context.Context, cli client.Client) (*operatorv1.Authentication, error) {
 	authentication := &operatorv1.Authentication{}
-	err := cli.Get(ctx, DefaultTSEEInstanceKey, authentication)
+	err := cli.Get(ctx, DefaultEnterpriseInstanceKey, authentication)
 	if err != nil {
 		return nil, err
 	}
@@ -589,10 +588,10 @@ func GetInstallationStatus(ctx context.Context, client client.Client) (*operator
 	return &instance.Status, nil
 }
 
-// GetInstallation returns the current installation, for use by other controllers. It accounts for overlays and
+// GetInstallationSpec returns the current installation, for use by other controllers. It accounts for overlays and
 // returns the variant according to status.Variant, which is leveraged by other controllers to know when it is safe to
 // launch enterprise-dependent components.
-func GetInstallation(ctx context.Context, client client.Client) (operatorv1.ProductVariant, *operatorv1.InstallationSpec, error) {
+func GetInstallationSpec(ctx context.Context, client client.Client) (operatorv1.ProductVariant, *operatorv1.InstallationSpec, error) {
 	// Fetch the Installation instance. We only support a single instance named "default".
 	instance := &operatorv1.Installation{}
 	if err := client.Get(ctx, DefaultInstanceKey, instance); err != nil {
@@ -625,13 +624,13 @@ func GetAPIServer(ctx context.Context, client client.Client) (*operatorv1.APISer
 		}
 
 		// Default instance doesn't exist. Check for the legacy (enterprise only) CR.
-		err = client.Get(ctx, DefaultTSEEInstanceKey, instance)
+		err = client.Get(ctx, DefaultEnterpriseInstanceKey, instance)
 		if err != nil {
 			return nil, "failed to get apiserver 'tigera-secure'", err
 		}
 	} else {
 		// Assert there is no legacy "tigera-secure" instance present.
-		err = client.Get(ctx, DefaultTSEEInstanceKey, instance)
+		err = client.Get(ctx, DefaultEnterpriseInstanceKey, instance)
 		if err == nil {
 			return nil,
 				"Duplicate configuration detected",
@@ -644,7 +643,7 @@ func GetAPIServer(ctx context.Context, client client.Client) (*operatorv1.APISer
 // GetPacketCapture finds the PacketCapture CR in your cluster.
 func GetPacketCaptureAPI(ctx context.Context, cli client.Client) (*operatorv1.PacketCaptureAPI, error) {
 	pc := &operatorv1.PacketCaptureAPI{}
-	err := cli.Get(ctx, DefaultTSEEInstanceKey, pc)
+	err := cli.Get(ctx, DefaultEnterpriseInstanceKey, pc)
 	if err != nil {
 		return nil, err
 	}
@@ -684,13 +683,20 @@ type resourceWatchContext struct {
 }
 
 // WaitToAddResourceWatch will check if the required CRD APIs are available and if so, it will add a watch for the
-// resource. The completion of this operation will be signaled on a ready channel
-func WaitToAddResourceWatch(controller ctrlruntime.Controller, c kubernetes.Interface, log logr.Logger, flag *ReadyFlag, objs []client.Object) {
+// resource. The completion of this operation will be signaled on a ready channel.
+// An optional predicate can be provided to override the default generation-based predicate for all
+// watched objects. This is useful for resources whose meaningful changes are status-only updates
+// that don't bump generation (e.g., DatastoreMigration phase transitions).
+func WaitToAddResourceWatch(controller ctrlruntime.Controller, c kubernetes.Interface, log logr.Logger, flag *ReadyFlag, objs []client.Object, predicates ...predicate.Predicate) {
 	// Track resources left to watch and establish their watch context.
 	resourcesToWatch := map[client.Object]resourceWatchContext{}
 	for _, obj := range objs {
+		pred := createPredicateForObject(obj)
+		if len(predicates) > 0 {
+			pred = predicate.And(predicates...)
+		}
 		resourcesToWatch[obj] = resourceWatchContext{
-			predicate: createPredicateForObject(obj),
+			predicate: pred,
 			logger:    ContextLoggerForResource(log, obj),
 		}
 	}
@@ -833,7 +839,7 @@ func AddTigeraStatusWatch(c ctrlruntime.Controller, name string) error {
 
 // GetKubeControllerMetricsPort fetches kube controller metrics port.
 func GetKubeControllerMetricsPort(ctx context.Context, client client.Client) (int, error) {
-	kubeControllersConfig := &crdv1.KubeControllersConfiguration{}
+	kubeControllersConfig := &v3.KubeControllersConfiguration{}
 	kubeControllersMetricsPort := 0
 
 	// Query the KubeControllersConfiguration object. We'll use this to help configure kube-controllers metric port.
@@ -858,30 +864,6 @@ func GetElasticsearch(ctx context.Context, c client.Client) (*esv1.Elasticsearch
 		return nil, err
 	}
 	return &es, nil
-}
-
-func GetAlertmanager(ctx context.Context, c client.Client) (*monitoringv1.Alertmanager, error) {
-	a := monitoringv1.Alertmanager{}
-	err := c.Get(ctx, client.ObjectKey{Name: monitor.CalicoNodeAlertmanager, Namespace: common.TigeraPrometheusNamespace}, &a)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &a, nil
-}
-
-func GetPrometheus(ctx context.Context, c client.Client) (*monitoringv1.Prometheus, error) {
-	p := monitoringv1.Prometheus{}
-	err := c.Get(ctx, client.ObjectKey{Name: monitor.CalicoNodePrometheus, Namespace: common.TigeraPrometheusNamespace}, &p)
-	if err != nil {
-		if errors.IsNotFound(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return &p, nil
 }
 
 // AddKubeProxyWatch creates a watch on the kube-proxy DaemonSet.
@@ -1081,7 +1063,11 @@ func MaintainInstallationFinalizer(
 		log.Error(err, "An error occurred when querying the Installation resource")
 		return finalizerSet, err
 	}
-	patchFrom := client.MergeFrom(installation.DeepCopy())
+	// Use optimistic locking so that concurrent finalizer patches from different controllers
+	// (e.g., whisker and goldmane) produce a conflict error instead of silently overwriting
+	// each other. JSON merge patch replaces the entire finalizers array, so without the lock
+	// the second writer wins and the first controller's finalizer is lost until re-reconciliation.
+	patchFrom := client.MergeFromWithOptions(installation.DeepCopy(), client.MergeFromWithOptimisticLock{})
 
 	// Determine the correct finalizers to apply to the Installation.
 	if mainResource != nil {
@@ -1143,6 +1129,22 @@ func AllPodsTerminated(ctx context.Context, c client.Client, obj client.Object) 
 		return false, err
 	}
 	return len(podList.Items) == 0, nil
+}
+
+func RestoreV3Metadata(obj client.Object) error {
+	if v3metaJSON, ok := obj.GetAnnotations()["projectcalico.org/metadata"]; ok {
+		v3meta := metav1.ObjectMeta{}
+		err := json.Unmarshal([]byte(v3metaJSON), &v3meta)
+		if err != nil {
+			return err
+		}
+
+		// Restore the v3 metadata we care about.
+		obj.SetLabels(v3meta.Labels)
+		obj.SetAnnotations(v3meta.Annotations)
+		log.V(1).Info("Restored v3 resource metadata", "labels", v3meta.Labels, "annotations", v3meta.Annotations)
+	}
+	return nil
 }
 
 // getMatchLabels extracts the matchLabels from the given workload object.

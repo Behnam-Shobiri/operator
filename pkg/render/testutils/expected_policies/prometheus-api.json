@@ -2,12 +2,12 @@
   "apiVersion": "projectcalico.org/v3",
   "kind": "NetworkPolicy",
   "metadata": {
-    "name": "allow-tigera.tigera-prometheus-api",
+    "name": "calico-system.tigera-prometheus-api",
     "namespace": "tigera-prometheus"
   },
   "spec": {
     "order": 1,
-    "tier": "allow-tigera",
+    "tier": "calico-system",
     "selector": "k8s-app == 'tigera-prometheus-api'",
     "types": [
       "Ingress",
@@ -30,7 +30,7 @@
         "protocol": "UDP",
         "destination": {
           "namespaceSelector": "projectcalico.org/name == 'kube-system'",
-          "selector": "k8s-app == 'kube-dns'",
+          "selector": "k8s-app in { 'kube-dns', 'coredns' }",
           "ports": [
             53
           ]

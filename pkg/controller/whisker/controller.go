@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@ import (
 	v1 "k8s.io/api/apps/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -28,8 +29,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
-	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	"github.com/tigera/operator/pkg/controller/options"
@@ -38,7 +39,6 @@ import (
 	"github.com/tigera/operator/pkg/controller/utils/imageset"
 	"github.com/tigera/operator/pkg/ctrlruntime"
 	"github.com/tigera/operator/pkg/dns"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rcertificatemanagement "github.com/tigera/operator/pkg/render/certificatemanagement"
 	"github.com/tigera/operator/pkg/render/goldmane"
@@ -55,7 +55,7 @@ var log = logf.Log.WithName(controllerName)
 
 // Add creates a new Reconciler Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and start it when the Manager is started.
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	statusManager := status.New(mgr.GetClient(), "whisker", opts.KubernetesVersion)
 	reconciler := newReconciler(mgr.GetClient(), mgr.GetScheme(), statusManager, opts.DetectedProvider, opts)
 
@@ -102,7 +102,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		return fmt.Errorf("whisker-controller failed to watch Tigerastatus: %w", err)
 	}
 
-	if err = c.WatchObject(&crdv1.ClusterInformation{}, &handler.EnqueueRequestForObject{}); err != nil {
+	if err = c.WatchObject(&v3.ClusterInformation{}, &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("whisker-controller failed to watch ClusterInformation")
 	}
 
@@ -121,7 +121,7 @@ func newReconciler(
 	schema *runtime.Scheme,
 	statusMgr status.StatusManager,
 	p operatorv1.Provider,
-	opts options.AddOptions,
+	opts options.ControllerOptions,
 ) *Reconciler {
 	c := &Reconciler{
 		cli:           cli,
@@ -171,10 +171,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 	// SetMetaData in the TigeraStatus such as observedGenerations.
 	defer r.status.SetMetaData(&whiskerCR.ObjectMeta)
 
-	variant, installation, err := utils.GetInstallation(ctx, r.cli)
+	variant, installationSpec, err := utils.GetInstallationSpec(ctx, r.cli)
 	if err != nil {
 		return reconcile.Result{}, err
-	} else if installation == nil {
+	} else if installationSpec == nil {
 		return reconcile.Result{}, nil
 	}
 
@@ -186,13 +186,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 		return reconcile.Result{}, nil
 	}
 
-	pullSecrets, err := utils.GetNetworkingPullSecrets(installation, r.cli)
+	pullSecrets, err := utils.GetInstallationPullSecrets(installationSpec, r.cli)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error retrieving pull secrets", err, reqLogger)
 		return reconcile.Result{}, err
 	}
 
-	certificateManager, err := certificatemanager.Create(r.cli, installation, r.clusterDomain, common.OperatorNamespace())
+	certificateManager, err := certificatemanager.Create(r.cli, installationSpec, r.clusterDomain, common.OperatorNamespace())
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the certificate manager", err, reqLogger)
 		return reconcile.Result{}, err
@@ -238,14 +238,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 	cfg := &whisker.Configuration{
 		PullSecrets:           pullSecrets,
 		OpenShift:             r.provider.IsOpenShift(),
-		Installation:          installation,
+		Installation:          installationSpec,
 		TrustedCertBundle:     trustedBundle,
 		WhiskerBackendKeyPair: backendKeyPair,
 		Whisker:               whiskerCR,
 		ClusterDomain:         r.clusterDomain,
 	}
 
-	clusterInfo := &crdv1.ClusterInformation{}
+	clusterInfo := &v3.ClusterInformation{}
 	err = r.cli.Get(ctx, utils.DefaultInstanceKey, clusterInfo)
 	if err != nil {
 		reqLogger.Info("Unable to retrieve ClusterInformation", "error", err)
@@ -286,7 +286,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 
 func updateWhiskerWithDefaults(instance *operatorv1.Whisker) {
 	if instance.Spec.Notifications == nil {
-		instance.Spec.Notifications = ptr.ToPtr(operatorv1.Enabled)
+		instance.Spec.Notifications = ptr.To(operatorv1.Enabled)
 	}
 }
 

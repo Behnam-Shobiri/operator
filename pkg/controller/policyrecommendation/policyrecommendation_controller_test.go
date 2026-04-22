@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/types"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
 	"github.com/tigera/operator/pkg/common"
@@ -43,6 +43,7 @@ import (
 	"github.com/tigera/operator/pkg/apis"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
+	"github.com/tigera/operator/pkg/controller/options"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
 	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
@@ -61,7 +62,7 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 	BeforeEach(func() {
 		// The schema contains all objects that should be known to the fake client when the test runs.
 		scheme = runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 		Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(batchv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -82,6 +83,8 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 		mockStatus.On("IsAvailable").Return(true)
 		mockStatus.On("OnCRFound").Return()
 		mockStatus.On("ClearDegraded")
+		mockStatus.On("SetWarning", mock.Anything, mock.Anything).Return()
+		mockStatus.On("ClearWarning", mock.Anything).Return()
 		mockStatus.On("SetDegraded", operatorv1.ResourceValidationError, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return().Maybe()
 		mockStatus.On("SetDegraded", operatorv1.ResourceReadError, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return().Maybe()
 		mockStatus.On("SetDegraded", operatorv1.ResourceUpdateError, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return().Maybe()
@@ -97,11 +100,13 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 		r = ReconcilePolicyRecommendation{
 			client:                   c,
 			scheme:                   scheme,
-			provider:                 operatorv1.ProviderNone,
 			status:                   mockStatus,
 			licenseAPIReady:          &utils.ReadyFlag{},
 			tierWatchReady:           &utils.ReadyFlag{},
 			policyRecScopeWatchReady: &utils.ReadyFlag{},
+			opts: options.ControllerOptions{
+				DetectedProvider: operatorv1.ProviderNone,
+			},
 		}
 
 		// We start off with a 'standard' installation, with nothing special
@@ -110,14 +115,14 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 			&operatorv1.Installation{
 				ObjectMeta: metav1.ObjectMeta{Name: "default"},
 				Spec: operatorv1.InstallationSpec{
-					Variant:  operatorv1.TigeraSecureEnterprise,
+					Variant:  operatorv1.CalicoEnterprise,
 					Registry: "some.registry.org/",
 					ImagePullSecrets: []corev1.LocalObjectReference{{
 						Name: "tigera-pull-secret",
 					}},
 				},
 				Status: operatorv1.InstallationStatus{
-					Variant: operatorv1.TigeraSecureEnterprise,
+					Variant: operatorv1.CalicoEnterprise,
 					Computed: &operatorv1.InstallationSpec{
 						Registry: "my-reg",
 						// The test is provider agnostic.
@@ -132,7 +137,7 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 			ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure"},
 			Status:     operatorv1.APIServerStatus{State: operatorv1.TigeraStatusReady},
 		})).NotTo(HaveOccurred())
-		Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+		Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})).NotTo(HaveOccurred())
 		Expect(c.Create(ctx, &v3.LicenseKey{
 			ObjectMeta: metav1.ObjectMeta{Name: "default"},
 			Status:     v3.LicenseKeyStatus{Features: []string{common.PolicyRecommendationFeature}},
@@ -226,7 +231,7 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 		})
 	})
 
-	Context("allow-tigera reconciliation", func() {
+	Context("calico-system reconciliation", func() {
 		var readyFlag *utils.ReadyFlag
 
 		BeforeEach(func() {
@@ -239,16 +244,18 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 			r = ReconcilePolicyRecommendation{
 				client:                   c,
 				scheme:                   scheme,
-				provider:                 operatorv1.ProviderNone,
 				status:                   mockStatus,
 				licenseAPIReady:          readyFlag,
 				tierWatchReady:           readyFlag,
 				policyRecScopeWatchReady: readyFlag,
+				opts: options.ControllerOptions{
+					DetectedProvider: operatorv1.ProviderNone,
+				},
 			}
 		})
 
-		It("should wait if allow-tigera tier is unavailable", func() {
-			test.DeleteAllowTigeraTierAndExpectWait(ctx, c, &r, mockStatus)
+		It("should wait if calico-system tier is unavailable", func() {
+			test.DeleteCalicoSystemTierAndExpectWait(ctx, c, &r, mockStatus)
 		})
 
 		It("should wait if tier watch is not ready", func() {
@@ -322,7 +329,7 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 			tenantBNamespace := "tenant-b"
 
 			BeforeEach(func() {
-				r.multiTenant = true
+				r.opts.MultiTenant = true
 			})
 
 			It("should reconcile both with and without namespace provided while namespaced policyrecommendations exist", func() {
@@ -470,7 +477,7 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 		BeforeEach(func() {
 			// The schema contains all objects that should be known to the fake client when the test runs.
 			scheme = runtime.NewScheme()
-			Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+			Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 			Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(batchv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -490,6 +497,8 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 			mockStatus.On("IsAvailable").Return(true)
 			mockStatus.On("OnCRFound").Return()
 			mockStatus.On("ClearDegraded")
+			mockStatus.On("SetWarning", mock.Anything, mock.Anything).Return()
+			mockStatus.On("ClearWarning", mock.Anything).Return()
 			mockStatus.On("SetDegraded", operatorv1.ResourceValidationError, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return().Maybe()
 			mockStatus.On("SetDegraded", operatorv1.ResourceReadError, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return().Maybe()
 			mockStatus.On("SetDegraded", operatorv1.ResourceUpdateError, mock.AnythingOfType("string"), mock.Anything, mock.Anything).Return().Maybe()
@@ -505,11 +514,13 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 			r := &ReconcilePolicyRecommendation{
 				client:                   c,
 				scheme:                   scheme,
-				provider:                 operatorv1.ProviderNone,
 				status:                   mockStatus,
 				licenseAPIReady:          &utils.ReadyFlag{},
 				tierWatchReady:           &utils.ReadyFlag{},
 				policyRecScopeWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					DetectedProvider: operatorv1.ProviderNone,
+				},
 			}
 
 			// Create a new context.
@@ -545,7 +556,9 @@ var _ = Describe("PolicyRecommendation controller tests", func() {
 				policyRecScopeWatchReady: &utils.ReadyFlag{},
 
 				// Set the provider to OpenShift.
-				provider: operatorv1.ProviderOpenShift,
+				opts: options.ControllerOptions{
+					DetectedProvider: operatorv1.ProviderOpenShift,
+				},
 			}
 
 			// Create a new context.

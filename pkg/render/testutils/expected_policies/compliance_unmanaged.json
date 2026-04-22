@@ -2,12 +2,12 @@
   "apiVersion": "projectcalico.org/v3",
   "kind": "NetworkPolicy",
   "metadata": {
-    "name": "allow-tigera.compliance-access",
+    "name": "calico-system.compliance-access",
     "namespace": "tigera-compliance"
   },
   "spec": {
     "order": 1,
-    "tier": "allow-tigera",
+    "tier": "calico-system",
     "selector": "k8s-app == 'compliance-benchmarker' || k8s-app == 'compliance-controller' || k8s-app == 'compliance-snapshotter' || k8s-app == 'compliance-reporter'",
     "types": [
       "Egress"
@@ -28,7 +28,7 @@
         "protocol": "UDP",
         "destination": {
           "namespaceSelector": "projectcalico.org/name == 'kube-system'",
-          "selector": "k8s-app == 'kube-dns'",
+          "selector": "k8s-app in { 'kube-dns', 'coredns' }",
           "ports": [
             53
           ]

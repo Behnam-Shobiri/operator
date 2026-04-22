@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -69,7 +69,7 @@ type LinseedSubController struct {
 	elasticExternal bool
 }
 
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	if !opts.EnterpriseCRDExists {
 		return nil
 	}
@@ -171,7 +171,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		return fmt.Errorf("log-storage-access-controller failed to watch the Service resource: %w", err)
 	}
 
-	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, opts.K8sClientset, log, r.tierWatchReady)
+	go utils.WaitToAddTierWatch(networkpolicy.CalicoTierName, c, opts.K8sClientset, log, r.tierWatchReady)
 	go utils.WaitToAddNetworkPolicyWatches(c, opts.K8sClientset, log, []types.NamespacedName{
 		{Name: linseed.PolicyName, Namespace: helper.InstallNamespace()},
 	})
@@ -216,7 +216,7 @@ func (r *LinseedSubController) Reconcile(ctx context.Context, request reconcile.
 
 	// Get LogStorage resource.
 	logStorage := &operatorv1.LogStorage{}
-	key := utils.DefaultTSEEInstanceKey
+	key := utils.DefaultEnterpriseInstanceKey
 	err = r.client.Get(ctx, key, logStorage)
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -237,7 +237,7 @@ func (r *LinseedSubController) Reconcile(ctx context.Context, request reconcile.
 	}
 
 	// Get Installation resource.
-	variant, install, err := utils.GetInstallation(context.Background(), r.client)
+	variant, installationSpec, err := utils.GetInstallationSpec(context.Background(), r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotFound, "Installation not found", err, reqLogger)
@@ -258,13 +258,13 @@ func (r *LinseedSubController) Reconcile(ctx context.Context, request reconcile.
 		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
-	// Ensure the allow-tigera tier exists, before rendering any network policies within it.
-	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.TigeraComponentTierName}, &v3.Tier{}); err != nil {
+	// Ensure the calico-system tier exists, before rendering any network policies within it.
+	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.CalicoTierName}, &v3.Tier{}); err != nil {
 		if errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for allow-tigera tier to be created, see the 'tiers' TigeraStatus for more information", err, reqLogger)
+			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for calico-system tier to be created, see the 'tiers' TigeraStatus for more information", err, reqLogger)
 			return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 		} else {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying allow-tigera tier", err, reqLogger)
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying calico-system tier", err, reqLogger)
 			return reconcile.Result{}, err
 		}
 	}
@@ -288,7 +288,7 @@ func (r *LinseedSubController) Reconcile(ctx context.Context, request reconcile.
 		return reconcile.Result{}, err
 	}
 
-	pullSecrets, err := utils.GetNetworkingPullSecrets(install, r.client)
+	pullSecrets, err := utils.GetInstallationPullSecrets(installationSpec, r.client)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "An error occurring while retrieving the pull secrets", err, reqLogger)
 		return reconcile.Result{}, err
@@ -357,7 +357,7 @@ func (r *LinseedSubController) Reconcile(ctx context.Context, request reconcile.
 		certificatemanager.WithLogger(reqLogger),
 		certificatemanager.WithTenant(tenant),
 	}
-	cm, err := certificatemanager.Create(r.client, install, r.clusterDomain, helper.TruthNamespace(), opts...)
+	cm, err := certificatemanager.Create(r.client, installationSpec, r.clusterDomain, helper.TruthNamespace(), opts...)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the Tigera CA", err, reqLogger)
 		return reconcile.Result{}, err
@@ -429,7 +429,7 @@ func (r *LinseedSubController) Reconcile(ctx context.Context, request reconcile.
 		Namespace:       helper.InstallNamespace(),
 	})
 	cfg := &linseed.Config{
-		Installation:                   install,
+		Installation:                   installationSpec,
 		PullSecrets:                    pullSecrets,
 		Namespace:                      helper.InstallNamespace(),
 		BindNamespaces:                 bindNamespaces,

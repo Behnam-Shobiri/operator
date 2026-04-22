@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,8 +22,7 @@ import (
 	"strings"
 	"time"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/gstruct"
 
@@ -50,7 +49,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	netv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -58,6 +56,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	apiregv1 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -68,7 +67,6 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 		instance           *operatorv1.InstallationSpec
 		apiserver          *operatorv1.APIServerSpec
 		managementCluster  = &operatorv1.ManagementCluster{Spec: operatorv1.ManagementClusterSpec{Address: "example.com:1234"}}
-		replicas           int32
 		cfg                *render.APIServerConfiguration
 		trustedBundle      certificatemanagement.TrustedBundle
 		dnsNames           []string
@@ -79,14 +77,14 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 
 	BeforeEach(func() {
 		instance = &operatorv1.InstallationSpec{
-			ControlPlaneReplicas: &replicas,
+			ControlPlaneReplicas: ptr.To(int32(2)),
 			Registry:             "testregistry.com/",
-			Variant:              operatorv1.TigeraSecureEnterprise,
+			Variant:              operatorv1.CalicoEnterprise,
 		}
 		apiserver = &operatorv1.APIServerSpec{}
 		dnsNames = dns.GetServiceDNSNames(render.APIServerServiceName, render.APIServerNamespace, clusterDomain)
 		scheme := runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 
 		cli = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 		certificateManager, err = certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
@@ -96,15 +94,15 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		trustedBundle = certificatemanagement.CreateTrustedBundle(nil)
-		replicas = 2
 
 		cfg = &render.APIServerConfiguration{
-			K8SServiceEndpoint: k8sapi.ServiceEndpoint{},
-			Installation:       instance,
-			APIServer:          apiserver,
-			OpenShift:          true,
-			TLSKeyPair:         kp,
-			TrustedBundle:      trustedBundle,
+			RequiresAggregationServer: true,
+			K8SServiceEndpoint:        k8sapi.ServiceEndpoint{},
+			Installation:              instance,
+			APIServer:                 apiserver,
+			OpenShift:                 true,
+			TLSKeyPair:                kp,
+			TrustedBundle:             trustedBundle,
 			KubernetesVersion: &common.VersionInfo{
 				Major: 1,
 				Minor: 31,
@@ -251,7 +249,7 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 		))
 		Expect(d.Spec.Template.Spec.Containers[1].Args).To(BeEmpty())
 
-		Expect(d.Spec.Template.Spec.Containers[1].Env).To(HaveLen(6))
+		Expect(d.Spec.Template.Spec.Containers[1].Env).To(HaveLen(10))
 
 		Expect(d.Spec.Template.Spec.Containers[1].Env[0].Name).To(Equal("DATASTORE_TYPE"))
 		Expect(d.Spec.Template.Spec.Containers[1].Env[0].Value).To(Equal("kubernetes"))
@@ -267,9 +265,17 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 		Expect(d.Spec.Template.Spec.Containers[1].Env[3].ValueFrom).To(BeNil())
 		Expect(d.Spec.Template.Spec.Containers[1].Env[4].Name).To(Equal("TRUSTED_BUNDLE_PATH"))
 		Expect(d.Spec.Template.Spec.Containers[1].Env[4].Value).To(Equal("/etc/pki/tls/certs/tigera-ca-bundle.crt"))
-		Expect(d.Spec.Template.Spec.Containers[1].Env[5].Name).To(Equal("LOGLEVEL"))
-		Expect(d.Spec.Template.Spec.Containers[1].Env[5].Value).To(Equal("info"))
-		Expect(d.Spec.Template.Spec.Containers[1].Env[5].ValueFrom).To(BeNil())
+		Expect(d.Spec.Template.Spec.Containers[1].Env[5].Name).To(Equal("LINSEED_URL"))
+		Expect(d.Spec.Template.Spec.Containers[1].Env[5].Value).To(Equal("https://tigera-linseed.tigera-elasticsearch.svc"))
+		Expect(d.Spec.Template.Spec.Containers[1].Env[6].Name).To(Equal("LINSEED_CLIENT_CERT"))
+		Expect(d.Spec.Template.Spec.Containers[1].Env[6].Value).To(Equal("/calico-apiserver-certs/tls.crt"))
+		Expect(d.Spec.Template.Spec.Containers[1].Env[7].Name).To(Equal("LINSEED_CLIENT_KEY"))
+		Expect(d.Spec.Template.Spec.Containers[1].Env[7].Value).To(Equal("/calico-apiserver-certs/tls.key"))
+		Expect(d.Spec.Template.Spec.Containers[1].Env[8].Name).To(Equal("LINSEED_CA"))
+		Expect(d.Spec.Template.Spec.Containers[1].Env[8].Value).To(Equal("/etc/pki/tls/certs/tigera-ca-bundle.crt"))
+		Expect(d.Spec.Template.Spec.Containers[1].Env[9].Name).To(Equal("LOGLEVEL"))
+		Expect(d.Spec.Template.Spec.Containers[1].Env[9].Value).To(Equal("info"))
+		Expect(d.Spec.Template.Spec.Containers[1].Env[9].ValueFrom).To(BeNil())
 
 		// Expect the SECURITY_GROUP env variables to not be set
 		Expect(d.Spec.Template.Spec.Containers[1].Env).NotTo(ContainElement(gstruct.MatchFields(gstruct.IgnoreExtras, gstruct.Fields{"Name": Equal("TIGERA_DEFAULT_SECURITY_GROUPS")})))
@@ -378,6 +384,35 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 		Entry("custom cluster domain", "custom-domain.internal"),
 	)
 
+	It("should render resources without an aggregation server", func() {
+		cfg.RequiresAggregationServer = false
+
+		component, err := render.APIServer(cfg)
+		Expect(err).To(BeNil(), "Expected APIServer to create successfully %s", err)
+		resources, _ := component.Objects()
+
+		expectedResources := []client.Object{
+			&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "tigera-ca-bundle", Namespace: "calico-system"}, TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: "v1"}},
+			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver", Namespace: "calico-system"}, TypeMeta: metav1.TypeMeta{Kind: "ServiceAccount", APIVersion: "v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "calico-crds"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver-access-calico-crds"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "calico-tier-getter"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "calico-tier-getter"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver-delegate-auth"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver", Namespace: "calico-system"}, TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"}},
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "calico-api", Namespace: "calico-system"}, TypeMeta: metav1.TypeMeta{Kind: "Service", APIVersion: "v1"}},
+			&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver", Namespace: "calico-system"}, TypeMeta: metav1.TypeMeta{Kind: "PodDisruptionBudget", APIVersion: "policy/v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "tigera-ui-user"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "tigera-network-admin"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "calico-webhook-reader"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
+			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver-webhook-reader"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
+		}
+
+		rtest.ExpectResources(resources, expectedResources)
+	})
+
 	It("should render L7 Admission Controller with default config when SidecarInjection is Enabled", func() {
 		sidecarEnabled := operatorv1.SidecarEnabled
 		cfg.ApplicationLayer = &operatorv1.ApplicationLayer{
@@ -454,7 +489,7 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 
 	It("should render SecurityContextConstrains properly when provider is OpenShift", func() {
 		cfg.Installation.KubernetesProvider = operatorv1.ProviderOpenShift
-		cfg.Installation.Variant = operatorv1.TigeraSecureEnterprise
+		cfg.Installation.Variant = operatorv1.CalicoEnterprise
 		component, err := render.APIServer(cfg)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(component.ResolveImages(nil)).To(BeNil())
@@ -466,6 +501,11 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 			Resources:     []string{"securitycontextconstraints"},
 			Verbs:         []string{"use"},
 			ResourceNames: []string{"privileged"},
+		}))
+		Expect(role.Rules).To(ContainElement(rbacv1.PolicyRule{
+			APIGroups: []string{"config.openshift.io"},
+			Resources: []string{"infrastructures"},
+			Verbs:     []string{"get", "list", "watch"},
 		}))
 	})
 
@@ -733,8 +773,8 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 
 		component := render.APIServerPolicy(cfg)
 		resources, _ := component.Objects()
-		policyName := types.NamespacedName{Name: "allow-tigera.apiserver-access", Namespace: "calico-system"}
-		policy := testutils.GetAllowTigeraPolicyFromResources(policyName, resources)
+		policyName := types.NamespacedName{Name: "calico-system.apiserver-access", Namespace: "calico-system"}
+		policy := testutils.GetCalicoSystemPolicyFromResources(policyName, resources)
 		Expect(policy).ToNot(BeNil())
 		Expect(policy.Spec).ToNot(BeNil())
 		Expect(policy.Spec.Egress).ToNot(BeNil())
@@ -755,8 +795,8 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 
 		component := render.APIServerPolicy(cfg)
 		resources, _ := component.Objects()
-		policyName := types.NamespacedName{Name: "allow-tigera.apiserver-access", Namespace: "calico-system"}
-		policy := testutils.GetAllowTigeraPolicyFromResources(policyName, resources)
+		policyName := types.NamespacedName{Name: "calico-system.apiserver-access", Namespace: "calico-system"}
+		policy := testutils.GetCalicoSystemPolicyFromResources(policyName, resources)
 		Expect(policy).ToNot(BeNil())
 		Expect(policy.Spec).ToNot(BeNil())
 		Expect(policy.Spec.Egress).ToNot(BeNil())
@@ -788,8 +828,8 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 	})
 
 	It("should set KUBERENETES_SERVICE_... variables if not host networked on Docker EE with non-proxy address", func() {
-		cfg.K8SServiceEndpoint.Host = "k8shost"
-		cfg.K8SServiceEndpoint.Port = "1234"
+		cfg.K8SServiceEndpointPodNetwork.Host = "k8shost"
+		cfg.K8SServiceEndpointPodNetwork.Port = "1234"
 		cfg.Installation.KubernetesProvider = operatorv1.ProviderDockerEE
 
 		component, err := render.APIServer(cfg)
@@ -945,6 +985,24 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 		Expect((dep.(*appsv1.Deployment)).Spec.Template.Spec.Containers[0].Args).To(ContainElement(fmt.Sprintf("--tunnelSecretName=%s", render.ManagerTLSSecretName)))
 	})
 
+	It("should pass tunnelSecretName when TLS secret is not manager-tls", func() {
+		cfg.ManagementCluster = managementCluster
+		cfg.ManagementCluster.Spec.TLS = &operatorv1.TLS{
+			SecretName: render.VoltronTunnelSecretName,
+		}
+		component, err := render.APIServer(cfg)
+		Expect(err).To(BeNil(), "Expected APIServer to create successfully %s", err)
+
+		resources, _ := component.Objects()
+
+		dep := rtest.GetResource(resources, "calico-apiserver", "calico-system", "apps", "v1", "Deployment")
+		Expect(dep).ToNot(BeNil())
+
+		args := (dep.(*appsv1.Deployment)).Spec.Template.Spec.Containers[0].Args
+		Expect(args).To(ContainElement(fmt.Sprintf("--tunnelSecretName=%s", render.VoltronTunnelSecretName)))
+		Expect(args).ToNot(ContainElement("--managementClusterCAType=Public"))
+	})
+
 	It("should add an init container if certificate management is enabled", func() {
 		cfg.Installation.CertificateManagement = &operatorv1.CertificateManagement{SignerName: "a.b/c", CACert: cfg.TLSKeyPair.GetCertificatePEM()}
 		certificateManager, err := certificatemanager.Create(cli, cfg.Installation, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
@@ -999,8 +1057,7 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 	})
 
 	It("should not render PodAffinity when ControlPlaneReplicas is 1", func() {
-		var replicas int32 = 1
-		cfg.Installation.ControlPlaneReplicas = &replicas
+		cfg.Installation.ControlPlaneReplicas = ptr.To(int32(1))
 		component, err := render.APIServer(cfg)
 		Expect(err).To(BeNil(), "Expected APIServer to create successfully %s", err)
 		resources, _ := component.Objects()
@@ -1011,8 +1068,7 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 	})
 
 	It("should render PodAffinity when ControlPlaneReplicas is greater than 1", func() {
-		var replicas int32 = 2
-		cfg.Installation.ControlPlaneReplicas = &replicas
+		cfg.Installation.ControlPlaneReplicas = ptr.To(int32(2))
 		component, err := render.APIServer(cfg)
 		Expect(err).To(BeNil(), "Expected APIServer to create successfully %s", err)
 		resources, _ := component.Objects()
@@ -1023,11 +1079,11 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 		Expect(deploy.Spec.Template.Spec.Affinity).To(Equal(podaffinity.NewPodAntiAffinity("calico-apiserver", []string{"calico-system", "tigera-system", "calico-apiserver"})))
 	})
 
-	Context("allow-tigera rendering", func() {
-		policyName := types.NamespacedName{Name: "allow-tigera.apiserver-access", Namespace: "calico-system"}
+	Context("calico-system rendering", func() {
+		policyName := types.NamespacedName{Name: "calico-system.apiserver-access", Namespace: "calico-system"}
 
-		DescribeTable("should render allow-tigera policy",
-			func(scenario testutils.AllowTigeraScenario) {
+		DescribeTable("should render calico-system policy",
+			func(scenario testutils.CalicoSystemScenario) {
 				cfg.OpenShift = scenario.OpenShift
 				if scenario.ManagedCluster {
 					cfg.ManagementClusterConnection = &operatorv1.ManagementClusterConnection{}
@@ -1038,14 +1094,14 @@ var _ = Describe("API server rendering tests (Calico Enterprise)", func() {
 				component := render.APIServerPolicy(cfg)
 				resources, _ := component.Objects()
 
-				policy := testutils.GetAllowTigeraPolicyFromResources(policyName, resources)
+				policy := testutils.GetCalicoSystemPolicyFromResources(policyName, resources)
 				expectedPolicy := testutils.SelectPolicyByProvider(scenario, apiServerPolicy, apiServerPolicyForOCP)
 				Expect(policy).To(Equal(expectedPolicy))
 			},
-			Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false}),
-			Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true}),
-			Entry("for managed, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: true, OpenShift: false}),
-			Entry("for managed, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: true, OpenShift: true}),
+			Entry("for management/standalone, kube-dns", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: false}),
+			Entry("for management/standalone, openshift-dns", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: true}),
+			Entry("for managed, kube-dns", testutils.CalicoSystemScenario{ManagedCluster: true, OpenShift: false}),
+			Entry("for managed, openshift-dns", testutils.CalicoSystemScenario{ManagedCluster: true, OpenShift: true}),
 		)
 	})
 
@@ -1404,7 +1460,7 @@ func validateTunnelSecret(voltronSecret *corev1.Secret) {
 	opts = x509.VerifyOptions{
 		DNSName:     "voltron",
 		Roots:       x509.NewCertPool(),
-		CurrentTime: time.Now().AddDate(0, 0, crypto.DefaultCACertificateLifetimeInDays+1),
+		CurrentTime: time.Now().Add(crypto.DefaultCACertificateLifetimeDuration + 24*time.Hour),
 	}
 	_, err = newCert.Verify(opts)
 	Expect(err).Should(HaveOccurred())
@@ -1520,11 +1576,6 @@ var (
 			Verbs: []string{"get", "watch", "list"},
 		},
 		{
-			APIGroups: []string{"projectcalico.org"},
-			Resources: []string{"authorizationreviews"},
-			Verbs:     []string{"create"},
-		},
-		{
 			APIGroups:     []string{"projectcalico.org"},
 			Resources:     []string{"uisettingsgroups"},
 			Verbs:         []string{"get"},
@@ -1571,7 +1622,7 @@ var (
 			Verbs:     []string{"get", "list"},
 		},
 		{
-			APIGroups: []string{"crd.projectcalico.org"},
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 			Resources: []string{"securityeventwebhooks"},
 			Verbs:     []string{"get", "list"},
 		},
@@ -1686,11 +1737,6 @@ var (
 			Verbs: []string{"create", "update", "delete", "patch", "get", "watch", "list"},
 		},
 		{
-			APIGroups: []string{"projectcalico.org"},
-			Resources: []string{"authorizationreviews"},
-			Verbs:     []string{"create"},
-		},
-		{
 			APIGroups:     []string{"projectcalico.org"},
 			Resources:     []string{"uisettingsgroups"},
 			Verbs:         []string{"get", "patch", "update"},
@@ -1731,7 +1777,7 @@ var (
 			Verbs:     []string{"get", "list"},
 		},
 		{
-			APIGroups: []string{"crd.projectcalico.org"},
+			APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 			Resources: []string{"securityeventwebhooks"},
 			Verbs:     []string{"get", "list", "update", "patch", "create", "delete"},
 		},
@@ -1752,20 +1798,19 @@ var (
 var _ = Describe("API server rendering tests (Calico)", func() {
 	var instance *operatorv1.InstallationSpec
 	var apiserver *operatorv1.APIServerSpec
-	var replicas int32
 	var cfg *render.APIServerConfiguration
 	var certificateManager certificatemanager.CertificateManager
 	var cli client.Client
 
 	BeforeEach(func() {
 		instance = &operatorv1.InstallationSpec{
-			ControlPlaneReplicas: &replicas,
+			ControlPlaneReplicas: ptr.To(int32(2)),
 			Registry:             "testregistry.com/",
 			Variant:              operatorv1.Calico,
 		}
 		apiserver = &operatorv1.APIServerSpec{}
 		scheme := runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 		cli = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 		var err error
 		certificateManager, err = certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
@@ -1773,13 +1818,14 @@ var _ = Describe("API server rendering tests (Calico)", func() {
 		dnsNames := dns.GetServiceDNSNames(render.APIServerServiceName, render.APIServerNamespace, clusterDomain)
 		kp, err := certificateManager.GetOrCreateKeyPair(cli, render.CalicoAPIServerTLSSecretName, common.OperatorNamespace(), dnsNames)
 		Expect(err).NotTo(HaveOccurred())
-		replicas = 2
+
 		cfg = &render.APIServerConfiguration{
-			K8SServiceEndpoint: k8sapi.ServiceEndpoint{},
-			Installation:       instance,
-			APIServer:          apiserver,
-			OpenShift:          true,
-			TLSKeyPair:         kp,
+			RequiresAggregationServer: true,
+			K8SServiceEndpoint:        k8sapi.ServiceEndpoint{},
+			Installation:              instance,
+			APIServer:                 apiserver,
+			OpenShift:                 true,
+			TLSKeyPair:                kp,
 		}
 	})
 
@@ -1802,7 +1848,6 @@ var _ = Describe("API server rendering tests (Calico)", func() {
 			&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver", Namespace: "calico-system"}, TypeMeta: metav1.TypeMeta{Kind: "PodDisruptionBudget", APIVersion: "policy/v1"}},
 			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "calico-webhook-reader"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
 			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver-webhook-reader"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
-			&netv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-apiserver", Namespace: "calico-system"}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "networking.k8s.io/v1"}},
 		}
 
 		dnsNames := dns.GetServiceDNSNames(render.APIServerServiceName, render.APIServerNamespace, clusterDomain)
@@ -1813,34 +1858,29 @@ var _ = Describe("API server rendering tests (Calico)", func() {
 		Expect(err).To(BeNil(), "Expected APIServer to create successfully %s", err)
 		Expect(component.ResolveImages(nil)).To(BeNil())
 
-		resources, _ := component.Objects()
+		resources, deleteResources := component.Objects()
 
 		rtest.ExpectResources(resources, expectedResources)
+		rtest.ExpectResourceInList(deleteResources, "allow-apiserver", "calico-system", "networking.k8s.io", "v1", "NetworkPolicy")
 
 		apiService, ok := rtest.GetResource(resources, "v3.projectcalico.org", "", "apiregistration.k8s.io", "v1", "APIService").(*apiregv1.APIService)
 		Expect(ok).To(BeTrue(), "Expected v1.APIService")
 		verifyAPIService(apiService, false, clusterDomain)
 
 		d := rtest.GetResource(resources, "calico-apiserver", "calico-system", "apps", "v1", "Deployment").(*appsv1.Deployment)
-
 		Expect(d.Name).To(Equal("calico-apiserver"))
 		Expect(len(d.Labels)).To(Equal(1))
 		Expect(d.Labels).To(HaveKeyWithValue("apiserver", "true"))
-
 		Expect(*d.Spec.Replicas).To(BeEquivalentTo(2))
 		Expect(d.Spec.Strategy.Type).To(Equal(appsv1.RollingUpdateDeploymentStrategyType))
 		Expect(len(d.Spec.Selector.MatchLabels)).To(Equal(1))
 		Expect(d.Spec.Selector.MatchLabels).To(HaveKeyWithValue("apiserver", "true"))
-
 		Expect(d.Spec.Template.Name).To(Equal("calico-apiserver"))
 		Expect(d.Spec.Template.Namespace).To(Equal("calico-system"))
 		Expect(len(d.Spec.Template.Labels)).To(Equal(1))
 		Expect(d.Spec.Template.Labels).To(HaveKeyWithValue("apiserver", "true"))
-
 		Expect(d.Spec.Template.Spec.ServiceAccountName).To(Equal("calico-apiserver"))
-
 		Expect(d.Spec.Template.Spec.Tolerations).To(ConsistOf(rmeta.TolerateControlPlane))
-
 		Expect(d.Spec.Template.Spec.ImagePullSecrets).To(BeEmpty())
 		Expect(len(d.Spec.Template.Spec.Containers)).To(Equal(1))
 		Expect(d.Spec.Template.Spec.Containers[0].Name).To(Equal("calico-apiserver"))
@@ -1907,6 +1947,31 @@ var _ = Describe("API server rendering tests (Calico)", func() {
 		Entry("custom cluster domain", "custom-domain.internal"),
 	)
 
+	It("should not render deployment for OSS without aggregation server", func() {
+		cfg.RequiresAggregationServer = false
+
+		component, err := render.APIServer(cfg)
+		Expect(err).To(BeNil(), "Expected APIServer to create successfully %s", err)
+		Expect(component.ResolveImages(nil)).To(BeNil())
+		resources, deleteResources := component.Objects()
+
+		// Should not include deployment, service, SA, or PDB.
+		Expect(rtest.GetResource(resources, "calico-apiserver", "calico-system", "apps", "v1", "Deployment")).To(BeNil())
+		Expect(rtest.GetResource(resources, "calico-api", "calico-system", "", "v1", "Service")).To(BeNil())
+		Expect(rtest.GetResource(resources, "calico-apiserver", "calico-system", "", "v1", "ServiceAccount")).To(BeNil())
+		Expect(rtest.GetResource(resources, "calico-apiserver", "calico-system", "policy", "v1", "PodDisruptionBudget")).To(BeNil())
+
+		// Should still include RBAC.
+		Expect(rtest.GetResource(resources, "calico-crds", "", "rbac.authorization.k8s.io", "v1", "ClusterRole")).ToNot(BeNil())
+		Expect(rtest.GetResource(resources, "calico-webhook-reader", "", "rbac.authorization.k8s.io", "v1", "ClusterRole")).ToNot(BeNil())
+
+		// Deployment and related objects should be in the delete list.
+		rtest.ExpectResourceInList(deleteResources, "calico-apiserver", "calico-system", "", "v1", "ServiceAccount")
+		rtest.ExpectResourceInList(deleteResources, "calico-apiserver", "calico-system", "apps", "v1", "Deployment")
+		rtest.ExpectResourceInList(deleteResources, "calico-api", "calico-system", "", "v1", "Service")
+		rtest.ExpectResourceInList(deleteResources, "calico-apiserver", "calico-system", "policy", "v1", "PodDisruptionBudget")
+	})
+
 	It("should render an API server with custom configuration", func() {
 		expectedResources := []client.Object{
 			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver", Namespace: "calico-system"}, TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ServiceAccount"}},
@@ -1926,13 +1991,12 @@ var _ = Describe("API server rendering tests (Calico)", func() {
 			&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver", Namespace: "calico-system"}, TypeMeta: metav1.TypeMeta{APIVersion: "policy/v1", Kind: "PodDisruptionBudget"}},
 			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "calico-webhook-reader"}, TypeMeta: metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"}},
 			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "calico-apiserver-webhook-reader"}, TypeMeta: metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"}},
-			&netv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-apiserver", Namespace: "calico-system"}, TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"}},
 		}
 
 		component, err := render.APIServer(cfg)
 		Expect(err).To(BeNil(), "Expected APIServer to create successfully %s", err)
 		Expect(component.ResolveImages(nil)).To(BeNil())
-		resources, _ := component.Objects()
+		resources, deleteResources := component.Objects()
 
 		// Should render the correct resources.
 		By("Checking each expected resource is actually rendered")
@@ -1946,6 +2010,8 @@ var _ = Describe("API server rendering tests (Calico)", func() {
 			gvk := r.GetObjectKind().GroupVersionKind()
 			rtest.ExpectResourceInList(expectedResources, r.GetName(), r.GetNamespace(), gvk.Group, gvk.Version, gvk.Kind)
 		}
+
+		rtest.ExpectResourceInList(deleteResources, "allow-apiserver", "calico-system", "networking.k8s.io", "v1", "NetworkPolicy")
 
 		// Expect same number as above
 		Expect(len(resources)).To(Equal(len(expectedResources)))
@@ -2032,9 +2098,9 @@ var _ = Describe("API server rendering tests (Calico)", func() {
 		rtest.ExpectNoK8sServiceEpEnvVars(deployment.Spec.Template.Spec)
 	})
 
-	It("should not set KUBERNETES_SERVICE_... variables if Docker EE using non-proxy address", func() {
-		cfg.K8SServiceEndpoint.Host = "k8shost"
-		cfg.K8SServiceEndpoint.Port = "1234"
+	It("should set KUBERNETES_SERVICE_... variables if Docker EE using non-proxy address", func() {
+		cfg.K8SServiceEndpointPodNetwork.Host = "k8shost"
+		cfg.K8SServiceEndpointPodNetwork.Port = "1234"
 		cfg.Installation.KubernetesProvider = operatorv1.ProviderDockerEE
 
 		component, err := render.APIServer(cfg)
@@ -2352,9 +2418,9 @@ var _ = Describe("API server rendering tests (Calico)", func() {
 			cfg.MultiTenant = true
 			cfg.ManagementCluster = &operatorv1.ManagementCluster{Spec: operatorv1.ManagementClusterSpec{Address: "example.com:1234"}}
 			cfg.Installation = &operatorv1.InstallationSpec{
-				ControlPlaneReplicas: &replicas,
+				ControlPlaneReplicas: ptr.To(int32(2)),
 				Registry:             "testregistry.com/",
-				Variant:              operatorv1.TigeraSecureEnterprise,
+				Variant:              operatorv1.CalicoEnterprise,
 			}
 		})
 

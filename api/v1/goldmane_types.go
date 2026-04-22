@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +24,7 @@ import (
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
 
+// +kubebuilder:validation:XValidation:rule="self.metadata.name == 'default'", message="resource name must be 'default'"
 type Goldmane struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -35,6 +36,12 @@ type Goldmane struct {
 
 type GoldmaneSpec struct {
 	GoldmaneDeployment *GoldmaneDeployment `json:"goldmaneDeployment,omitempty"`
+
+	// MetricsPort configures the port that Goldmane uses to serve Prometheus metrics.
+	// When set to a non-zero value, Goldmane will expose a /metrics endpoint on the given port.
+	// Set to zero to disable metrics. If omitted, metrics are disabled.
+	// +optional
+	MetricsPort *int32 `json:"metricsPort,omitempty"`
 }
 
 // +kubebuilder:object:root=true

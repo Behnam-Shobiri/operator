@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -64,7 +64,7 @@ type ESKubeControllersController struct {
 	tierWatchReady  *utils.ReadyFlag
 }
 
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	if !opts.EnterpriseCRDExists {
 		return nil
 	}
@@ -166,7 +166,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	})
 
 	// Start goroutines to establish watches against projectcalico.org/v3 resources.
-	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, opts.K8sClientset, log, r.tierWatchReady)
+	go utils.WaitToAddTierWatch(networkpolicy.CalicoTierName, c, opts.K8sClientset, log, r.tierWatchReady)
 	go utils.WaitToAddNetworkPolicyWatches(c, opts.K8sClientset, log, []types.NamespacedName{
 		{Name: kubecontrollers.EsKubeControllerNetworkPolicyName, Namespace: esKubeControllersNamespace.InstallNamespace()},
 	})
@@ -181,7 +181,7 @@ func (r *ESKubeControllersController) Reconcile(ctx context.Context, request rec
 
 	// Get LogStorage resource.
 	logStorage := &operatorv1.LogStorage{}
-	key := utils.DefaultTSEEInstanceKey
+	key := utils.DefaultEnterpriseInstanceKey
 	err := r.client.Get(ctx, key, logStorage)
 	if err != nil {
 		if errors.IsNotFound(err) {
@@ -202,7 +202,7 @@ func (r *ESKubeControllersController) Reconcile(ctx context.Context, request rec
 	}
 
 	// Get Installation resource.
-	variant, install, err := utils.GetInstallation(context.Background(), r.client)
+	variant, installationSpec, err := utils.GetInstallationSpec(context.Background(), r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotFound, "Installation not found", err, reqLogger)
@@ -218,13 +218,13 @@ func (r *ESKubeControllersController) Reconcile(ctx context.Context, request rec
 		return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 	}
 
-	// Ensure the allow-tigera tier exists, before rendering any network policies within it.
-	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.TigeraComponentTierName}, &v3.Tier{}); err != nil {
+	// Ensure the calico-system tier exists, before rendering any network policies within it.
+	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.CalicoTierName}, &v3.Tier{}); err != nil {
 		if errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for allow-tigera tier to be created, see the 'tiers' TigeraStatus for more information", err, reqLogger)
+			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for calico-system tier to be created, see the 'tiers' TigeraStatus for more information", err, reqLogger)
 			return reconcile.Result{RequeueAfter: 10 * time.Second}, nil
 		} else {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying allow-tigera tier", err, reqLogger)
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying calico-system tier", err, reqLogger)
 			return reconcile.Result{}, err
 		}
 	}
@@ -272,7 +272,7 @@ func (r *ESKubeControllersController) Reconcile(ctx context.Context, request rec
 	opts := []certificatemanager.Option{
 		certificatemanager.WithLogger(reqLogger),
 	}
-	cm, err := certificatemanager.Create(r.client, install, r.clusterDomain, helper.TruthNamespace(), opts...)
+	cm, err := certificatemanager.Create(r.client, installationSpec, r.clusterDomain, helper.TruthNamespace(), opts...)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to load CA", err, reqLogger)
 		return reconcile.Result{}, err
@@ -287,7 +287,7 @@ func (r *ESKubeControllersController) Reconcile(ctx context.Context, request rec
 		return reconcile.Result{}, err
 	}
 
-	pullSecrets, err := utils.GetNetworkingPullSecrets(install, r.client)
+	pullSecrets, err := utils.GetInstallationPullSecrets(installationSpec, r.client)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "An error occurring while retrieving the pull secrets", err, reqLogger)
 		return reconcile.Result{}, err
@@ -306,7 +306,7 @@ func (r *ESKubeControllersController) Reconcile(ctx context.Context, request rec
 	if err := r.createESGateway(
 		ctx,
 		gwNSHelper,
-		install,
+		installationSpec,
 		variant,
 		pullSecrets,
 		hdler,
@@ -330,15 +330,10 @@ func (r *ESKubeControllersController) Reconcile(ctx context.Context, request rec
 		return reconcile.Result{}, err
 	}
 
-	setup := render.NewSetup(&render.SetUpConfiguration{
-		Namespace:       helper.InstallNamespace(),
-		PullSecrets:     pullSecrets,
-		CreateNamespace: false,
-	})
-
 	kubeControllersCfg := kubecontrollers.KubeControllersConfiguration{
 		K8sServiceEp:                 k8sapi.Endpoint,
-		Installation:                 install,
+		K8sServiceEpPodNetwork:       k8sapi.PodNetworkEndpoint,
+		Installation:                 installationSpec,
 		ManagementCluster:            managementCluster,
 		ClusterDomain:                r.clusterDomain,
 		Authentication:               authentication,
@@ -364,12 +359,6 @@ func (r *ESKubeControllersController) Reconcile(ctx context.Context, request rec
 
 	if err = imageset.ResolveImages(imageSet, esKubeControllerComponents); err != nil {
 		r.status.SetDegraded(operatorv1.ResourceValidationError, "Error resolving ImageSet for elasticsearch kube-controllers components", err, reqLogger)
-		return reconcile.Result{}, err
-	}
-
-	setupHandler := hdler
-	if err := setupHandler.CreateOrUpdateOrDelete(ctx, setup, nil); err != nil {
-		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Error creating / updating  elasticsearch kube-controllers resource", err, reqLogger)
 		return reconcile.Result{}, err
 	}
 

@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,11 +22,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// AddOptions are passed to controllers when added to the controller manager. They
+// ControllerOptions are passed to controllers when added to the controller manager. They
 // detail options detected by the daemon at startup that some controllers may either
 // use to determine if they should run at all, or store them and influence their
 // reconciliation loops.
-type AddOptions struct {
+type ControllerOptions struct {
 	DetectedProvider    v1.Provider
 	EnterpriseCRDExists bool
 	ClusterDomain       string
@@ -46,4 +46,7 @@ type AddOptions struct {
 	// use external elasticsearch. When set, the operator will not install Elasticsearch
 	// and instead will configure the cluster to use an external Elasticsearch.
 	ElasticExternal bool
+
+	// Whether or not to use crd.projectcalico.org/v1 or projectcalico.org/v3 for Calico CRDs.
+	UseV3CRDs bool
 }

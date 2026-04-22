@@ -2,12 +2,12 @@
   "apiVersion": "projectcalico.org/v3",
   "kind": "NetworkPolicy",
   "metadata": {
-    "name": "allow-tigera.linseed-access",
+    "name": "calico-system.linseed-access",
     "namespace": "tigera-elasticsearch"
   },
   "spec": {
     "order": 1,
-    "tier": "allow-tigera",
+    "tier": "calico-system",
     "selector": "k8s-app == 'tigera-linseed'",
     "types": [
       "Ingress",
@@ -44,8 +44,8 @@
         "action": "Allow",
         "protocol": "TCP",
         "source": {
-          "selector": "k8s-app == 'tigera-manager'",
-          "namespaceSelector": "projectcalico.org/name == 'tigera-manager'"
+          "selector": "k8s-app == 'calico-manager'",
+          "namespaceSelector": "projectcalico.org/name == 'calico-system'"
         },
         "destination": {
           "ports": [
@@ -169,6 +169,19 @@
           "selector": "k8s-app == 'tigera-policy-recommendation'",
           "namespaceSelector": "projectcalico.org/name == 'calico-system'"
         }
+      },
+      {
+        "action": "Allow",
+        "protocol": "TCP",
+        "source": {
+          "selector": "k8s-app == 'calico-apiserver'",
+          "namespaceSelector": "projectcalico.org/name == 'calico-system'"
+        },
+        "destination": {
+          "ports": [
+            8444
+          ]
+        }
       }
     ],
     "egress": [
@@ -177,7 +190,7 @@
         "protocol": "UDP",
         "destination": {
           "namespaceSelector": "projectcalico.org/name == 'kube-system'",
-          "selector": "k8s-app == 'kube-dns'",
+          "selector": "k8s-app in { 'kube-dns', 'coredns' }",
           "ports": [
             53
           ]

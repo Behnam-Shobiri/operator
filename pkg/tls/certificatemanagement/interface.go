@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,6 +42,12 @@ const (
 	// TrustedCertConfigMapNamePublic is the name of the trusted certificate bundle ConfigMap that includes public CAs, used
 	// only in multi-tenant environments as a single namespace requires both a trusted bundle with public CAs as well as one without.
 	TrustedCertConfigMapNamePublic = "tigera" + TrustedCertConfigMapSuffixPublic
+
+	// Certificate metadata labels and annotations set on TLS secrets.
+	SignerLabel      = "certificates.operator.tigera.io/signer"
+	IssuerAnnotation = "certificates.operator.tigera.io/issuer"
+	ExpiryAnnotation = "certificates.operator.tigera.io/expiry"
+	ExpiryFormat     = "2006-01-02T15:04:05Z"
 )
 
 // KeyPairInterface wraps a Secret object that contains a private key and a certificate. Whether CertificateManagement is
@@ -59,6 +65,9 @@ type KeyPairInterface interface {
 	Secret(namespace string) *corev1.Secret
 	HashAnnotationKey() string
 	HashAnnotationValue() string
+	// Warnings returns a warning message if the certificate requires attention (e.g., a BYO secret
+	// expiring within 30 days). Returns an empty string if there are no warnings.
+	Warnings() string
 	CertificateInterface
 }
 

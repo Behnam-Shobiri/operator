@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@ package render_test
 import (
 	"fmt"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -29,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apiserver/pkg/authentication/serviceaccount"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
@@ -39,7 +39,6 @@ import (
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
 	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/dns"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	rtest "github.com/tigera/operator/pkg/render/common/test"
@@ -62,7 +61,7 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 
 	BeforeEach(func() {
 		scheme := runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 
 		cli = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 		certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
@@ -97,7 +96,7 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: "tigera-policy-recommendation"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"}},
 			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-policy-recommendation"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.PolicyRecommendationManagedClustersWatchRoleBindingName}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
-			&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera.tigera-policy-recommendation", Namespace: render.PolicyRecommendationNamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
+			&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "calico-system.tigera-policy-recommendation", Namespace: render.PolicyRecommendationNamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
 			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "tigera-policy-recommendation", Namespace: render.PolicyRecommendationNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"}},
 		}
 
@@ -111,7 +110,7 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 			corev1.EnvVar{Name: "LINSEED_CA", Value: "/etc/pki/tls/certs/tigera-ca-bundle.crt"},
 			corev1.EnvVar{Name: "LINSEED_CLIENT_CERT", Value: "/policy-recommendation-tls/tls.crt"},
 			corev1.EnvVar{Name: "LINSEED_CLIENT_KEY", Value: "/policy-recommendation-tls/tls.key"},
-			corev1.EnvVar{Name: "MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: "https://tigera-manager.tigera-manager.svc:9443"},
+			corev1.EnvVar{Name: "MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: fmt.Sprintf("https://%s.%s.svc:%d", render.ManagerServiceName, render.ManagerNamespace, render.ManagerPort)},
 		))
 		Expect(prc.Spec.Template.Spec.Containers[0].VolumeMounts[0].Name).To(Equal(certificatemanagement.TrustedCertConfigMapName))
 		Expect(prc.Spec.Template.Spec.Containers[0].VolumeMounts[0].MountPath).To(Equal("/etc/pki/tls/certs"))
@@ -152,7 +151,12 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 					"tier.stagednetworkpolicies",
 					"networkpolicies",
 					"tier.networkpolicies",
+					"stagedglobalnetworkpolicies",
+					"tier.stagedglobalnetworkpolicies",
+					"globalnetworkpolicies",
+					"tier.globalnetworkpolicies",
 					"globalnetworksets",
+					"hostendpoints",
 				},
 				Verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"},
 			},
@@ -180,7 +184,6 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 				Namespace: render.PolicyRecommendationNamespace,
 			},
 		}))
-
 	})
 
 	It("should render toleration on GKE", func() {
@@ -387,7 +390,7 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 		cfg.ManagementCluster = true
 		cfg.Tenant = &operatorv1.Tenant{
 			Spec: operatorv1.TenantSpec{
-				ManagedClusterVariant: ptr.ToPtr(operatorv1.Calico),
+				ManagedClusterVariant: ptr.To(operatorv1.Calico),
 			},
 		}
 		component := render.PolicyRecommendation(cfg)
@@ -405,7 +408,7 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 		cfg.ManagementCluster = true
 		cfg.Tenant = &operatorv1.Tenant{
 			Spec: operatorv1.TenantSpec{
-				ManagedClusterVariant: ptr.ToPtr(operatorv1.TigeraSecureEnterprise),
+				ManagedClusterVariant: ptr.To(operatorv1.CalicoEnterprise),
 			},
 		}
 		component := render.PolicyRecommendation(cfg)
@@ -432,32 +435,32 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 			func(envVar corev1.EnvVar) string { return envVar.Name }, Equal("MANAGED_CLUSTER_TYPE"))))
 	})
 
-	Context("allow-tigera rendering", func() {
-		policyName := types.NamespacedName{Name: "allow-tigera.tigera-policy-recommendation", Namespace: "calico-system"}
+	Context("calico-system rendering", func() {
+		policyName := types.NamespacedName{Name: "calico-system.tigera-policy-recommendation", Namespace: "calico-system"}
 
-		getExpectedPolicy := func(scenario testutils.AllowTigeraScenario) *v3.NetworkPolicy {
+		getExpectedPolicy := func(scenario testutils.CalicoSystemScenario) *v3.NetworkPolicy {
 			return testutils.SelectPolicyByClusterTypeAndProvider(
 				scenario,
-				expectedUnmanagedPolicy,
-				expectedUnmanagedPolicyForOpenshift,
-				nil,
-				nil,
+				map[string]*v3.NetworkPolicy{
+					"unmanaged":           expectedUnmanagedPolicy,
+					"unmanaged-openshift": expectedUnmanagedPolicyForOpenshift,
+				},
 			)
 		}
 
-		DescribeTable("should render allow-tigera policy",
-			func(scenario testutils.AllowTigeraScenario) {
+		DescribeTable("should render calico-system policy",
+			func(scenario testutils.CalicoSystemScenario) {
 				cfg.ManagedCluster = scenario.ManagedCluster
 				cfg.OpenShift = scenario.OpenShift
 				component := render.PolicyRecommendation(cfg)
 				resources, _ := component.Objects()
 
-				policy := testutils.GetAllowTigeraPolicyFromResources(policyName, resources)
+				policy := testutils.GetCalicoSystemPolicyFromResources(policyName, resources)
 				expectedPolicy := getExpectedPolicy(scenario)
 				Expect(policy).To(Equal(expectedPolicy))
 			},
-			Entry("for management/standalone, kube-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: false}),
-			Entry("for management/standalone, openshift-dns", testutils.AllowTigeraScenario{ManagedCluster: false, OpenShift: true}),
+			Entry("for management/standalone, kube-dns", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: false}),
+			Entry("for management/standalone, openshift-dns", testutils.CalicoSystemScenario{ManagedCluster: false, OpenShift: true}),
 		)
 	})
 
@@ -487,7 +490,7 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-policy-recommendation"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.PolicyRecommendationManagedClustersWatchRoleBindingName, Namespace: tenantANamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-policy-recommendation-managed-cluster-access", Namespace: tenantANamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
-				&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera.tigera-policy-recommendation", Namespace: tenantANamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
+				&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "calico-system.tigera-policy-recommendation", Namespace: tenantANamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
 				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "tigera-policy-recommendation", Namespace: tenantANamespace}, TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"}},
 			}
 
@@ -497,6 +500,21 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 			envs := d.Spec.Template.Spec.Containers[0].Env
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "TENANT_NAMESPACE", Value: tenantANamespace}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "TENANT_ID", Value: "tenant-a-id"}))
+
+			roleBinding := rtest.GetResource(tenantAResources, render.PolicyRecommendationManagedClustersWatchRoleBindingName, tenantANamespace, "rbac.authorization.k8s.io", "v1", "RoleBinding").(*rbacv1.RoleBinding)
+			Expect(roleBinding.RoleRef.Name).To(Equal(render.ManagedClustersWatchClusterRoleName))
+			Expect(roleBinding.Subjects).To(ConsistOf([]rbacv1.Subject{
+				{
+					Kind:      "ServiceAccount",
+					Name:      render.PolicyRecommendationName,
+					Namespace: tenantANamespace,
+				},
+				{
+					Kind:      "ServiceAccount",
+					Name:      "tigera-policy-recommendation",
+					Namespace: "tigera-policy-recommendation",
+				},
+			}))
 
 			cfg.Namespace = tenantBNamespace
 			cfg.Tenant = &operatorv1.Tenant{
@@ -519,7 +537,7 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 				&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-policy-recommendation"}, TypeMeta: metav1.TypeMeta{Kind: "ClusterRoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: render.PolicyRecommendationManagedClustersWatchRoleBindingName, Namespace: tenantBNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
 				&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: "tigera-policy-recommendation-managed-cluster-access", Namespace: tenantBNamespace}, TypeMeta: metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"}},
-				&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera.tigera-policy-recommendation", Namespace: tenantBNamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
+				&v3.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "calico-system.tigera-policy-recommendation", Namespace: tenantBNamespace}, TypeMeta: metav1.TypeMeta{Kind: "NetworkPolicy", APIVersion: "projectcalico.org/v3"}},
 				&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "tigera-policy-recommendation", Namespace: tenantBNamespace}, TypeMeta: metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"}},
 			}
 
@@ -552,7 +570,7 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 			envs := d.Spec.Template.Spec.Containers[0].Env
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "TENANT_NAMESPACE", Value: cfg.Tenant.Namespace}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "TENANT_ID", Value: cfg.Tenant.Spec.ID}))
-			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: fmt.Sprintf("https://tigera-manager.%s.svc:9443", cfg.Tenant.Namespace)}))
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: render.ManagerService(cfg.Tenant)}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "LINSEED_URL", Value: fmt.Sprintf("https://tigera-linseed.%s.svc", cfg.Tenant.Namespace)}))
 		})
 
@@ -575,7 +593,7 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 			d := rtest.GetResource(createdResources, "tigera-policy-recommendation", render.PolicyRecommendationNamespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
 			envs := d.Spec.Template.Spec.Containers[0].Env
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "TENANT_ID", Value: cfg.Tenant.Spec.ID}))
-			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: fmt.Sprintf("https://tigera-manager.%s.svc:9443", render.ManagerNamespace)}))
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: render.ManagerService(cfg.Tenant)}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "LINSEED_URL", Value: fmt.Sprintf("https://tigera-linseed.%s.svc", render.ElasticsearchNamespace)}))
 		})
 
@@ -597,7 +615,7 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 
 			d := rtest.GetResource(createdResources, "tigera-policy-recommendation", render.PolicyRecommendationNamespace, appsv1.GroupName, "v1", "Deployment").(*appsv1.Deployment)
 			envs := d.Spec.Template.Spec.Containers[0].Env
-			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: fmt.Sprintf("https://tigera-manager.%s.svc:9443", render.ManagerNamespace)}))
+			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "MULTI_CLUSTER_FORWARDING_ENDPOINT", Value: render.ManagerService(cfg.Tenant)}))
 			Expect(envs).To(ContainElement(corev1.EnvVar{Name: "LINSEED_URL", Value: fmt.Sprintf("https://tigera-linseed.%s.svc", render.ElasticsearchNamespace)}))
 		})
 
@@ -679,6 +697,5 @@ var _ = Describe("Policy recommendation rendering tests", func() {
 			Expect(resources).To(BeEmpty(), "Expected no resources to be rendered in a managed cluster")
 			rtest.ExpectResources(deleteResources, expectedDeleteResources)
 		})
-
 	})
 })

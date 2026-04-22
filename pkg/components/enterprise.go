@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -85,12 +85,12 @@ var (
 	}
 
 	ComponentEckElasticsearch = Component{
-		Version: "8.18.8",
+		Version: "8.19.10",
 		variant: enterpriseVariant,
 	}
 
 	ComponentEckKibana = Component{
-		Version: "8.18.8",
+		Version: "8.19.10",
 		variant: enterpriseVariant,
 	}
 
@@ -291,7 +291,7 @@ var (
 	}
 
 	ComponentCoreOSPrometheus = Component{
-		Version: "v3.4.1",
+		Version: "v3.9.1",
 		variant: enterpriseVariant,
 	}
 
@@ -312,7 +312,7 @@ var (
 	}
 
 	ComponentCoreOSAlertmanager = Component{
-		Version: "v0.28.0",
+		Version: "v0.30.1",
 		variant: enterpriseVariant,
 	}
 
@@ -435,6 +435,43 @@ var (
 		imagePath: "",
 		variant:   enterpriseVariant,
 	}
+
+	ComponentIstioPilot = Component{
+		Version:  "master",
+		Image:    "istio-pilot",
+		Registry: "",
+		variant:  enterpriseVariant,
+	}
+
+	ComponentIstioInstallCNI = Component{
+		Version:  "master",
+		Image:    "istio-install-cni",
+		Registry: "",
+		variant:  enterpriseVariant,
+	}
+
+	ComponentIstioZTunnel = Component{
+		Version:  "master",
+		Image:    "istio-ztunnel",
+		Registry: "",
+		variant:  enterpriseVariant,
+	}
+
+	ComponentIstioProxyv2 = Component{
+		Version:  "master",
+		Image:    "istio-proxyv2",
+		Registry: "",
+		variant:  enterpriseVariant,
+	}
+
+	ComponentTigeraWebhooks = Component{
+		Version:   "master",
+		Image:     "webhooks",
+		Registry:  "",
+		imagePath: "",
+		variant:   enterpriseVariant,
+	}
+
 	// Only components that correspond directly to images should be included in this list,
 	// Components that are only for providing a version should be left out of this list.
 	EnterpriseImages = []Component{
@@ -487,5 +524,10 @@ var (
 		ComponentGatewayAPIEnvoyGateway,
 		ComponentGatewayAPIEnvoyProxy,
 		ComponentGatewayAPIEnvoyRatelimit,
+		ComponentIstioPilot,
+		ComponentIstioInstallCNI,
+		ComponentIstioZTunnel,
+		ComponentIstioProxyv2,
+		ComponentTigeraWebhooks,
 	}
 )

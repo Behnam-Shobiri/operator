@@ -39,3 +39,13 @@ components:
     version: master
   guardian:
     version: master
+  istio-pilot:
+    version: master
+  istio-install-cni:
+    version: master
+  istio-ztunnel:
+    version: master
+  istio-proxyv2:
+    version: master
+  webhooks:
+    version: master

@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,8 +24,8 @@ import (
 // EGWDeploymentContainer is a Egress Gateway Deployment container.
 type EGWDeploymentContainer struct {
 	// Name is an enum which identifies the EGW Deployment container by name.
-	// Supported values are: calico-egw
-	// +kubebuilder:validation:Enum=calico-egw
+	// Supported values are: egress-gateway
+	// +kubebuilder:validation:Enum=egress-gateway
 	Name string `json:"name"`
 
 	// Resources allows customization of limits and requests for compute resources such as cpu and memory.
@@ -34,6 +34,16 @@ type EGWDeploymentContainer struct {
 	// If used in conjunction with the deprecated ComponentResources, then this value takes precedence.
 	// +optional
 	Resources *v1.ResourceRequirements `json:"resources,omitempty"`
+
+	// ReadinessProbe allows customization of the readiness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	ReadinessProbe *ProbeOverride `json:"readinessProbe,omitempty"`
+
+	// LivenessProbe allows customization of the liveness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	LivenessProbe *ProbeOverride `json:"livenessProbe,omitempty"`
 }
 
 // EGWDeploymentInitContainer is a Egress Gateway Deployment init container.

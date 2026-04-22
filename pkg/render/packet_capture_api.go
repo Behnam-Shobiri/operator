@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,13 +20,13 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/components"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render/common/authentication"
 	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	"github.com/tigera/operator/pkg/render/common/configmap"
@@ -48,7 +48,7 @@ const (
 	PacketCaptureClusterRoleBindingName = PacketCaptureName
 	PacketCaptureDeploymentName         = PacketCaptureName
 	PacketCaptureServiceName            = PacketCaptureName
-	PacketCapturePolicyName             = networkpolicy.TigeraComponentPolicyPrefix + PacketCaptureName
+	PacketCapturePolicyName             = networkpolicy.CalicoComponentPolicyPrefix + PacketCaptureName
 	PacketCapturePort                   = 8444
 	PacketCaptureServerCert             = "tigera-packetcapture-server-tls"
 )
@@ -84,7 +84,13 @@ func PacketCaptureAPI(cfg *PacketCaptureApiConfiguration) Component {
 }
 
 func PacketCaptureAPIPolicy(cfg *PacketCaptureApiConfiguration) Component {
-	return NewPassthrough(allowTigeraPolicy(cfg))
+	return NewPassthrough(
+		[]client.Object{calicoSystemPolicy(cfg)},
+		[]client.Object{
+			// allow-tigera Tier was renamed to calico-system
+			networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("tigera-packetcapture", PacketCaptureNamespace),
+		},
+	)
 }
 
 func (pc *packetCaptureApiComponent) ResolveImages(is *operatorv1.ImageSet) error {
@@ -246,7 +252,7 @@ func (pc *packetCaptureApiComponent) deployment() *appsv1.Deployment {
 			Namespace: PacketCaptureNamespace,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.Int32ToPtr(1),
+			Replicas: ptr.To(int32(1)),
 			Strategy: appsv1.DeploymentStrategy{
 				Type: appsv1.RecreateDeploymentStrategyType,
 			},
@@ -340,7 +346,7 @@ func (pc *packetCaptureApiComponent) annotations() map[string]string {
 	return annotations
 }
 
-func allowTigeraPolicy(cfg *PacketCaptureApiConfiguration) *v3.NetworkPolicy {
+func calicoSystemPolicy(cfg *PacketCaptureApiConfiguration) *v3.NetworkPolicy {
 	managedCluster := cfg.ManagementClusterConnection != nil
 	egressRules := []v3.Rule{
 		{
@@ -387,7 +393,7 @@ func allowTigeraPolicy(cfg *PacketCaptureApiConfiguration) *v3.NetworkPolicy {
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
+			Tier:     networkpolicy.CalicoTierName,
 			Selector: networkpolicy.KubernetesAppSelector(PacketCaptureName),
 			Types:    []v3.PolicyType{v3.PolicyTypeIngress, v3.PolicyTypeEgress},
 			Ingress:  ingressRules,

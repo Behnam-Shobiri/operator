@@ -2,13 +2,13 @@
   "apiVersion": "projectcalico.org/v3",
   "kind": "NetworkPolicy",
   "metadata": {
-    "name": "allow-tigera.manager-access",
-    "namespace": "tigera-manager"
+    "name": "calico-system.manager-access",
+    "namespace": "calico-system"
   },
   "spec": {
     "order": 1,
-    "tier": "allow-tigera",
-    "selector": "k8s-app == 'tigera-manager'",
+    "tier": "calico-system",
+    "selector": "k8s-app == 'calico-manager'",
     "types": [
       "Ingress",
       "Egress"
@@ -61,8 +61,8 @@
         "source": {
         },
         "destination": {
-          "selector": "k8s-app == 'tigera-manager'",
-          "namespaceSelector": "projectcalico.org/name == 'tigera-manager'",
+          "selector": "k8s-app == 'calico-manager'",
+          "namespaceSelector": "projectcalico.org/name == 'calico-system'",
           "ports": [
             9443
           ]
@@ -152,7 +152,7 @@
         "protocol": "UDP",
         "destination": {
           "namespaceSelector": "projectcalico.org/name == 'kube-system'",
-          "selector": "k8s-app == 'kube-dns'",
+          "selector": "k8s-app in { 'kube-dns', 'coredns' }",
           "ports": [
             53
           ]

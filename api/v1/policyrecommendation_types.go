@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,7 +22,6 @@ import (
 // PolicyRecommendationSpec defines configuration for the Calico Enterprise Policy Recommendation
 // service.
 type PolicyRecommendationSpec struct {
-
 	// PolicyRecommendation configures the PolicyRecommendation Deployment.
 	// +optional
 	PolicyRecommendationDeployment *PolicyRecommendationDeployment `json:"policyRecommendationDeployment,omitempty"`
@@ -30,7 +29,6 @@ type PolicyRecommendationSpec struct {
 
 // PolicyRecommendationDeployment is the configuration for the PolicyRecommendation Deployment.
 type PolicyRecommendationDeployment struct {
-
 	// Spec is the specification of the PolicyRecommendation Deployment.
 	// +optional
 	Spec *PolicyRecommendationDeploymentSpec `json:"spec,omitempty"`
@@ -38,7 +36,6 @@ type PolicyRecommendationDeployment struct {
 
 // PolicyRecommendationDeploymentSpec defines configuration for the PolicyRecommendation Deployment.
 type PolicyRecommendationDeploymentSpec struct {
-
 	// Template describes the PolicyRecommendation Deployment pod that will be created.
 	// +optional
 	Template *PolicyRecommendationDeploymentPodTemplateSpec `json:"template,omitempty"`
@@ -46,7 +43,6 @@ type PolicyRecommendationDeploymentSpec struct {
 
 // PolicyRecommendationDeploymentPodTemplateSpec is the PolicyRecommendation Deployment's PodTemplateSpec
 type PolicyRecommendationDeploymentPodTemplateSpec struct {
-
 	// Spec is the PolicyRecommendation Deployment's PodSpec.
 	// +optional
 	Spec *PolicyRecommendationDeploymentPodSpec `json:"spec,omitempty"`
@@ -79,6 +75,16 @@ type PolicyRecommendationDeploymentContainer struct {
 	// If omitted, the PolicyRecommendation Deployment will use its default value for this container's resources.
 	// +optional
 	Resources *v1.ResourceRequirements `json:"resources,omitempty"`
+
+	// ReadinessProbe allows customization of the readiness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	ReadinessProbe *ProbeOverride `json:"readinessProbe,omitempty"`
+
+	// LivenessProbe allows customization of the liveness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	LivenessProbe *ProbeOverride `json:"livenessProbe,omitempty"`
 }
 
 // PolicyRecommendationDeploymentInitContainer is a PolicyRecommendation Deployment init container.
@@ -106,6 +112,8 @@ type PolicyRecommendationStatus struct {
 
 // PolicyRecommendation is the Schema for the policy recommendation API. At most one instance
 // of this resource is supported. It must be named "tigera-secure".
+//
+// +kubebuilder:validation:XValidation:rule="self.metadata.name == 'tigera-secure'", message="resource name must be 'tigera-secure'"
 type PolicyRecommendation struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

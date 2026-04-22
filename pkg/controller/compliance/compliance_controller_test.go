@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,12 +20,13 @@ import (
 	"time"
 
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
+	"github.com/tigera/operator/pkg/controller/options"
 	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/tls"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
 	"github.com/tigera/operator/pkg/common"
@@ -65,7 +66,7 @@ var _ = Describe("Compliance controller tests", func() {
 	BeforeEach(func() {
 		// The schema contains all objects that should be known to the fake client when the test runs.
 		scheme = runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 		Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(operatorv1.SchemeBuilder.AddToScheme(scheme)).NotTo(HaveOccurred())
@@ -86,6 +87,8 @@ var _ = Describe("Compliance controller tests", func() {
 		mockStatus.On("OnCRFound").Return()
 		mockStatus.On("AddCertificateSigningRequests", mock.Anything).Return()
 		mockStatus.On("ClearDegraded")
+		mockStatus.On("SetWarning", mock.Anything, mock.Anything).Return()
+		mockStatus.On("ClearWarning", mock.Anything).Return()
 		mockStatus.On("ReadyToMonitor")
 		mockStatus.On("SetMetaData", mock.Anything).Return()
 
@@ -94,24 +97,26 @@ var _ = Describe("Compliance controller tests", func() {
 		r = ReconcileCompliance{
 			client:          c,
 			scheme:          scheme,
-			provider:        operatorv1.ProviderNone,
 			status:          mockStatus,
-			clusterDomain:   dns.DefaultClusterDomain,
 			licenseAPIReady: &utils.ReadyFlag{},
 			tierWatchReady:  &utils.ReadyFlag{},
+			opts: options.ControllerOptions{
+				DetectedProvider: operatorv1.ProviderNone,
+				ClusterDomain:    dns.DefaultClusterDomain,
+			},
 		}
 		// We start off with a 'standard' installation, with nothing special
 		installation = &operatorv1.Installation{
 			ObjectMeta: metav1.ObjectMeta{Name: "default"},
 			Spec: operatorv1.InstallationSpec{
-				Variant:  operatorv1.TigeraSecureEnterprise,
+				Variant:  operatorv1.CalicoEnterprise,
 				Registry: "some.registry.org/",
 				ImagePullSecrets: []corev1.LocalObjectReference{{
 					Name: "tigera-pull-secret",
 				}},
 			},
 			Status: operatorv1.InstallationStatus{
-				Variant: operatorv1.TigeraSecureEnterprise,
+				Variant: operatorv1.CalicoEnterprise,
 				Computed: &operatorv1.InstallationSpec{
 					Registry: "my-reg",
 					// The test is provider agnostic.
@@ -126,7 +131,7 @@ var _ = Describe("Compliance controller tests", func() {
 		// The compliance reconcile loop depends on a ton of objects that should be available in your client as
 		// prerequisites. Without them, compliance will not even start creating objects. Let's create them now.
 		Expect(c.Create(ctx, &operatorv1.APIServer{ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure"}, Status: operatorv1.APIServerStatus{State: operatorv1.TigeraStatusReady}})).NotTo(HaveOccurred())
-		Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+		Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})).NotTo(HaveOccurred())
 		Expect(c.Create(ctx, &v3.LicenseKey{ObjectMeta: metav1.ObjectMeta{Name: "default"}, Status: v3.LicenseKeyStatus{Features: []string{common.ComplianceFeature}}})).NotTo(HaveOccurred())
 		Expect(c.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tigera-pull-secret", Namespace: common.OperatorNamespace()}})).NotTo(HaveOccurred())
 
@@ -247,7 +252,8 @@ var _ = Describe("Compliance controller tests", func() {
 
 		// Custom cert has the compliance svc DNS names as well as other DNS names
 		dnsNames := append(expectedDNSNames, "compliance.example.com", "192.168.10.13")
-		newSecret, err := secret.CreateTLSSecret(nil,
+		testCA := test.MakeTestCA("compliance-test")
+		newSecret, err := secret.CreateTLSSecret(testCA,
 			render.ComplianceServerCertSecret, common.OperatorNamespace(), corev1.TLSPrivateKeyKey,
 			corev1.TLSCertKey, tls.DefaultCertificateDuration, nil, dnsNames...,
 		)
@@ -314,7 +320,7 @@ var _ = Describe("Compliance controller tests", func() {
 		Expect(c.Create(
 			ctx,
 			&operatorv1.ManagementClusterConnection{
-				ObjectMeta: metav1.ObjectMeta{Name: utils.DefaultTSEEInstanceKey.Name},
+				ObjectMeta: metav1.ObjectMeta{Name: utils.DefaultEnterpriseInstanceKey.Name},
 			})).NotTo(HaveOccurred())
 
 		By("reconciling after the cluster type changes")
@@ -621,7 +627,7 @@ var _ = Describe("Compliance controller tests", func() {
 		})
 	})
 
-	Context("allow-tigera reconciliation", func() {
+	Context("calico-system reconciliation", func() {
 		var readyFlag *utils.ReadyFlag
 
 		BeforeEach(func() {
@@ -634,16 +640,18 @@ var _ = Describe("Compliance controller tests", func() {
 			r = ReconcileCompliance{
 				client:          c,
 				scheme:          scheme,
-				provider:        operatorv1.ProviderNone,
 				status:          mockStatus,
-				clusterDomain:   dns.DefaultClusterDomain,
 				licenseAPIReady: readyFlag,
 				tierWatchReady:  readyFlag,
+				opts: options.ControllerOptions{
+					DetectedProvider: operatorv1.ProviderNone,
+					ClusterDomain:    dns.DefaultClusterDomain,
+				},
 			}
 		})
 
-		It("should wait if allow-tigera tier is unavailable", func() {
-			test.DeleteAllowTigeraTierAndExpectWait(ctx, c, &r, mockStatus)
+		It("should wait if calico-system tier is unavailable", func() {
+			test.DeleteCalicoSystemTierAndExpectWait(ctx, c, &r, mockStatus)
 		})
 
 		It("should wait if tier watch is not ready", func() {
@@ -914,7 +922,7 @@ var _ = Describe("Compliance controller tests", func() {
 		tenantBNamespace := "tenant-b"
 
 		BeforeEach(func() {
-			r.multiTenant = true
+			r.opts.MultiTenant = true
 		})
 
 		It("should reconcile both with and without namespace provided while namespaced compliance instances exist", func() {

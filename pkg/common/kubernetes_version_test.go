@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -31,7 +31,7 @@ var _ = Describe("Test get Kubernetes version", func() {
 	var clientset kubernetes.Interface
 
 	BeforeEach(func() {
-		clientset = fake.NewSimpleClientset()
+		clientset = fake.NewClientset()
 	})
 
 	It("should return expected major and minor version when both version numbers are valid integers", func() {

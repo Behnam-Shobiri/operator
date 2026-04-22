@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 /*
 
 
@@ -32,6 +32,10 @@ type APIServerSpec struct {
 	// used in conjunction with ControlPlaneNodeSelector or ControlPlaneTolerations, then these overrides
 	// take precedence.
 	APIServerDeployment *APIServerDeployment `json:"apiServerDeployment,omitempty"`
+
+	// CalicoWebhooksDeployment configures the calico-webhooks Deployment.
+	// +optional
+	CalicoWebhooksDeployment *CalicoWebhooksDeployment `json:"calicoWebhooksDeployment,omitempty"`
 }
 
 // APIServerStatus defines the observed state of Tigera API server.
@@ -52,6 +56,7 @@ type APIServerStatus struct {
 // of this resource is supported. It must be named "default" or "tigera-secure".
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
+// +kubebuilder:validation:XValidation:rule="self.metadata.name == 'default' || self.metadata.name == 'tigera-secure'",message="resource name must be 'default' or 'tigera-secure'"
 type APIServer struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -95,6 +100,16 @@ type APIServerDeploymentContainer struct {
 	// If used in conjunction with the deprecated ComponentResources, then this value takes precedence.
 	// +optional
 	Resources *v1.ResourceRequirements `json:"resources,omitempty"`
+
+	// ReadinessProbe allows customization of the readiness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	ReadinessProbe *ProbeOverride `json:"readinessProbe,omitempty"`
+
+	// LivenessProbe allows customization of the liveness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	LivenessProbe *ProbeOverride `json:"livenessProbe,omitempty"`
 }
 
 type APIServerDeploymentContainerPort struct {

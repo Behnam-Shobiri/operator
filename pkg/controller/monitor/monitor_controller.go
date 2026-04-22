@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,10 +19,8 @@ import (
 	_ "embed"
 	"fmt"
 	"reflect"
+	"time"
 
-	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
-
-	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -61,16 +59,17 @@ const ResourceName = "monitor"
 
 var log = logf.Log.WithName("controller_monitor")
 
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	if !opts.EnterpriseCRDExists {
 		return nil
 	}
 
 	prometheusReady := &utils.ReadyFlag{}
 	tierWatchReady := &utils.ReadyFlag{}
+	licenseAPIReady := &utils.ReadyFlag{}
 
 	// Create the reconciler
-	reconciler := newReconciler(mgr, opts, prometheusReady, tierWatchReady)
+	reconciler := newReconciler(mgr, opts, prometheusReady, tierWatchReady, licenseAPIReady)
 
 	// Create a new controller
 	c, err := ctrlruntime.NewController("monitor-controller", mgr, controller.Options{Reconciler: reconciler})
@@ -82,22 +81,24 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		{Name: monitor.PrometheusPolicyName, Namespace: common.TigeraPrometheusNamespace},
 		{Name: monitor.PrometheusAPIPolicyName, Namespace: common.TigeraPrometheusNamespace},
 		{Name: monitor.PrometheusOperatorPolicyName, Namespace: common.TigeraPrometheusNamespace},
-		{Name: monitor.AlertManagerPolicyName, Namespace: common.TigeraPrometheusNamespace},
-		{Name: monitor.MeshAlertManagerPolicyName, Namespace: common.TigeraPrometheusNamespace},
-		{Name: networkpolicy.TigeraComponentDefaultDenyPolicyName, Namespace: common.TigeraPrometheusNamespace},
+		{Name: monitor.AlertmanagerPolicyName, Namespace: common.TigeraPrometheusNamespace},
+		{Name: monitor.MeshAlertmanagerPolicyName, Namespace: common.TigeraPrometheusNamespace},
+		{Name: networkpolicy.CalicoComponentDefaultDenyPolicyName, Namespace: common.TigeraPrometheusNamespace},
 	}
 
 	// Watch for changes to Tier, as its status is used as input to determine whether network policy should be reconciled by this controller.
-	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, opts.K8sClientset, log, tierWatchReady)
+	go utils.WaitToAddTierWatch(networkpolicy.CalicoTierName, c, opts.K8sClientset, log, tierWatchReady)
 
 	go utils.WaitToAddNetworkPolicyWatches(c, opts.K8sClientset, log, policyNames)
 
 	go waitToAddPrometheusWatch(c, opts.K8sClientset, log, prometheusReady)
 
+	go utils.WaitToAddLicenseKeyWatch(c, opts.K8sClientset, log, licenseAPIReady)
+
 	return add(mgr, c)
 }
 
-func newReconciler(mgr manager.Manager, opts options.AddOptions, prometheusReady *utils.ReadyFlag, tierWatchReady *utils.ReadyFlag) reconcile.Reconciler {
+func newReconciler(mgr manager.Manager, opts options.ControllerOptions, prometheusReady *utils.ReadyFlag, tierWatchReady *utils.ReadyFlag, licenseAPIReady *utils.ReadyFlag) reconcile.Reconciler {
 	r := &ReconcileMonitor{
 		client:          mgr.GetClient(),
 		scheme:          mgr.GetScheme(),
@@ -105,12 +106,12 @@ func newReconciler(mgr manager.Manager, opts options.AddOptions, prometheusReady
 		status:          status.New(mgr.GetClient(), "monitor", opts.KubernetesVersion),
 		prometheusReady: prometheusReady,
 		tierWatchReady:  tierWatchReady,
+		licenseAPIReady: licenseAPIReady,
 		clusterDomain:   opts.ClusterDomain,
 		multiTenant:     opts.MultiTenant,
 	}
 
 	r.status.AddStatefulSets([]types.NamespacedName{
-		{Namespace: common.TigeraPrometheusNamespace, Name: fmt.Sprintf("alertmanager-%s", monitor.CalicoNodeAlertmanager)},
 		{Namespace: common.TigeraPrometheusNamespace, Name: fmt.Sprintf("prometheus-%s", monitor.CalicoNodePrometheus)},
 	})
 
@@ -134,13 +135,13 @@ func add(_ manager.Manager, c ctrlruntime.Controller) error {
 		return fmt.Errorf("monitor-controller failed to watch ImageSet: %w", err)
 	}
 
-	// ManagementClusterConnection (in addition to Installation/Network) is used as input to determine whether network policy should be reconciled.
+	// ManagementClusterConnection (in addition to Installation) is used as input to determine whether network policy should be reconciled.
 	err = c.WatchObject(&operatorv1.ManagementClusterConnection{}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return fmt.Errorf("monitor-controller failed to watch ManagementClusterConnection resource: %w", err)
 	}
 
-	if err = c.WatchObject(&crdv1.FelixConfiguration{}, &handler.EnqueueRequestForObject{}); err != nil {
+	if err = c.WatchObject(&v3.FelixConfiguration{}, &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("monitor-controller failed to watch FelixConfiguration resource: %w", err)
 	}
 
@@ -187,13 +188,14 @@ type ReconcileMonitor struct {
 	status          status.StatusManager
 	prometheusReady *utils.ReadyFlag
 	tierWatchReady  *utils.ReadyFlag
+	licenseAPIReady *utils.ReadyFlag
 	clusterDomain   string
 	multiTenant     bool
 }
 
 func (r *ReconcileMonitor) getMonitor(ctx context.Context) (*operatorv1.Monitor, error) {
 	instance := &operatorv1.Monitor{}
-	err := r.client.Get(ctx, utils.DefaultTSEEInstanceKey, instance)
+	err := r.client.Get(ctx, utils.DefaultEnterpriseInstanceKey, instance)
 	if err != nil {
 		return nil, err
 	}
@@ -239,6 +241,15 @@ func (r *ReconcileMonitor) Reconcile(ctx context.Context, request reconcile.Requ
 		r.status.SetDegraded(operatorv1.ResourceUpdateError, "Failed to write defaults", err, reqLogger)
 		return reconcile.Result{}, err
 	}
+
+	// Track alertmanager statefulset health only when it has replicas.
+	alertmanagerSS := types.NamespacedName{Namespace: common.TigeraPrometheusNamespace, Name: fmt.Sprintf("alertmanager-%s", monitor.CalicoNodeAlertmanager)}
+	if instance.Spec.Alertmanager != nil && instance.Spec.Alertmanager.AlertmanagerSpec != nil &&
+		instance.Spec.Alertmanager.AlertmanagerSpec.Replicas != nil && *instance.Spec.Alertmanager.AlertmanagerSpec.Replicas > 0 {
+		r.status.AddStatefulSets([]types.NamespacedName{alertmanagerSS})
+	} else {
+		r.status.RemoveStatefulSets(alertmanagerSS)
+	}
 	if instance.Spec.ExternalPrometheus != nil {
 		if err = r.client.Get(ctx, client.ObjectKey{Name: instance.Spec.ExternalPrometheus.Namespace}, &corev1.Namespace{}); err != nil {
 			r.status.SetDegraded(operatorv1.ResourceReadError, fmt.Sprintf("Failed to get external prometheus namespace %s",
@@ -247,7 +258,34 @@ func (r *ReconcileMonitor) Reconcile(ctx context.Context, request reconcile.Requ
 		}
 	}
 
-	variant, install, err := utils.GetInstallation(context.Background(), r.client)
+	if !r.licenseAPIReady.IsReady() {
+		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for LicenseKeyAPI to be ready", nil, reqLogger)
+		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
+	}
+
+	license, err := utils.FetchLicenseKey(ctx, r.client)
+	if err != nil {
+		if errors.IsNotFound(err) {
+			r.status.SetDegraded(operatorv1.ResourceNotFound, "License not found", err, reqLogger)
+			return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
+		}
+		r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying license", err, reqLogger)
+		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
+	}
+
+	gracePeriod := utils.ParseGracePeriod(license.Status.GracePeriod)
+	licenseStatus := utils.GetLicenseStatus(license, gracePeriod)
+	licenseExpired := licenseStatus == utils.LicenseStatusExpired
+
+	// When in the grace period, schedule a requeue so the controller automatically
+	// transitions to expired state when the grace period elapses.
+	var graceRequeueAfter time.Duration
+	if licenseStatus == utils.LicenseStatusInGracePeriod {
+		reqLogger.Info("License has expired and is within the grace period. Please renew your license to avoid service disruption.")
+		graceRequeueAfter = time.Until(license.Status.Expiry.Add(gracePeriod))
+	}
+
+	variant, installationSpec, err := utils.GetInstallationSpec(context.Background(), r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotFound, "Installation not found", err, reqLogger)
@@ -257,7 +295,7 @@ func (r *ReconcileMonitor) Reconcile(ctx context.Context, request reconcile.Requ
 		return reconcile.Result{}, err
 	}
 
-	pullSecrets, err := utils.GetNetworkingPullSecrets(install, r.client)
+	pullSecrets, err := utils.GetInstallationPullSecrets(installationSpec, r.client)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error retrieving pull secrets", err, reqLogger)
 		return reconcile.Result{}, err
@@ -269,14 +307,14 @@ func (r *ReconcileMonitor) Reconcile(ctx context.Context, request reconcile.Requ
 		return reconcile.Result{}, err
 	}
 
-	certificateManager, err := certificatemanager.Create(r.client, install, r.clusterDomain, common.OperatorNamespace())
+	certificateManager, err := certificatemanager.Create(r.client, installationSpec, r.clusterDomain, common.OperatorNamespace())
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the Tigera CA", err, reqLogger)
 		return reconcile.Result{}, err
 	}
 
 	var serverTLSSecret certificatemanagement.KeyPairInterface
-	if instance.Spec.ExternalPrometheus == nil || install.CertificateManagement != nil {
+	if instance.Spec.ExternalPrometheus == nil || installationSpec.CertificateManagement != nil {
 		// We're either not using an external prometheus in which case we simply sign the KeyPair directly using the certificateManager,
 		// or we are configured to use a custom TLS secret, which is also handled under the covers by `GetOrCreateKeyPair`.
 		serverTLSSecret, err = certificateManager.GetOrCreateKeyPair(r.client, monitor.PrometheusServerTLSSecretName, common.OperatorNamespace(), PrometheusTLSServerDNSNames(r.clusterDomain))
@@ -343,60 +381,18 @@ func (r *ReconcileMonitor) Reconcile(ctx context.Context, request reconcile.Requ
 		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
-	// Ensure the allow-tigera tier exists, before rendering any network policies within it.
+	// Ensure the calico-system tier exists, before rendering any network policies within it.
 	includeV3NetworkPolicy := false
-	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.TigeraComponentTierName}, &v3.Tier{}); err != nil {
+	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.CalicoTierName}, &v3.Tier{}); err != nil {
 		// The creation of the Tier depends on this controller to reconcile it's non-NetworkPolicy resources so that the
 		// License becomes available (in managed clusters). Therefore, if we fail to query the Tier, we exclude NetworkPolicy
 		// from reconciliation and tolerate errors arising from the Tier not being created.
 		if !errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying allow-tigera tier", err, reqLogger)
+			r.status.SetDegraded(operatorv1.ResourceReadError, "Error querying calico-system tier", err, reqLogger)
 			return reconcile.Result{}, err
 		}
 	} else {
 		includeV3NetworkPolicy = true
-	}
-
-	p, err := utils.GetPrometheus(ctx, r.client)
-	if err != nil {
-		r.status.SetDegraded(operatorv1.ResourceReadError, "An error occurred trying to retrieve the Prometheus status", err, reqLogger)
-		return reconcile.Result{}, err
-	}
-
-	if p != nil {
-		available := monitoringv1.ConditionFalse
-
-		for _, cond := range p.Status.Conditions {
-			if cond.Type == monitoringv1.Available {
-				available = cond.Status
-			}
-		}
-
-		if available != monitoringv1.ConditionTrue {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Prometheus component is not available", err, reqLogger)
-			return reconcile.Result{}, err
-		}
-	}
-
-	am, err := utils.GetAlertmanager(ctx, r.client)
-	if err != nil {
-		r.status.SetDegraded(operatorv1.ResourceReadError, "An error occurred trying to retrieve the Alertmanager status", err, reqLogger)
-		return reconcile.Result{}, err
-	}
-
-	if am != nil {
-		available := monitoringv1.ConditionFalse
-
-		for _, cond := range am.Status.Conditions {
-			if cond.Type == monitoringv1.Available {
-				available = cond.Status
-			}
-		}
-
-		if available != monitoringv1.ConditionTrue {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Alertmanager component is not available", err, reqLogger)
-			return reconcile.Result{}, err
-		}
 	}
 
 	// Create a component handler to manage the rendered component.
@@ -420,9 +416,24 @@ func (r *ReconcileMonitor) Reconcile(ctx context.Context, request reconcile.Requ
 		return reconcile.Result{}, err
 	}
 
+	// Create operator TLS keypair only when mTLS is enabled (METRICS_SCHEME=https).
+	// The Service and ServiceMonitor are created whenever metrics are enabled.
+	operatorMetricsEnabled := common.MetricsEnabled()
+	var operatorTLSSecret certificatemanagement.KeyPairInterface
+	if common.MetricsTLSEnabled() {
+		operatorMetricsServiceName := common.OperatorName() + "-metrics"
+		operatorTLSDNSNames := dns.GetServiceDNSNames(operatorMetricsServiceName, common.OperatorNamespace(), r.clusterDomain)
+		operatorTLSSecret, err = certificateManager.GetOrCreateKeyPair(r.client, monitor.OperatorTLSSecretName, common.OperatorNamespace(), operatorTLSDNSNames)
+		if err != nil {
+			r.status.SetDegraded(operatorv1.ResourceCreateError, "Error creating operator metrics TLS certificate", err, reqLogger)
+			return reconcile.Result{}, err
+		}
+		trustedBundle.AddCertificates(operatorTLSSecret)
+	}
+
 	monitorCfg := &monitor.Config{
 		Monitor:                       instance.Spec,
-		Installation:                  install,
+		Installation:                  installationSpec,
 		PullSecrets:                   pullSecrets,
 		AlertmanagerConfigSecret:      alertmanagerConfigSecret,
 		KeyValidatorConfig:            keyValidatorConfig,
@@ -433,6 +444,11 @@ func (r *ReconcileMonitor) Reconcile(ctx context.Context, request reconcile.Requ
 		OpenShift:                     r.provider.IsOpenShift(),
 		KubeControllerPort:            kubeControllersMetricsPort,
 		FelixPrometheusMetricsEnabled: utils.IsFelixPrometheusMetricsEnabled(felixConfiguration),
+		LicenseExpired:                licenseExpired,
+		OperatorMetricsEnabled:        operatorMetricsEnabled,
+		OperatorNamespace:             common.OperatorNamespace(),
+		OperatorName:                  common.OperatorName(),
+		OperatorTLSSecret:             operatorTLSSecret,
 	}
 
 	// Render prometheus component
@@ -444,13 +460,14 @@ func (r *ReconcileMonitor) Reconcile(ctx context.Context, request reconcile.Requ
 			KeyPairOptions: []rcertificatemanagement.KeyPairOption{
 				rcertificatemanagement.NewKeyPairOption(serverTLSSecret, true, true),
 				rcertificatemanagement.NewKeyPairOption(clientTLSSecret, true, true),
+				rcertificatemanagement.NewKeyPairOption(operatorTLSSecret, true, true),
 			},
 			TrustedBundle: trustedBundle,
 		}),
 	}
 
 	if createInOperatorNamespace {
-		components = append(components, render.NewPassthrough(alertmanagerConfigSecret))
+		components = append(components, render.NewCreationPassthrough(alertmanagerConfigSecret))
 	}
 
 	// v3 NetworkPolicy will fail to reconcile if the Tier is not created, which can only occur once a License is created.
@@ -476,6 +493,27 @@ func (r *ReconcileMonitor) Reconcile(ctx context.Context, request reconcile.Requ
 	// Tell the status manager that we're ready to monitor the resources we've told it about and receive statuses.
 	r.status.ReadyToMonitor()
 
+	if licenseExpired {
+		r.status.ClearWarning("license-grace-period")
+		r.status.SetDegraded(operatorv1.ResourceValidationError,
+			"License is expired - Contact Tigera support or email licensing@tigera.io", nil, reqLogger)
+		return reconcile.Result{}, nil
+	}
+
+	// Check license grace period warning.
+	if licenseStatus == utils.LicenseStatusInGracePeriod {
+		r.status.SetWarning("license-grace-period",
+			"License has expired and is within the grace period. Please renew your license to avoid service disruption.")
+	} else {
+		r.status.ClearWarning("license-grace-period")
+	}
+
+	// Check BYO certificate expiry warnings.
+	certificatemanagement.CheckKeyPairWarnings(map[string]certificatemanagement.KeyPairInterface{
+		monitor.PrometheusServerTLSSecretName: serverTLSSecret,
+		monitor.PrometheusClientTLSSecretName: clientTLSSecret,
+	}, r.status)
+
 	r.status.ClearDegraded()
 
 	if !r.status.IsAvailable() {
@@ -489,10 +527,21 @@ func (r *ReconcileMonitor) Reconcile(ctx context.Context, request reconcile.Requ
 		return reconcile.Result{}, err
 	}
 
-	return reconcile.Result{}, nil
+	return reconcile.Result{RequeueAfter: graceRequeueAfter}, nil
 }
 
 func fillDefaults(instance *operatorv1.Monitor) {
+	if instance.Spec.Alertmanager == nil {
+		instance.Spec.Alertmanager = &operatorv1.Alertmanager{}
+	}
+	if instance.Spec.Alertmanager.AlertmanagerSpec == nil {
+		instance.Spec.Alertmanager.AlertmanagerSpec = &operatorv1.AlertmanagerSpec{}
+	}
+	if instance.Spec.Alertmanager.AlertmanagerSpec.Replicas == nil {
+		var replicas int32 = 0
+		instance.Spec.Alertmanager.AlertmanagerSpec.Replicas = &replicas
+	}
+
 	if instance.Spec.ExternalPrometheus != nil && instance.Spec.ExternalPrometheus.ServiceMonitor != nil {
 
 		if len(instance.Spec.ExternalPrometheus.ServiceMonitor.Labels) == 0 {

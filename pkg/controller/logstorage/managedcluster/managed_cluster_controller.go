@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,7 +46,7 @@ type LogStorageManagedClusterController struct {
 	clusterDomain string
 }
 
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	if !opts.EnterpriseCRDExists {
 		return nil
 	}
@@ -104,14 +104,14 @@ func (r *LogStorageManagedClusterController) Reconcile(ctx context.Context, requ
 	reqLogger.Info("Reconciling ManagedCluster resources for log storage")
 
 	// Make sure this is an Enterprise cluster.
-	variant, install, err := utils.GetInstallation(context.Background(), r.client)
+	variant, installationSpec, err := utils.GetInstallationSpec(context.Background(), r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{}, err
 	}
-	if variant != operatorv1.TigeraSecureEnterprise {
+	if !variant.IsEnterprise() {
 		return reconcile.Result{}, nil
 	}
 
@@ -136,7 +136,7 @@ func (r *LogStorageManagedClusterController) Reconcile(ctx context.Context, requ
 	// Create the component and install it.
 	cfg := &render.ManagedClusterLogStorageConfiguration{
 		ClusterDomain: r.clusterDomain,
-		Installation:  install,
+		Installation:  installationSpec,
 	}
 	component := render.NewManagedClusterLogStorage(cfg)
 	hdler := utils.NewComponentHandler(reqLogger, r.client, r.scheme, managementClusterConnection)

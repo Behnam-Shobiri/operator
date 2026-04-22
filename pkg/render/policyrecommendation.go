@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,13 +23,13 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/authentication/serviceaccount"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
-	"github.com/tigera/operator/pkg/ptr"
 	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
@@ -47,7 +47,7 @@ const (
 
 	PolicyRecommendationName       = "tigera-policy-recommendation"
 	PolicyRecommendationNamespace  = common.CalicoNamespace
-	PolicyRecommendationPolicyName = networkpolicy.TigeraComponentPolicyPrefix + PolicyRecommendationName
+	PolicyRecommendationPolicyName = networkpolicy.CalicoComponentPolicyPrefix + PolicyRecommendationName
 
 	PolicyRecommendationTLSSecretName                                   = "policy-recommendation-tls"
 	PolicyRecommendationMultiTenantManagedClustersAccessRoleBindingName = "tigera-policy-recommendation-managed-cluster-access"
@@ -109,7 +109,6 @@ func (pr *policyRecommendationComponent) SupportedOSType() rmeta.OSType {
 }
 
 func (pr *policyRecommendationComponent) Objects() ([]client.Object, []client.Object) {
-
 	var objs []client.Object
 
 	// Guardian has RBAC permissions to handle policy recommendation requests in managed clusters,
@@ -121,7 +120,7 @@ func (pr *policyRecommendationComponent) Objects() ([]client.Object, []client.Ob
 	// Management and managed clusters need API access to the resources defined in the policy
 	// recommendation cluster role
 	objs = []client.Object{
-		pr.allowTigeraPolicyForPolicyRecommendation(),
+		pr.calicoSystemPolicyForPolicyRecommendation(),
 		pr.serviceAccount(),
 		pr.clusterRole(),
 		pr.clusterRoleBinding(),
@@ -156,7 +155,12 @@ func (pr *policyRecommendationComponent) clusterRole() client.Object {
 				"tier.stagednetworkpolicies",
 				"networkpolicies",
 				"tier.networkpolicies",
+				"stagedglobalnetworkpolicies",
+				"tier.stagedglobalnetworkpolicies",
+				"globalnetworkpolicies",
+				"tier.globalnetworkpolicies",
 				"globalnetworksets",
+				"hostendpoints",
 			},
 			Verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"},
 		},
@@ -233,7 +237,32 @@ func (pr *policyRecommendationComponent) clusterRoleBinding() client.Object {
 
 func (pr *policyRecommendationComponent) managedClustersWatchRoleBinding() client.Object {
 	if pr.cfg.Tenant.MultiTenant() {
-		return rcomponents.RoleBinding(PolicyRecommendationManagedClustersWatchRoleBindingName, ManagedClustersWatchClusterRoleName, PolicyRecommendationName, pr.cfg.Namespace)
+		// There are 2 service accounts that require permissions on managedcluster resources; the real service account in
+		// the tenant namespace that is used to watch managedcluster resources and the tigera-policy-recommendation:tigera-policy-recommendation
+		// service account which is hardcoded into the impersonation headers by voltron and used only for checking whether
+		// the request is allowed to access the managed cluster in question
+		policyRecRoleBinding := &rbacv1.RoleBinding{
+			TypeMeta:   metav1.TypeMeta{Kind: "RoleBinding", APIVersion: "rbac.authorization.k8s.io/v1"},
+			ObjectMeta: metav1.ObjectMeta{Name: PolicyRecommendationManagedClustersWatchRoleBindingName, Namespace: pr.cfg.Namespace},
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: "rbac.authorization.k8s.io",
+				Kind:     "ClusterRole",
+				Name:     ManagedClustersWatchClusterRoleName,
+			},
+			Subjects: []rbacv1.Subject{
+				{
+					Kind:      "ServiceAccount",
+					Name:      PolicyRecommendationName,
+					Namespace: pr.cfg.Namespace,
+				},
+				{
+					Kind:      "ServiceAccount",
+					Name:      "tigera-policy-recommendation",
+					Namespace: "tigera-policy-recommendation",
+				},
+			},
+		}
+		return policyRecRoleBinding
 	}
 
 	return rcomponents.ClusterRoleBinding(PolicyRecommendationManagedClustersWatchRoleBindingName, ManagedClustersWatchClusterRoleName, PolicyRecommendationName, []string{pr.cfg.Namespace})
@@ -375,7 +404,7 @@ func (pr *policyRecommendationComponent) deployment() *appsv1.Deployment {
 			Namespace: pr.cfg.Namespace,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.Int32ToPtr(1),
+			Replicas: ptr.To(int32(1)),
 			Template: *podTemplateSpec,
 		},
 	}
@@ -400,13 +429,13 @@ func (pr *policyRecommendationComponent) serviceAccount() client.Object {
 	}
 }
 
-// allowTigeraPolicyForPolicyRecommendation defines an allow-tigera policy for policy recommendation.
-func (pr *policyRecommendationComponent) allowTigeraPolicyForPolicyRecommendation() *v3.NetworkPolicy {
+// calicoSystemPolicyForPolicyRecommendation defines a calico-system policy for policy recommendation.
+func (pr *policyRecommendationComponent) calicoSystemPolicyForPolicyRecommendation() *v3.NetworkPolicy {
 	egressRules := []v3.Rule{
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.KubeAPIServerServiceSelectorEntityRule,
+			Destination: networkpolicy.KubeAPIServerEntityRule,
 		},
 		{
 			Action:      v3.Allow,
@@ -433,7 +462,7 @@ func (pr *policyRecommendationComponent) allowTigeraPolicyForPolicyRecommendatio
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
+			Tier:     networkpolicy.CalicoTierName,
 			Selector: networkpolicy.KubernetesAppSelector(PolicyRecommendationName),
 			Types:    []v3.PolicyType{v3.PolicyTypeEgress},
 			Ingress:  []v3.Rule{},
@@ -443,7 +472,6 @@ func (pr *policyRecommendationComponent) allowTigeraPolicyForPolicyRecommendatio
 }
 
 func (pr *policyRecommendationComponent) deprecatedObjects(isManagedCluster bool) []client.Object {
-
 	var deprecatedObjs []client.Object
 	if isManagedCluster {
 		deprecatedObjs = append(deprecatedObjs, []client.Object{
@@ -466,9 +494,11 @@ func (pr *policyRecommendationComponent) deprecatedObjects(isManagedCluster bool
 			&corev1.Namespace{
 				TypeMeta:   metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
 				ObjectMeta: metav1.ObjectMeta{Name: "tigera-policy-recommendation"},
-			})
+			},
+			// allow-tigera Tier was renamed to calico-system
+			networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("tigera-policy-recommendation", pr.cfg.Namespace),
+		)
 	}
 
 	return deprecatedObjs
-
 }

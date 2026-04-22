@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,7 +23,6 @@ import (
 
 // PacketCaptureAPISpec defines configuration for the Packet Capture API.
 type PacketCaptureAPISpec struct {
-
 	// PacketCaptureAPIDeployment configures the PacketCaptureAPI Deployment.
 	// +optional
 	PacketCaptureAPIDeployment *PacketCaptureAPIDeployment `json:"packetCaptureAPIDeployment,omitempty"`
@@ -31,7 +30,6 @@ type PacketCaptureAPISpec struct {
 
 // PacketCaptureAPIDeployment is the configuration for the PacketCaptureAPI Deployment.
 type PacketCaptureAPIDeployment struct {
-
 	// Spec is the specification of the PacketCaptureAPI Deployment.
 	// +optional
 	Spec *PacketCaptureAPIDeploymentSpec `json:"spec,omitempty"`
@@ -39,7 +37,6 @@ type PacketCaptureAPIDeployment struct {
 
 // PacketCaptureAPIDeploymentSpec defines configuration for the PacketCaptureAPI Deployment.
 type PacketCaptureAPIDeploymentSpec struct {
-
 	// Template describes the PacketCaptureAPI Deployment pod that will be created.
 	// +optional
 	Template *PacketCaptureAPIDeploymentPodTemplateSpec `json:"template,omitempty"`
@@ -47,7 +44,6 @@ type PacketCaptureAPIDeploymentSpec struct {
 
 // PacketCaptureAPIDeploymentPodTemplateSpec is the PacketCaptureAPI Deployment's PodTemplateSpec
 type PacketCaptureAPIDeploymentPodTemplateSpec struct {
-
 	// Spec is the PacketCaptureAPI Deployment's PodSpec.
 	// +optional
 	Spec *PacketCaptureAPIDeploymentPodSpec `json:"spec,omitempty"`
@@ -80,6 +76,16 @@ type PacketCaptureAPIDeploymentContainer struct {
 	// If omitted, the PacketCaptureAPI Deployment will use its default value for this container's resources.
 	// +optional
 	Resources *v1.ResourceRequirements `json:"resources,omitempty"`
+
+	// ReadinessProbe allows customization of the readiness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	ReadinessProbe *ProbeOverride `json:"readinessProbe,omitempty"`
+
+	// LivenessProbe allows customization of the liveness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	LivenessProbe *ProbeOverride `json:"livenessProbe,omitempty"`
 }
 
 // PacketCaptureAPIDeploymentInitContainer is a PacketCaptureAPI Deployment init container.
@@ -101,6 +107,8 @@ type PacketCaptureAPIDeploymentInitContainer struct {
 // +kubebuilder:resource:scope=Cluster
 
 // PacketCaptureAPI is used to configure the resource requirement for PacketCaptureAPI deployment. It must be named "tigera-secure".
+//
+// +kubebuilder:validation:XValidation:rule="self.metadata.name == 'tigera-secure'", message="resource name must be 'tigera-secure'"
 type PacketCaptureAPI struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
@@ -113,7 +121,6 @@ type PacketCaptureAPI struct {
 
 // PacketCaptureAPIStatus defines the observed state of the Packet Capture API.
 type PacketCaptureAPIStatus struct {
-
 	// State provides user-readable status.
 	State string `json:"state,omitempty"`
 

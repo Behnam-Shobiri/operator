@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -28,8 +28,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
-	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
 	"github.com/tigera/operator/pkg/controller/options"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
@@ -46,7 +46,7 @@ var log = logf.Log.WithName(controllerName)
 
 // Add creates a new Reconciler Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and start it when the Manager is started.
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	statusManager := status.New(mgr.GetClient(), ResourceName, opts.KubernetesVersion)
 	reconciler := newReconciler(mgr.GetClient(), mgr.GetScheme(), statusManager, opts.DetectedProvider, opts)
 
@@ -59,7 +59,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		return fmt.Errorf("%s failed to watch Installation resource: %w", controllerName, err)
 	}
 
-	if err = c.WatchObject(&crdv1.FelixConfiguration{}, &handler.EnqueueRequestForObject{}); err != nil {
+	if err = c.WatchObject(&v3.FelixConfiguration{}, &handler.EnqueueRequestForObject{}); err != nil {
 		return fmt.Errorf("%s failed to watch for Felix Configuration resource: %w", controllerName, err)
 	}
 
@@ -87,7 +87,7 @@ func newReconciler(
 	schema *runtime.Scheme,
 	statusMgr status.StatusManager,
 	p operatorv1.Provider,
-	opts options.AddOptions,
+	opts options.ControllerOptions,
 ) *Reconciler {
 	c := &Reconciler{
 		cli:           cli,
@@ -117,14 +117,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 	reqLogger.V(2).Info("Reconciling KubeProxy")
 
-	_, installationCR, err := utils.GetInstallation(ctx, r.cli)
+	_, installationSpec, err := utils.GetInstallationSpec(ctx, r.cli)
 	if err != nil {
 		return reconcile.Result{}, err
-	} else if installationCR == nil {
+	} else if installationSpec == nil {
 		return reconcile.Result{}, nil
 	}
 
-	if !installationCR.KubeProxyManagementEnabled() {
+	if !installationSpec.KubeProxyManagementEnabled() {
 		// If KubeProxyManagement is not Enabled, we should clean up kubeproxy from tigerastatus and not reconcile kube-proxy.
 		r.status.OnCRNotFound()
 		return reconcile.Result{}, nil
@@ -178,8 +178,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 
 		}
 		reqLogger.Info("kube-proxy DaemonSet patched to disable kube-proxy, since kubeProxyManagement is Enabled and BPFEnabled is true.")
-		if !installationCR.KubernetesProvider.IsNone() {
-			reqLogger.Info(fmt.Sprintf("[WARNING] Auto disabling kube-proxy may result in unexpected behavior in %s. ", installationCR.KubernetesProvider) +
+		if !installationSpec.KubernetesProvider.IsNone() {
+			reqLogger.Info(fmt.Sprintf("[WARNING] Auto disabling kube-proxy may result in unexpected behavior in %s. ", installationSpec.KubernetesProvider) +
 				"If the Operator fails to patch the kube-proxy DaemonSet, disable 'kubeProxyManagement' in the Installation CR " +
 				"and follow the eBPF installation guide at https://docs.tigera.io.")
 		}

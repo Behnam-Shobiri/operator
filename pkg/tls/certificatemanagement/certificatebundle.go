@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -192,7 +192,7 @@ func (t *trustedBundle) ConfigMap(namespace string) *corev1.ConfigMap {
 		return certs[i].GetName() < certs[j].GetName()
 	})
 	for _, cert := range certs {
-		pemBuf.WriteString(fmt.Sprintf("# certificate name: %s/%s\n%s\n\n", cert.GetNamespace(), cert.GetName(), string(cert.GetCertificatePEM())))
+		fmt.Fprintf(&pemBuf, "# certificate name: %s/%s\n%s\n\n", cert.GetNamespace(), cert.GetName(), string(cert.GetCertificatePEM()))
 	}
 
 	pemStr := pemBuf.String()

@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"net/url"
@@ -30,18 +31,24 @@ import (
 
 	"github.com/tigera/operator/internal/controller"
 	"github.com/tigera/operator/pkg/active"
+	"github.com/tigera/operator/pkg/apigroup"
 	"github.com/tigera/operator/pkg/apis"
 	"github.com/tigera/operator/pkg/awssgsetup"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
+	"github.com/tigera/operator/pkg/controller/metrics"
+	"github.com/tigera/operator/pkg/controller/migration/datastoremigration"
 	"github.com/tigera/operator/pkg/controller/options"
 	"github.com/tigera/operator/pkg/controller/utils"
-	"github.com/tigera/operator/pkg/crds"
 	"github.com/tigera/operator/pkg/dns"
+	"github.com/tigera/operator/pkg/imports/admission"
+	"github.com/tigera/operator/pkg/imports/crds"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/intrusiondetection/dpi"
+	"github.com/tigera/operator/pkg/render/istio"
 	"github.com/tigera/operator/pkg/render/logstorage"
 	"github.com/tigera/operator/pkg/render/logstorage/eck"
+	operatortls "github.com/tigera/operator/pkg/tls"
 	"github.com/tigera/operator/version"
 
 	operatortigeraiov1 "github.com/tigera/operator/api/v1"
@@ -59,6 +66,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 	"sigs.k8s.io/yaml"
@@ -66,7 +74,7 @@ import (
 )
 
 var (
-	defaultMetricsPort int32 = 8484
+	defaultMetricsPort int32 = 9484
 	scheme                   = runtime.NewScheme()
 	setupLog                 = ctrl.Log.WithName("setup")
 )
@@ -80,15 +88,13 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(apiextensions.AddToScheme(scheme))
 	utilruntime.Must(operatortigeraiov1.AddToScheme(scheme))
-	utilruntime.Must(apis.AddToScheme(scheme))
+	utilruntime.Must(datastoremigration.AddToScheme(scheme))
 }
 
 func printVersion() {
 	log.Info(fmt.Sprintf("Version: %v", version.VERSION))
 	log.Info(fmt.Sprintf("Go Version: %s", goruntime.Version()))
 	log.Info(fmt.Sprintf("Go OS/Arch: %s/%s", goruntime.GOOS, goruntime.GOARCH))
-	// TODO: Add this back if we can
-	// log.Info(fmt.Sprintf("Version of operator-sdk: %v", sdkVersion.Version))
 }
 
 func main() {
@@ -139,12 +145,13 @@ If a value other than 'all' is specified, the first CRD with a prefix of the spe
 	ctrl.SetLogger(zap.New(zap.WriteTo(os.Stdout), zap.UseFlagOptions(&opts)))
 
 	if showVersion {
-		// If the following line is updated then it might be necessary to update the release-verify target in the Makefile
+		// If the following line is updated then it might be necessary to update the assertOperatorImageVersion in hack/release/build.go
 		fmt.Println("Operator:", version.VERSION)
 		fmt.Println("Calico:", components.CalicoRelease)
 		fmt.Println("Enterprise:", components.EnterpriseRelease)
 		os.Exit(0)
 	}
+
 	if printImages != "" {
 		var cmpnts []components.Component
 		if strings.ToLower(printImages) == "list" {
@@ -165,6 +172,7 @@ If a value other than 'all' is specified, the first CRD with a prefix of the spe
 		}
 		os.Exit(0)
 	}
+
 	if printCalicoCRDs != "" {
 		if err := showCRDs(operatortigeraiov1.Calico, printCalicoCRDs); err != nil {
 			fmt.Println(err)
@@ -174,7 +182,7 @@ If a value other than 'all' is specified, the first CRD with a prefix of the spe
 	}
 
 	if printEnterpriseCRDs != "" {
-		if err := showCRDs(operatortigeraiov1.TigeraSecureEnterprise, printEnterpriseCRDs); err != nil {
+		if err := showCRDs(operatortigeraiov1.CalicoEnterprise, printEnterpriseCRDs); err != nil {
 			fmt.Println(err)
 			os.Exit(1)
 		}
@@ -210,6 +218,20 @@ If a value other than 'all' is specified, the first CRD with a prefix of the spe
 		os.Exit(1)
 	}
 
+	v3CRDs, err := apis.UseV3CRDS(cfg)
+	if err != nil {
+		log.Error(err, "Failed to determine CRD version to use")
+		os.Exit(1)
+	}
+
+	// Tell the component handler which API group to inject into workloads.
+	if v3CRDs {
+		apigroup.Set(apigroup.V3)
+	}
+
+	// Add the Calico API to the scheme, now that we know which backing CRD version to use.
+	utilruntime.Must(apis.AddToScheme(scheme, v3CRDs))
+
 	// Because we only run this as a job that is set up by the operator, it should not be
 	// launched except by an operator that is the active operator. So we do not need to
 	// check that we're the active operator before running the AWS SG setup.
@@ -241,11 +263,35 @@ If a value other than 'all' is specified, the first CRD with a prefix of the spe
 	active.WaitUntilActive(cs, c, sigHandler, setupLog)
 	log.Info("Active operator: proceeding")
 
+	metricsOpts := server.Options{
+		BindAddress: metricsAddr(),
+	}
+	if common.MetricsTLSEnabled() {
+		metricsOpts.SecureServing = true
+		clientAuth, err := operatortls.ParseClientAuthType(os.Getenv("METRICS_CLIENT_AUTH"))
+		if err != nil {
+			setupLog.Error(err, "invalid METRICS_CLIENT_AUTH")
+			os.Exit(1)
+		}
+		minVersion, err := operatortls.ParseTLSVersion(os.Getenv("TLS_MIN_VERSION"))
+		if err != nil {
+			setupLog.Error(err, "invalid TLS_MIN_VERSION")
+			os.Exit(1)
+		}
+		getCert := getCertificateFromFile(metricsTLSCertFile(), metricsTLSKeyFile())
+		metricsOpts.TLSOpts = []func(*tls.Config){
+			func(cfg *tls.Config) {
+				cfg.GetCertificate = getCert
+				cfg.ClientAuth = clientAuth
+				cfg.ClientCAs = loadClientCAFromFile(metricsTLSCAFile())
+				cfg.MinVersion = minVersion
+			},
+		}
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme: scheme,
-		Metrics: server.Options{
-			BindAddress: metricsAddr(),
-		},
+		Scheme:  scheme,
+		Metrics: metricsOpts,
 		WebhookServer: webhook.NewServer(webhook.Options{
 			Port: 9443,
 		}),
@@ -279,8 +325,15 @@ If a value other than 'all' is specified, the first CRD with a prefix of the spe
 	// If configured to manage CRDs, do a preliminary install of them here. The Installation controller
 	// will reconcile them as well, but we need to make sure they are installed before we start the rest of the controllers.
 	if bootstrapCRDs || manageCRDs {
-		if err := crds.Ensure(mgr.GetClient(), variant); err != nil {
+		setupLog.WithValues("v3", v3CRDs).Info("Ensuring CRDs are installed")
+
+		if err := crds.Ensure(mgr.GetClient(), variant, v3CRDs, setupLog); err != nil {
 			setupLog.Error(err, "Failed to ensure CRDs are created")
+			os.Exit(1)
+		}
+
+		if err := admission.Ensure(mgr.GetClient(), variant, v3CRDs, setupLog); err != nil {
+			setupLog.Error(err, "Failed to ensure MutatingAdmissionPolicies are created")
 			os.Exit(1)
 		}
 
@@ -407,6 +460,7 @@ If a value other than 'all' is specified, the first CRD with a prefix of the spe
 		render.LogCollectorNamespace,
 		render.CSIDaemonSetNamespace,
 		render.ManagerNamespace,
+		istio.IstioNamespace,
 	}
 	for _, ns := range badNamespaces {
 		if common.OperatorNamespace() == ns {
@@ -431,7 +485,7 @@ If a value other than 'all' is specified, the first CRD with a prefix of the spe
 		os.Exit(1)
 	}
 
-	options := options.AddOptions{
+	options := options.ControllerOptions{
 		DetectedProvider:    provider,
 		EnterpriseCRDExists: enterpriseCRDExists,
 		ClusterDomain:       clusterDomain,
@@ -441,6 +495,7 @@ If a value other than 'all' is specified, the first CRD with a prefix of the spe
 		K8sClientset:        clientset,
 		MultiTenant:         multiTenant,
 		ElasticExternal:     utils.UseExternalElastic(bootConfig),
+		UseV3CRDs:           v3CRDs,
 	}
 
 	// Before we start any controllers, make sure our options are valid.
@@ -453,6 +508,12 @@ If a value other than 'all' is specified, the first CRD with a prefix of the spe
 	if err != nil {
 		setupLog.Error(err, "unable to create controllers")
 		os.Exit(1)
+	}
+
+	// Register custom Prometheus metrics collector.
+	if common.MetricsEnabled() {
+		collector := metrics.NewOperatorCollector(mgr.GetClient(), enterpriseCRDExists)
+		ctrlmetrics.Registry.MustRegister(collector)
 	}
 
 	setupLog.Info("starting manager")
@@ -493,32 +554,9 @@ func setKubernetesServiceEnv(kubeconfigFile string) error {
 	return nil
 }
 
-// metricsAddr processes user-specified metrics host and port and sets
-// default values accordingly.
-func metricsAddr() string {
-	metricsHost := os.Getenv("METRICS_HOST")
-	metricsPort := os.Getenv("METRICS_PORT")
-
-	// if neither are specified, disable metrics.
-	if metricsHost == "" && metricsPort == "" {
-		// the controller-runtime accepts '0' to denote that metrics should be disabled.
-		return "0"
-	}
-	// if just a host is specified, listen on port 8484 of that host.
-	if metricsHost != "" && metricsPort == "" {
-		// the controller-runtime will choose a random port if none is specified.
-		// so use the defaultMetricsPort in that case.
-		return fmt.Sprintf("%s:%d", metricsHost, defaultMetricsPort)
-	}
-
-	// finally, handle cases where just a port is specified or both are specified in the same case
-	// since controller-runtime correctly uses all interfaces if no host is specified.
-	return fmt.Sprintf("%s:%s", metricsHost, metricsPort)
-}
-
 func showCRDs(variant operatortigeraiov1.ProductVariant, outputType string) error {
 	first := true
-	for _, v := range crds.GetCRDs(variant) {
+	for _, v := range crds.GetCRDs(variant, os.Getenv("CALICO_API_GROUP") == "projectcalico.org/v3") {
 		if outputType != "all" {
 			if !strings.HasPrefix(v.Name, outputType) {
 				continue
@@ -584,7 +622,7 @@ func executePreDeleteHook(ctx context.Context, c client.Client) error {
 }
 
 // verifyConfiguration verifies that the final configuration of the operator is correct before starting any controllers.
-func verifyConfiguration(ctx context.Context, cs kubernetes.Interface, opts options.AddOptions) error {
+func verifyConfiguration(ctx context.Context, cs kubernetes.Interface, opts options.ControllerOptions) error {
 	if opts.ElasticExternal {
 		// There should not be an internal-es cert
 		if _, err := cs.CoreV1().Secrets(render.ElasticsearchNamespace).Get(ctx, render.TigeraElasticsearchInternalCertSecret, metav1.GetOptions{}); err != nil {

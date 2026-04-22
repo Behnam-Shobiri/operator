@@ -1,4 +1,4 @@
-// Copyright (c) 2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2024-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ const (
 	OperatorName         = "elastic-operator"
 	OperatorNamespace    = "tigera-eck-operator"
 	LicenseConfigMapName = "elastic-licensing"
-	OperatorPolicyName   = networkpolicy.TigeraComponentPolicyPrefix + "elastic-operator-access"
+	OperatorPolicyName   = networkpolicy.CalicoComponentPolicyPrefix + "elastic-operator-access"
 	EnterpriseTrial      = "eck-trial-license"
 )
 
@@ -96,8 +96,10 @@ func (e *eck) Objects() ([]client.Object, []client.Object) {
 
 	toCreate = append(toCreate,
 		render.CreateNamespace(OperatorNamespace, e.cfg.Installation.KubernetesProvider, render.PSSRestricted, e.cfg.Installation.Azure),
-		e.operatorAllowTigeraPolicy(),
+		e.operatorCalicoSystemPolicy(),
 	)
+	// allow-tigera Tier was renamed to calico-system
+	toDelete = append(toDelete, networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("elastic-operator-access", OperatorNamespace))
 
 	toCreate = append(toCreate, render.CreateOperatorSecretsRoleBinding(OperatorNamespace))
 
@@ -214,6 +216,16 @@ func (e *eck) operatorClusterRole() *rbacv1.ClusterRole {
 			APIGroups: []string{"logstash.k8s.elastic.co"},
 			Resources: []string{"logstashes", "logstashes/status", "logstashes/finalizers"},
 			Verbs:     []string{"get", "list", "watch", "create", "update", "patch"},
+		},
+		{
+			APIGroups: []string{"autoops.k8s.elastic.co"},
+			Resources: []string{"autoopsagentpolicies", "autoopsagentpolicies/status", "autoopsagentpolicies/finalizers"},
+			Verbs:     []string{"get", "list", "watch"},
+		},
+		{
+			APIGroups: []string{"packageregistry.k8s.elastic.co"},
+			Resources: []string{"packageregistries", "packageregistries/status", "packageregistries/finalizers"},
+			Verbs:     []string{"get", "list", "watch"},
 		},
 		{
 			APIGroups: []string{"storage.k8s.io"},
@@ -363,9 +375,9 @@ func (e *eck) operatorStatefulSet() *appsv1.StatefulSet {
 							"--container-registry=" + e.cfg.Installation.Registry,
 							"--max-concurrent-reconciles=3",
 							"--ca-cert-validity=8760h",
-							"--ca-cert-rotate-before=24h",
+							"--ca-cert-rotate-before=720h",
+							"--cert-rotate-before=720h",
 							"--cert-validity=8760h",
-							"--cert-rotate-before=24h",
 							"--enable-webhook=false",
 							"--manage-webhook-certs=false",
 						},
@@ -422,7 +434,7 @@ func (e *eck) elasticEnterpriseTrial() *corev1.Secret {
 }
 
 // Allow the elastic-operator to communicate with API server, DNS and elastic search.
-func (e *eck) operatorAllowTigeraPolicy() *v3.NetworkPolicy {
+func (e *eck) operatorCalicoSystemPolicy() *v3.NetworkPolicy {
 	egressRules := []v3.Rule{}
 	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, e.cfg.Provider.IsOpenShift())
 	egressRules = append(egressRules, []v3.Rule{
@@ -446,7 +458,7 @@ func (e *eck) operatorAllowTigeraPolicy() *v3.NetworkPolicy {
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
+			Tier:     networkpolicy.CalicoTierName,
 			Selector: networkpolicy.KubernetesAppSelector(OperatorName),
 			Types:    []v3.PolicyType{v3.PolicyTypeEgress},
 			Egress:   egressRules,

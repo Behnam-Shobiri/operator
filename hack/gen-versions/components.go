@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -59,6 +59,11 @@ var (
 		"gateway-api-envoy-gateway":   "envoy-gateway",
 		"gateway-api-envoy-proxy":     "envoy-proxy",
 		"gateway-api-envoy-ratelimit": "envoy-ratelimit",
+		"istio-pilot":                 "istio-pilot",
+		"istio-install-cni":           "istio-install-cni",
+		"istio-ztunnel":               "istio-ztunnel",
+		"istio-proxyv2":               "istio-proxyv2",
+		"webhooks":                    "webhooks",
 	}
 
 	ignoredImages = map[string]struct{}{

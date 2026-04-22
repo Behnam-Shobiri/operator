@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -220,6 +220,46 @@ var (
 		variant:   calicoVariant,
 	}
 
+	ComponentCalicoIstioPilot = Component{
+		Version:   "master",
+		Image:     "istio-pilot",
+		Registry:  "",
+		imagePath: "",
+		variant:   calicoVariant,
+	}
+
+	ComponentCalicoIstioInstallCNI = Component{
+		Version:   "master",
+		Image:     "istio-install-cni",
+		Registry:  "",
+		imagePath: "",
+		variant:   calicoVariant,
+	}
+
+	ComponentCalicoIstioZTunnel = Component{
+		Version:   "master",
+		Image:     "istio-ztunnel",
+		Registry:  "",
+		imagePath: "",
+		variant:   calicoVariant,
+	}
+
+	ComponentCalicoIstioProxyv2 = Component{
+		Version:   "master",
+		Image:     "istio-proxyv2",
+		Registry:  "",
+		imagePath: "",
+		variant:   calicoVariant,
+	}
+
+	ComponentCalicoWebhooks = Component{
+		Version:   "master",
+		Image:     "webhooks",
+		Registry:  "",
+		imagePath: "",
+		variant:   calicoVariant,
+	}
+
 	CalicoImages = []Component{
 		ComponentCalicoCNI,
 		ComponentCalicoCNIFIPS,
@@ -246,5 +286,10 @@ var (
 		ComponentCalicoEnvoyProxy,
 		ComponentCalicoEnvoyRatelimit,
 		ComponentCalicoGuardian,
+		ComponentCalicoIstioPilot,
+		ComponentCalicoIstioInstallCNI,
+		ComponentCalicoIstioZTunnel,
+		ComponentCalicoIstioProxyv2,
+		ComponentCalicoWebhooks,
 	}
 )

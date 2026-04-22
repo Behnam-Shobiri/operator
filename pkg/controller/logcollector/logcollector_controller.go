@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/tigera/operator/pkg/dns"
 	corev1 "k8s.io/api/core/v1"
@@ -57,7 +58,7 @@ var log = logf.Log.WithName("controller_logcollector")
 
 // Add creates a new LogCollector Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	if !opts.EnterpriseCRDExists {
 		// No need to start this controller.
 		return nil
@@ -76,7 +77,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 	}
 
 	go utils.WaitToAddLicenseKeyWatch(c, opts.K8sClientset, log, licenseAPIReady)
-	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, opts.K8sClientset, log, tierWatchReady)
+	go utils.WaitToAddTierWatch(networkpolicy.CalicoTierName, c, opts.K8sClientset, log, tierWatchReady)
 	go utils.WaitToAddNetworkPolicyWatches(c, opts.K8sClientset, log, []types.NamespacedName{
 		{Name: render.FluentdPolicyName, Namespace: render.LogCollectorNamespace},
 	})
@@ -91,17 +92,14 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 }
 
 // newReconciler returns a new reconcile.Reconciler
-func newReconciler(mgr manager.Manager, opts options.AddOptions, licenseAPIReady *utils.ReadyFlag, tierWatchReady *utils.ReadyFlag) reconcile.Reconciler {
+func newReconciler(mgr manager.Manager, opts options.ControllerOptions, licenseAPIReady *utils.ReadyFlag, tierWatchReady *utils.ReadyFlag) reconcile.Reconciler {
 	c := &ReconcileLogCollector{
 		client:          mgr.GetClient(),
 		scheme:          mgr.GetScheme(),
-		provider:        opts.DetectedProvider,
 		status:          status.New(mgr.GetClient(), "log-collector", opts.KubernetesVersion),
-		clusterDomain:   opts.ClusterDomain,
 		licenseAPIReady: licenseAPIReady,
 		tierWatchReady:  tierWatchReady,
-		multiTenant:     opts.MultiTenant,
-		externalElastic: opts.ElasticExternal,
+		opts:            opts,
 	}
 	c.status.Run(opts.ShutdownContext)
 	return c
@@ -123,8 +121,7 @@ func add(mgr manager.Manager, c ctrlruntime.Controller) error {
 	}
 
 	if err = utils.AddInstallationWatch(c); err != nil {
-		log.V(5).Info("Failed to create network watch", "err", err)
-		return fmt.Errorf("logcollector-controller failed to watch Tigera network resource: %v", err)
+		return fmt.Errorf("logcollector-controller failed to watch Installation resource: %v", err)
 	}
 
 	if err = imageset.AddImageSetWatch(c); err != nil {
@@ -169,24 +166,19 @@ var _ reconcile.Reconciler = &ReconcileLogCollector{}
 
 // ReconcileLogCollector reconciles a LogCollector object
 type ReconcileLogCollector struct {
-	// This client, initialized using mgr.Client() above, is a split client
-	// that reads objects from the cache and writes to the apiserver
 	client          client.Client
 	scheme          *runtime.Scheme
-	provider        operatorv1.Provider
 	status          status.StatusManager
-	clusterDomain   string
 	licenseAPIReady *utils.ReadyFlag
 	tierWatchReady  *utils.ReadyFlag
-	multiTenant     bool
-	externalElastic bool
+	opts            options.ControllerOptions
 }
 
 // GetLogCollector returns the default LogCollector instance with defaults populated.
 func GetLogCollector(ctx context.Context, cli client.Client) (*operatorv1.LogCollector, error) {
 	// Fetch the instance. We only support a single instance named "tigera-secure".
 	instance := &operatorv1.LogCollector{}
-	err := cli.Get(ctx, utils.DefaultTSEEInstanceKey, instance)
+	err := cli.Get(ctx, utils.DefaultEnterpriseInstanceKey, instance)
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +287,7 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 		}
 	}
 
-	if !utils.IsAPIServerReady(r.client, reqLogger) {
+	if !utils.IsProjectCalicoV3Available(r.client, r.opts, reqLogger) {
 		r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for Tigera API server to be ready", nil, reqLogger)
 		return reconcile.Result{}, nil
 	}
@@ -306,14 +298,14 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
-	// Ensure the allow-tigera tier exists, before rendering any network policies within it.
-	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.TigeraComponentTierName}, &v3.Tier{}); err != nil {
+	// Ensure the calico-system tier exists, before rendering any network policies within it.
+	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.CalicoTierName}, &v3.Tier{}); err != nil {
 		if errors.IsNotFound(err) {
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for allow-tigera tier to be created, see the 'tiers' TigeraStatus for more information", err, reqLogger)
+			r.status.SetDegraded(operatorv1.ResourceNotReady, "Waiting for calico-system tier to be created, see the 'tiers' TigeraStatus for more information", err, reqLogger)
 			return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 		} else {
-			log.Error(err, "Error querying allow-tigera tier")
-			r.status.SetDegraded(operatorv1.ResourceNotReady, "Error querying allow-tigera tier", err, reqLogger)
+			log.Error(err, "Error querying calico-system tier")
+			r.status.SetDegraded(operatorv1.ResourceNotReady, "Error querying calico-system tier", err, reqLogger)
 			return reconcile.Result{}, err
 		}
 	}
@@ -336,7 +328,7 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 	// Fetch the Installation instance. We need this for a few reasons.
 	// - We need to make sure it has successfully completed installation.
 	// - We need to get the registry information from its spec.
-	variant, installation, err := utils.GetInstallation(ctx, r.client)
+	variant, installationSpec, err := utils.GetInstallationSpec(ctx, r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotFound, "Installation not found", err, reqLogger)
@@ -346,7 +338,7 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 		return reconcile.Result{}, err
 	}
 
-	pullSecrets, err := utils.GetNetworkingPullSecrets(installation, r.client)
+	pullSecrets, err := utils.GetInstallationPullSecrets(installationSpec, r.client)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "Error retrieving pull secrets", err, reqLogger)
 		return reconcile.Result{}, err
@@ -371,14 +363,14 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 		return reconcile.Result{}, err
 	}
 
-	certificateManager, err := certificatemanager.Create(r.client, installation, r.clusterDomain, common.OperatorNamespace())
+	certificateManager, err := certificatemanager.Create(r.client, installationSpec, r.opts.ClusterDomain, common.OperatorNamespace())
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create the Tigera CA", err, reqLogger)
 		return reconcile.Result{}, err
 	}
 
 	// fluentdKeyPair is the key pair fluentd presents to identify itself
-	httpInputServiceNames := dns.GetServiceDNSNames(render.FluentdInputService, render.LogCollectorNamespace, r.clusterDomain)
+	httpInputServiceNames := dns.GetServiceDNSNames(render.FluentdInputService, render.LogCollectorNamespace, r.opts.ClusterDomain)
 	fluentdKeyPair, err := certificateManager.GetOrCreateKeyPair(r.client, render.FluentdPrometheusTLSSecretName, common.OperatorNamespace(), append([]string{render.FluentdPrometheusTLSSecretName}, httpInputServiceNames...))
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Error creating TLS certificate", err, reqLogger)
@@ -395,7 +387,7 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 	}
 
 	// Determine whether or not this is a multi-tenant management cluster.
-	multiTenantManagement := r.multiTenant && managementCluster != nil
+	multiTenantManagement := r.opts.MultiTenant && managementCluster != nil
 	if instance.Spec.MultiTenantManagementClusterNamespace != "" && !multiTenantManagement {
 		r.status.SetDegraded(operatorv1.ResourceValidationError, "multiTenantManagementClusterNamespace can only be set on multi-tenant management clusters", nil, reqLogger)
 		return reconcile.Result{}, nil
@@ -421,7 +413,7 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 		linseedCertNamespace = instance.Spec.MultiTenantManagementClusterNamespace
 
 		// Make sure that a tenant actually exists in the configured namespace before continuing.
-		tenant, _, err = utils.GetTenant(ctx, r.multiTenant, r.client, instance.Spec.MultiTenantManagementClusterNamespace)
+		tenant, _, err = utils.GetTenant(ctx, r.opts.MultiTenant, r.client, instance.Spec.MultiTenantManagementClusterNamespace)
 		if err != nil {
 			r.status.SetDegraded(operatorv1.ResourceNotReady, fmt.Sprintf("Failed to retrieve tenant in ns %s", instance.Spec.MultiTenantManagementClusterNamespace), err, reqLogger)
 			return reconcile.Result{}, err
@@ -446,6 +438,18 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 	}
 
 	certificateManager.AddToStatusManager(r.status, render.LogCollectorNamespace)
+
+	gracePeriod := utils.ParseGracePeriod(license.Status.GracePeriod)
+	licenseStatus := utils.GetLicenseStatus(license, gracePeriod)
+	licenseExpired := licenseStatus == utils.LicenseStatusExpired
+
+	// When in the grace period, schedule a requeue so the controller automatically
+	// transitions to expired state when the grace period elapses.
+	var graceRequeueAfter time.Duration
+	if licenseStatus == utils.LicenseStatusInGracePeriod {
+		reqLogger.Info("License has expired and is within the grace period. Please renew your license to avoid service disruption.")
+		graceRequeueAfter = time.Until(license.Status.Expiry.Add(gracePeriod))
+	}
 
 	exportLogs := utils.IsFeatureActive(license, common.ExportLogsFeature)
 	if !exportLogs && instance.Spec.AdditionalStores != nil {
@@ -529,7 +533,7 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 	var eksConfig *render.EksCloudwatchLogConfig
 	var esClusterConfig *relasticsearch.ClusterConfig
 	var eksLogForwarderKeyPair certificatemanagement.KeyPairInterface
-	if installation.KubernetesProvider.IsEKS() {
+	if installationSpec.KubernetesProvider.IsEKS() {
 		log.Info("Managed kubernetes EKS found, getting necessary credentials and config")
 		if instance.Spec.AdditionalSources != nil {
 			if instance.Spec.AdditionalSources.EksCloudwatchLog != nil {
@@ -592,18 +596,19 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 		Filters:                filters,
 		EKSConfig:              eksConfig,
 		PullSecrets:            pullSecrets,
-		Installation:           installation,
-		ClusterDomain:          r.clusterDomain,
+		Installation:           installationSpec,
+		ClusterDomain:          r.opts.ClusterDomain,
 		OSType:                 rmeta.OSTypeLinux,
 		FluentdKeyPair:         fluentdKeyPair,
 		TrustedBundle:          trustedBundle,
 		ManagedCluster:         managedCluster,
 		UseSyslogCertificate:   useSyslogCertificate,
 		Tenant:                 tenant,
-		ExternalElastic:        r.externalElastic,
+		ExternalElastic:        r.opts.ElasticExternal,
 		EKSLogForwarderKeyPair: eksLogForwarderKeyPair,
 		PacketCapture:          packetcaptureapi,
 		NonClusterHost:         nonclusterhost,
+		LicenseExpired:         licenseExpired,
 	}
 	// Render the fluentd component for Linux
 	comp := render.Fluentd(fluentdCfg)
@@ -617,7 +622,7 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 		TrustedBundle: trustedBundle,
 	}
 
-	if installation.KubernetesProvider.IsEKS() {
+	if installationSpec.KubernetesProvider.IsEKS() {
 		if instance.Spec.AdditionalSources != nil {
 			if instance.Spec.AdditionalSources.EksCloudwatchLog != nil {
 				certificateComponent.ServiceAccounts = append(certificateComponent.ServiceAccounts, render.EKSLogForwarderName)
@@ -627,8 +632,8 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 	}
 
 	setUp := render.NewSetup(&render.SetUpConfiguration{
-		OpenShift:       r.provider.IsOpenShift(),
-		Installation:    installation,
+		OpenShift:       r.opts.DetectedProvider.IsOpenShift(),
+		Installation:    installationSpec,
 		PullSecrets:     pullSecrets,
 		Namespace:       render.LogCollectorNamespace,
 		PSS:             render.PSSPrivileged,
@@ -667,14 +672,15 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 			Filters:                filters,
 			EKSConfig:              eksConfig,
 			PullSecrets:            pullSecrets,
-			Installation:           installation,
-			ClusterDomain:          r.clusterDomain,
+			Installation:           installationSpec,
+			ClusterDomain:          r.opts.ClusterDomain,
 			OSType:                 rmeta.OSTypeWindows,
 			TrustedBundle:          trustedBundle,
 			ManagedCluster:         managedCluster,
 			UseSyslogCertificate:   useSyslogCertificate,
 			FluentdKeyPair:         fluentdKeyPair,
 			EKSLogForwarderKeyPair: eksLogForwarderKeyPair,
+			LicenseExpired:         licenseExpired,
 		}
 		comp = render.Fluentd(fluentdCfg)
 
@@ -692,6 +698,18 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 		}
 	}
 
+	if licenseExpired {
+		r.status.SetDegraded(operatorv1.ResourceValidationError,
+			"License is expired - Log forwarding is stopped. Contact Tigera support or email licensing@tigera.io", nil, reqLogger)
+		return reconcile.Result{}, nil
+	}
+
+	// Check BYO certificate expiry warnings.
+	certificatemanagement.CheckKeyPairWarnings(map[string]certificatemanagement.KeyPairInterface{
+		render.FluentdPrometheusTLSSecretName: fluentdKeyPair,
+		render.EKSLogForwarderTLSSecretName:   eksLogForwarderKeyPair,
+	}, r.status)
+
 	// Clear the degraded bit if we've reached this far.
 	r.status.ClearDegraded()
 
@@ -706,7 +724,7 @@ func (r *ReconcileLogCollector) Reconcile(ctx context.Context, request reconcile
 	if err = r.client.Status().Update(ctx, instance); err != nil {
 		return reconcile.Result{}, err
 	}
-	return reconcile.Result{}, nil
+	return reconcile.Result{RequeueAfter: graceRequeueAfter}, nil
 }
 
 func getS3Credential(client client.Client) (*render.S3Credential, error) {

@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -52,7 +52,7 @@ const (
 	TyphaContainerName = "calico-typha"
 
 	TyphaNonClusterHostSuffix            = "-noncluster-host"
-	TyphaNonClusterHostNetworkPolicyName = networkpolicy.TigeraComponentPolicyPrefix + "typha-noncluster-host-access"
+	TyphaNonClusterHostNetworkPolicyName = networkpolicy.CalicoComponentPolicyPrefix + "typha-noncluster-host-access"
 
 	defaultTyphaTerminationGracePeriod = 300
 	shutdownTimeoutEnvVar              = "TYPHA_SHUTDOWNTIMEOUTSECS"
@@ -99,7 +99,7 @@ func (c *typhaComponent) ResolveImages(is *operatorv1.ImageSet) error {
 	path := c.cfg.Installation.ImagePath
 	prefix := c.cfg.Installation.ImagePrefix
 	var err error
-	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if c.cfg.Installation.Variant.IsEnterprise() {
 		c.typhaImage, err = components.GetReference(components.ComponentTigeraTypha, reg, path, prefix, is)
 	} else {
 		if operatorv1.IsFIPSModeEnabled(c.cfg.Installation.FIPSMode) {
@@ -137,7 +137,13 @@ func (c *typhaComponent) Objects() ([]client.Object, []client.Object) {
 }
 
 func NewTyphaNonClusterHostPolicy(cfg *TyphaConfiguration) Component {
-	return NewPassthrough(typhaNonClusterHostAllowTigeraPolicy(cfg))
+	return NewPassthrough(
+		[]client.Object{typhaNonClusterHostCalicoSystemPolicy(cfg)},
+		[]client.Object{
+			// allow-tigera Tier was renamed to calico-system
+			networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("typha-noncluster-host-access", common.CalicoNamespace),
+		},
+	)
 }
 
 func (c *typhaComponent) typhaPodDisruptionBudget() *policyv1.PodDisruptionBudget {
@@ -261,7 +267,7 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 			},
 			{
 				// For monitoring Calico-specific configuration.
-				APIGroups: []string{"crd.projectcalico.org"},
+				APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 				Resources: []string{
 					"bgpconfigurations",
 					"bgppeers",
@@ -288,7 +294,7 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 			{
 				// For migration code in calico/node startup only. Remove when the migration
 				// code is removed from node.
-				APIGroups: []string{"crd.projectcalico.org"},
+				APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 				Resources: []string{
 					"globalbgpconfigs",
 					"globalfelixconfigs",
@@ -297,7 +303,7 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 			},
 			{
 				// Calico creates some configuration on startup.
-				APIGroups: []string{"crd.projectcalico.org"},
+				APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 				Resources: []string{
 					"clusterinformations",
 					"felixconfigurations",
@@ -307,7 +313,7 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 			},
 			{
 				// Calico creates some tiers on startup.
-				APIGroups: []string{"crd.projectcalico.org"},
+				APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 				Resources: []string{
 					"tiers",
 				},
@@ -322,7 +328,7 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 			{
 				// Most IPAM resources need full CRUD permissions so we can allocate and
 				// release IP addresses for pods.
-				APIGroups: []string{"crd.projectcalico.org"},
+				APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 				Resources: []string{
 					"blockaffinities",
 					"ipamblocks",
@@ -332,23 +338,29 @@ func (c *typhaComponent) typhaRole() *rbacv1.ClusterRole {
 			},
 			{
 				// But, we only need to be able to query for IPAM config.
-				APIGroups: []string{"crd.projectcalico.org"},
-				Resources: []string{"ipamconfigs"},
+				APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
+				Resources: []string{"ipamconfigurations"},
 				Verbs:     []string{"get"},
 			},
 			{
 				// confd (and in some cases, felix) watches block affinities for route aggregation.
-				APIGroups: []string{"crd.projectcalico.org"},
+				APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 				Resources: []string{"blockaffinities"},
 				Verbs:     []string{"watch"},
 			},
+			{
+				// For monitoring KubeVirt live migration.
+				APIGroups: []string{"kubevirt.io"},
+				Resources: []string{"virtualmachineinstancemigrations"},
+				Verbs:     []string{"get", "list", "watch"},
+			},
 		},
 	}
-	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if c.cfg.Installation.Variant.IsEnterprise() {
 		extraRules := []rbacv1.PolicyRule{
 			{
 				// Tigera Secure needs to be able to read licenses, and config.
-				APIGroups: []string{"crd.projectcalico.org"},
+				APIGroups: []string{"projectcalico.org", "crd.projectcalico.org"},
 				Resources: []string{
 					"licensekeys",
 					"remoteclusterconfigurations",
@@ -617,7 +629,7 @@ func (c *typhaComponent) typhaEnvVars(typhaSecret certificatemanagement.KeyPairI
 		typhaEnv = append(typhaEnv, corev1.EnvVar{Name: "FELIX_INTERFACEPREFIX", Value: "azv"})
 	}
 
-	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if c.cfg.Installation.Variant.IsEnterprise() {
 		if c.cfg.Installation.CalicoNetwork != nil && c.cfg.Installation.CalicoNetwork.MultiInterfaceMode != nil {
 			typhaEnv = append(typhaEnv, corev1.EnvVar{
 				Name:  "MULTI_INTERFACE_MODE",
@@ -635,7 +647,7 @@ func (c *typhaComponent) typhaEnvVars(typhaSecret certificatemanagement.KeyPairI
 		})
 	}
 
-	typhaEnv = append(typhaEnv, c.cfg.K8sServiceEp.EnvVars(true, c.cfg.Installation.KubernetesProvider)...)
+	typhaEnv = append(typhaEnv, c.cfg.K8sServiceEp.EnvVars()...)
 
 	if c.cfg.Installation.TyphaMetricsPort != nil {
 		// If a typha metrics port was given, then enable typha prometheus metrics and set the port.
@@ -811,7 +823,7 @@ func (c *typhaComponent) typhaPrometheusService() *corev1.Service {
 	}
 }
 
-func typhaNonClusterHostAllowTigeraPolicy(cfg *TyphaConfiguration) *v3.NetworkPolicy {
+func typhaNonClusterHostCalicoSystemPolicy(cfg *TyphaConfiguration) *v3.NetworkPolicy {
 	egressRules := []v3.Rule{}
 	egressRules = networkpolicy.AppendDNSEgressRules(egressRules, cfg.Installation.KubernetesProvider.IsOpenShift())
 	egressRules = append(egressRules, []v3.Rule{
@@ -848,7 +860,7 @@ func typhaNonClusterHostAllowTigeraPolicy(cfg *TyphaConfiguration) *v3.NetworkPo
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
+			Tier:     networkpolicy.CalicoTierName,
 			Selector: networkpolicy.KubernetesAppSelector(common.TyphaDeploymentName + TyphaNonClusterHostSuffix),
 			Types:    []v3.PolicyType{v3.PolicyTypeEgress, v3.PolicyTypeIngress},
 			Egress:   egressRules,

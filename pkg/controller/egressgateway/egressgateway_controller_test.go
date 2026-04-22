@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
 
@@ -33,6 +33,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -40,14 +41,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
-	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
 	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/test"
 )
 
@@ -63,7 +63,7 @@ var _ = Describe("Egress Gateway controller tests", func() {
 		BeforeEach(func() {
 			// The schema contains all objects that should be known to the fake client when the test runs.
 			scheme = runtime.NewScheme()
-			Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+			Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 			Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(batchv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -74,12 +74,12 @@ var _ = Describe("Egress Gateway controller tests", func() {
 			installation = &operatorv1.Installation{
 				ObjectMeta: metav1.ObjectMeta{Name: "default"},
 				Spec: operatorv1.InstallationSpec{
-					Variant:            operatorv1.TigeraSecureEnterprise,
+					Variant:            operatorv1.CalicoEnterprise,
 					KubernetesProvider: operatorv1.ProviderNone,
 					Registry:           "some.registry.org/",
 				},
 				Status: operatorv1.InstallationStatus{
-					Variant: operatorv1.TigeraSecureEnterprise,
+					Variant: operatorv1.CalicoEnterprise,
 					Computed: &operatorv1.InstallationSpec{
 						Registry: "my-reg",
 					},
@@ -96,11 +96,11 @@ var _ = Describe("Egress Gateway controller tests", func() {
 				licenseAPIReady: &utils.ReadyFlag{},
 			}
 
-			Expect(c.Create(ctx, &crdv1.IPPool{
-				ObjectMeta: metav1.ObjectMeta{Name: "ippool-1"}, Spec: crdv1.IPPoolSpec{
+			Expect(c.Create(ctx, &v3.IPPool{
+				ObjectMeta: metav1.ObjectMeta{Name: "ippool-1"}, Spec: v3.IPPoolSpec{
 					CIDR:             "1.2.3.0/24",
-					VXLANMode:        crdv1.VXLANModeAlways,
-					IPIPMode:         crdv1.IPIPModeNever,
+					VXLANMode:        v3.VXLANModeAlways,
+					IPIPMode:         v3.IPIPModeNever,
 					NATOutgoing:      true,
 					Disabled:         false,
 					DisableBGPExport: true,
@@ -108,11 +108,11 @@ var _ = Describe("Egress Gateway controller tests", func() {
 				},
 			})).NotTo(HaveOccurred())
 
-			Expect(c.Create(ctx, &crdv1.IPPool{
-				ObjectMeta: metav1.ObjectMeta{Name: "ippool-2"}, Spec: crdv1.IPPoolSpec{
+			Expect(c.Create(ctx, &v3.IPPool{
+				ObjectMeta: metav1.ObjectMeta{Name: "ippool-2"}, Spec: v3.IPPoolSpec{
 					CIDR:             "1.2.4.0/24",
-					VXLANMode:        crdv1.VXLANModeAlways,
-					IPIPMode:         crdv1.IPIPModeNever,
+					VXLANMode:        v3.VXLANModeAlways,
+					IPIPMode:         v3.IPIPModeNever,
 					NATOutgoing:      true,
 					Disabled:         false,
 					DisableBGPExport: true,
@@ -120,32 +120,32 @@ var _ = Describe("Egress Gateway controller tests", func() {
 				},
 			})).NotTo(HaveOccurred())
 
-			Expect(c.Create(ctx, &crdv1.IPPool{
-				ObjectMeta: metav1.ObjectMeta{Name: "ippool-4"}, Spec: crdv1.IPPoolSpec{
+			Expect(c.Create(ctx, &v3.IPPool{
+				ObjectMeta: metav1.ObjectMeta{Name: "ippool-4"}, Spec: v3.IPPoolSpec{
 					CIDR:             "1.2.5.0/24",
-					VXLANMode:        crdv1.VXLANModeAlways,
-					IPIPMode:         crdv1.IPIPModeNever,
+					VXLANMode:        v3.VXLANModeAlways,
+					IPIPMode:         v3.IPIPModeNever,
 					NATOutgoing:      true,
 					Disabled:         false,
 					DisableBGPExport: true,
 				},
 			})).NotTo(HaveOccurred())
 
-			Expect(c.Create(ctx, &crdv1.FelixConfiguration{
+			Expect(c.Create(ctx, &v3.FelixConfiguration{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "default",
 				},
 			})).NotTo(HaveOccurred())
 
 			var routeTableIndex uint32 = 1
-			Expect(c.Create(ctx, &crdv1.ExternalNetwork{
-				ObjectMeta: metav1.ObjectMeta{Name: "one"}, Spec: crdv1.ExternalNetworkSpec{
+			Expect(c.Create(ctx, &v3.ExternalNetwork{
+				ObjectMeta: metav1.ObjectMeta{Name: "one"}, Spec: v3.ExternalNetworkSpec{
 					RouteTableIndex: &routeTableIndex,
 				},
 			})).NotTo(HaveOccurred())
 
-			Expect(c.Create(ctx, &crdv1.ExternalNetwork{
-				ObjectMeta: metav1.ObjectMeta{Name: "two"}, Spec: crdv1.ExternalNetworkSpec{
+			Expect(c.Create(ctx, &v3.ExternalNetwork{
+				ObjectMeta: metav1.ObjectMeta{Name: "two"}, Spec: v3.ExternalNetworkSpec{
 					RouteTableIndex: &routeTableIndex,
 				},
 			})).NotTo(HaveOccurred())
@@ -267,7 +267,7 @@ var _ = Describe("Egress Gateway controller tests", func() {
 			for _, elem := range expectedEgwEnvVar {
 				Expect(egwContainer.Env).To(ContainElement(elem))
 			}
-			fc := &crdv1.FelixConfiguration{}
+			fc := &v3.FelixConfiguration{}
 			Expect(c.Get(ctx, types.NamespacedName{Name: "default", Namespace: ""}, fc)).NotTo(HaveOccurred())
 			Expect(fc.Spec.PolicySyncPathPrefix).To(Equal("/var/run/nodeagent"))
 
@@ -324,7 +324,7 @@ var _ = Describe("Egress Gateway controller tests", func() {
 				Expect(initContainer.Env).To(ContainElement(elem))
 				Expect(initContainer_blue.Env).To(ContainElement(elem))
 			}
-			var backend crdv1.IptablesBackend
+			var backend v3.IptablesBackend
 			backend = "Auto"
 			fc.Spec.IptablesBackend = &backend
 			Expect(c.Update(ctx, fc)).NotTo(HaveOccurred())
@@ -766,8 +766,8 @@ var _ = Describe("Egress Gateway controller tests", func() {
 			egw := &operatorv1.EgressGateway{
 				ObjectMeta: metav1.ObjectMeta{Name: "calico-red", Namespace: "calico-egress"},
 				Spec: operatorv1.EgressGatewaySpec{
-					Replicas:    ptr.ToPtr(int32(2)),
-					LogSeverity: ptr.ToPtr(operatorv1.LogSeverityInfo),
+					Replicas:    ptr.To(int32(2)),
+					LogSeverity: ptr.To(operatorv1.LogSeverityInfo),
 					IPPools: []operatorv1.EgressGatewayIPPool{
 						{Name: "ippool-1"},
 					},

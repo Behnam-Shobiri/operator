@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2019-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,13 +21,13 @@ import (
 	"fmt"
 	"time"
 
-	. "github.com/onsi/ginkgo"
-	"github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/mock"
 
+	admissionv1beta1 "k8s.io/api/admissionregistration/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
@@ -40,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	kfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/tools/cache"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -48,7 +49,6 @@ import (
 
 	operator "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
-	crdv1 "github.com/tigera/operator/pkg/apis/crd.projectcalico.org/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
@@ -56,7 +56,7 @@ import (
 	"github.com/tigera/operator/pkg/controller/utils"
 	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
 	"github.com/tigera/operator/pkg/dns"
-	"github.com/tigera/operator/pkg/ptr"
+	"github.com/tigera/operator/pkg/imports/admission"
 	"github.com/tigera/operator/pkg/render"
 	"github.com/tigera/operator/pkg/render/common/secret"
 	"github.com/tigera/operator/pkg/render/monitor"
@@ -101,7 +101,7 @@ var _ = Describe("Testing core-controller installation", func() {
 	var scheme *runtime.Scheme
 	var mockStatus *status.MockStatus
 
-	table.DescribeTable("checking rendering configuration",
+	DescribeTable("checking rendering configuration",
 		func(detectedProvider, configuredProvider operator.Provider, expectedErr error) {
 			configuredInstallation := &operator.Installation{}
 			configuredInstallation.Spec.KubernetesProvider = configuredProvider
@@ -114,9 +114,9 @@ var _ = Describe("Testing core-controller installation", func() {
 				Expect(err).To(Equal(expectedErr))
 			}
 		},
-		table.Entry("Same detected/configured provider", operator.ProviderOpenShift, operator.ProviderOpenShift, nil),
-		table.Entry("Different detected/configured provider", operator.ProviderOpenShift, operator.ProviderDockerEE, errMismatchedError),
-		table.Entry("Same detected/configured managed provider", operator.ProviderEKS, operator.ProviderEKS, nil),
+		Entry("Same detected/configured provider", operator.ProviderOpenShift, operator.ProviderOpenShift, nil),
+		Entry("Different detected/configured provider", operator.ProviderOpenShift, operator.ProviderDockerEE, errMismatchedError),
+		Entry("Same detected/configured managed provider", operator.ProviderEKS, operator.ProviderEKS, nil),
 	)
 
 	notReady := &utils.ReadyFlag{}
@@ -129,7 +129,7 @@ var _ = Describe("Testing core-controller installation", func() {
 		BeforeEach(func() {
 			// The schema contains all objects that should be known to the fake client when the test runs.
 			scheme = runtime.NewScheme()
-			Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+			Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 			Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(schedv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -157,7 +157,7 @@ var _ = Describe("Testing core-controller installation", func() {
 					Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
 				},
 			}
-			cs = kfake.NewSimpleClientset(objs...)
+			cs = kfake.NewClientset(objs...)
 
 			// Create an object we can use throughout the test to do the compliance reconcile loops.
 			mockStatus = &status.MockStatus{}
@@ -168,6 +168,8 @@ var _ = Describe("Testing core-controller installation", func() {
 			mockStatus.On("IsAvailable").Return(true)
 			mockStatus.On("OnCRFound").Return()
 			mockStatus.On("ClearDegraded")
+			mockStatus.On("SetWarning", mock.Anything, mock.Anything).Return()
+			mockStatus.On("ClearWarning", mock.Anything).Return()
 			mockStatus.On("AddCertificateSigningRequests", mock.Anything)
 			mockStatus.On("RemoveCertificateSigningRequests", mock.Anything)
 			mockStatus.On("ReadyToMonitor")
@@ -194,6 +196,7 @@ var _ = Describe("Testing core-controller installation", func() {
 				enterpriseCRDsExist:  true,
 				migrationChecked:     true,
 				tierWatchReady:       ready,
+				migrationWatchReady:  &utils.ReadyFlag{},
 				newComponentHandler:  utils.NewComponentHandler,
 			}
 
@@ -206,7 +209,7 @@ var _ = Describe("Testing core-controller installation", func() {
 
 			Expect(c.Create(ctx, prometheusTLS.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, certificateManager.KeyPair().Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
-			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})).NotTo(HaveOccurred())
 
 			// We start off with a 'standard' installation, with nothing special
 			Expect(c.Create(
@@ -214,12 +217,12 @@ var _ = Describe("Testing core-controller installation", func() {
 				&operator.Installation{
 					ObjectMeta: metav1.ObjectMeta{Name: "default"},
 					Spec: operator.InstallationSpec{
-						Variant:               operator.TigeraSecureEnterprise,
+						Variant:               operator.CalicoEnterprise,
 						Registry:              "some.registry.org/",
 						CertificateManagement: &operator.CertificateManagement{CACert: prometheusTLS.GetCertificatePEM()},
 					},
 					Status: operator.InstallationStatus{
-						Variant: operator.TigeraSecureEnterprise,
+						Variant: operator.CalicoEnterprise,
 						Computed: &operator.InstallationSpec{
 							Registry: "my-reg",
 							// The test is provider agnostic.
@@ -230,14 +233,14 @@ var _ = Describe("Testing core-controller installation", func() {
 
 			// In most clusters, the IP pool controller is responsible for creating IP pools. The Installation controller waits for this,
 			// so we need to create those pools here.
-			pool := crdv1.IPPool{
+			pool := v3.IPPool{
 				ObjectMeta: metav1.ObjectMeta{Name: "default-pool-v4"},
-				Spec: crdv1.IPPoolSpec{
+				Spec: v3.IPPoolSpec{
 					CIDR:         "192.168.0.0/16",
 					NATOutgoing:  true,
 					BlockSize:    26,
 					NodeSelector: "all()",
-					VXLANMode:    crdv1.VXLANModeAlways,
+					VXLANMode:    v3.VXLANModeAlways,
 				},
 			}
 			Expect(c.Create(ctx, &pool)).NotTo(HaveOccurred())
@@ -681,15 +684,15 @@ var _ = Describe("Testing core-controller installation", func() {
 					KubernetesProvider: operator.ProviderDockerEE,
 				},
 			}
-			currentPools := crdv1.IPPoolList{}
-			currentPools.Items = append(currentPools.Items, crdv1.IPPool{
+			currentPools := v3.IPPoolList{}
+			currentPools.Items = append(currentPools.Items, v3.IPPool{
 				ObjectMeta: metav1.ObjectMeta{Name: "default-pool-v4"},
-				Spec: crdv1.IPPoolSpec{
+				Spec: v3.IPPoolSpec{
 					CIDR:         "192.168.0.0/16",
 					NATOutgoing:  true,
 					BlockSize:    26,
 					NodeSelector: "all()",
-					VXLANMode:    crdv1.VXLANModeAlways,
+					VXLANMode:    v3.VXLANModeAlways,
 				},
 			})
 			Expect(MergeAndFillDefaults(installation, nil, &currentPools)).To(BeNil())
@@ -698,7 +701,7 @@ var _ = Describe("Testing core-controller installation", func() {
 		})
 	})
 
-	table.DescribeTable("test Node Affinity defaults",
+	DescribeTable("test Node Affinity defaults",
 		func(expected bool, provider operator.Provider, result []corev1.NodeSelectorTerm) {
 			installation := &operator.Installation{
 				Spec: operator.InstallationSpec{
@@ -713,7 +716,7 @@ var _ = Describe("Testing core-controller installation", func() {
 				Expect(installation.Spec.TyphaAffinity).To(BeNil())
 			}
 		},
-		table.Entry("AKS provider sets default",
+		Entry("AKS provider sets default",
 			true,
 			operator.ProviderAKS,
 			[]corev1.NodeSelectorTerm{{
@@ -730,7 +733,7 @@ var _ = Describe("Testing core-controller installation", func() {
 				},
 			}},
 		),
-		table.Entry("Expect no default value for DockerEE provider",
+		Entry("Expect no default value for DockerEE provider",
 			false,
 			operator.ProviderDockerEE,
 			[]corev1.NodeSelectorTerm{},
@@ -744,7 +747,7 @@ var _ = Describe("Testing core-controller installation", func() {
 		BeforeEach(func() {
 			// The schema contains all objects that should be known to the fake client when the test runs.
 			scheme = runtime.NewScheme()
-			Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+			Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 			Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(schedv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -774,7 +777,7 @@ var _ = Describe("Testing core-controller installation", func() {
 					},
 				},
 			}
-			cs = kfake.NewSimpleClientset(objs...)
+			cs = kfake.NewClientset(objs...)
 
 			// Create an object we can use throughout the test to do the compliance reconcile loops.
 			mockStatus = &status.MockStatus{}
@@ -785,6 +788,8 @@ var _ = Describe("Testing core-controller installation", func() {
 			mockStatus.On("IsAvailable").Return(true)
 			mockStatus.On("OnCRFound").Return()
 			mockStatus.On("ClearDegraded")
+			mockStatus.On("SetWarning", mock.Anything, mock.Anything).Return()
+			mockStatus.On("ClearWarning", mock.Anything).Return()
 			mockStatus.On("AddCertificateSigningRequests", mock.Anything)
 			mockStatus.On("RemoveCertificateSigningRequests", mock.Anything)
 			mockStatus.On("ReadyToMonitor")
@@ -812,6 +817,7 @@ var _ = Describe("Testing core-controller installation", func() {
 				migrationChecked:     true,
 				clusterDomain:        dns.DefaultClusterDomain,
 				tierWatchReady:       ready,
+				migrationWatchReady:  &utils.ReadyFlag{},
 				newComponentHandler:  utils.NewComponentHandler,
 			}
 			r.typhaAutoscaler.start(ctx)
@@ -819,11 +825,11 @@ var _ = Describe("Testing core-controller installation", func() {
 			cr = &operator.Installation{
 				ObjectMeta: metav1.ObjectMeta{Name: "default"},
 				Spec: operator.InstallationSpec{
-					Variant:  operator.TigeraSecureEnterprise,
+					Variant:  operator.CalicoEnterprise,
 					Registry: "some.registry.org/",
 				},
 				Status: operator.InstallationStatus{
-					Variant: operator.TigeraSecureEnterprise,
+					Variant: operator.CalicoEnterprise,
 					Computed: &operator.InstallationSpec{
 						Registry: "my-reg",
 						// The test is provider agnostic.
@@ -836,20 +842,20 @@ var _ = Describe("Testing core-controller installation", func() {
 
 			// In most clusters, the IP pool controller is responsible for creating IP pools. The Installation controller waits for this,
 			// so we need to create those pools here.
-			pool := crdv1.IPPool{
+			pool := v3.IPPool{
 				ObjectMeta: metav1.ObjectMeta{Name: "default-pool-v4"},
-				Spec: crdv1.IPPoolSpec{
+				Spec: v3.IPPoolSpec{
 					CIDR:         "192.168.0.0/16",
 					NATOutgoing:  true,
 					BlockSize:    26,
 					NodeSelector: "all()",
-					VXLANMode:    crdv1.VXLANModeAlways,
+					VXLANMode:    v3.VXLANModeAlways,
 				},
 			}
 			Expect(c.Create(ctx, &pool)).NotTo(HaveOccurred())
 
 			// Configure ourselves as a management cluster.
-			Expect(c.Create(ctx, &operator.ManagementCluster{ObjectMeta: metav1.ObjectMeta{Name: utils.DefaultTSEEInstanceKey.Name}})).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, &operator.ManagementCluster{ObjectMeta: metav1.ObjectMeta{Name: utils.DefaultEnterpriseInstanceKey.Name}})).NotTo(HaveOccurred())
 
 			expectedDNSNames = dns.GetServiceDNSNames(render.ManagerServiceName, render.ManagerNamespace, dns.DefaultClusterDomain)
 			expectedDNSNames = append(expectedDNSNames, "localhost")
@@ -860,7 +866,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			prometheusTLS, err := certificateManager.GetOrCreateKeyPair(c, monitor.PrometheusClientTLSSecretName, common.OperatorNamespace(), []string{monitor.PrometheusClientTLSSecretName})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, prometheusTLS.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
-			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})).NotTo(HaveOccurred())
 		})
 
 		AfterEach(func() {
@@ -950,7 +956,7 @@ var _ = Describe("Testing core-controller installation", func() {
 		BeforeEach(func() {
 			// The schema contains all objects that should be known to the fake client when the test runs.
 			scheme = runtime.NewScheme()
-			Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+			Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 			Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(schedv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -995,7 +1001,7 @@ var _ = Describe("Testing core-controller installation", func() {
 					Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
 				},
 			}
-			cs = kfake.NewSimpleClientset(objs...)
+			cs = kfake.NewClientset(objs...)
 
 			// Create an object we can use throughout the test to do the core reconcile loops.
 			mockStatus = &status.MockStatus{}
@@ -1004,6 +1010,8 @@ var _ = Describe("Testing core-controller installation", func() {
 			mockStatus.On("IsAvailable").Return(true)
 			mockStatus.On("OnCRFound").Return()
 			mockStatus.On("ClearDegraded")
+			mockStatus.On("SetWarning", mock.Anything, mock.Anything).Return()
+			mockStatus.On("ClearWarning", mock.Anything).Return()
 			mockStatus.On("AddCertificateSigningRequests", mock.Anything)
 			mockStatus.On("ReadyToMonitor")
 			mockStatus.On("SetMetaData", mock.Anything).Return()
@@ -1030,6 +1038,7 @@ var _ = Describe("Testing core-controller installation", func() {
 				enterpriseCRDsExist:  true,
 				migrationChecked:     true,
 				tierWatchReady:       ready,
+				migrationWatchReady:  &utils.ReadyFlag{},
 				newComponentHandler:  utils.NewComponentHandler,
 			}
 
@@ -1040,14 +1049,14 @@ var _ = Describe("Testing core-controller installation", func() {
 
 			// In most clusters, the IP pool controller is responsible for creating IP pools. The Installation controller waits for this,
 			// so we need to create those pools here.
-			pool := crdv1.IPPool{
+			pool := v3.IPPool{
 				ObjectMeta: metav1.ObjectMeta{Name: "default-pool-v4"},
-				Spec: crdv1.IPPoolSpec{
+				Spec: v3.IPPoolSpec{
 					CIDR:         "192.168.0.0/16",
 					NATOutgoing:  true,
 					BlockSize:    26,
 					NodeSelector: "all()",
-					VXLANMode:    crdv1.VXLANModeAlways,
+					VXLANMode:    v3.VXLANModeAlways,
 				},
 			}
 			Expect(c.Create(ctx, &pool)).NotTo(HaveOccurred())
@@ -1056,9 +1065,12 @@ var _ = Describe("Testing core-controller installation", func() {
 			cr = &operator.Installation{
 				ObjectMeta: metav1.ObjectMeta{Name: "default"},
 				Spec: operator.InstallationSpec{
-					Variant:               operator.TigeraSecureEnterprise,
+					Variant:               operator.CalicoEnterprise,
 					Registry:              "some.registry.org/",
 					CertificateManagement: &operator.CertificateManagement{CACert: cert},
+					ImagePullSecrets: []corev1.LocalObjectReference{{
+						Name: "tigera-pull-secret",
+					}},
 				},
 				Status: operator.InstallationStatus{},
 			}
@@ -1067,7 +1079,9 @@ var _ = Describe("Testing core-controller installation", func() {
 			prometheusTLS, err := certificateManager.GetOrCreateKeyPair(c, monitor.PrometheusClientTLSSecretName, common.OperatorNamespace(), []string{monitor.PrometheusClientTLSSecretName})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, prometheusTLS.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
-			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})).NotTo(HaveOccurred())
+			pullSecrets := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "tigera-pull-secret", Namespace: common.OperatorNamespace()}}
+			Expect(c.Create(ctx, pullSecrets)).NotTo(HaveOccurred())
 		})
 
 		AfterEach(func() {
@@ -1090,11 +1104,11 @@ var _ = Describe("Testing core-controller installation", func() {
 				Expect(err).ShouldNot(HaveOccurred())
 
 				By("Checking that the FelixConfiguration has NFTablesMode Enabled")
-				fc := &crdv1.FelixConfiguration{}
+				fc := &v3.FelixConfiguration{}
 				err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 				Expect(err).ShouldNot(HaveOccurred())
 				Expect(fc.Spec.NFTablesMode).ToNot(BeNil())
-				Expect(*fc.Spec.NFTablesMode).To(Equal(crdv1.NFTablesModeEnabled))
+				Expect(*fc.Spec.NFTablesMode).To(Equal(v3.NFTablesModeAuto))
 			})
 
 			It("should set NFTablesMode to Disabled if nftables mode is changed", func() {
@@ -1114,11 +1128,11 @@ var _ = Describe("Testing core-controller installation", func() {
 				Expect(err).ShouldNot(HaveOccurred())
 
 				By("checking that the FelixConfiguration has NFTablesMode Disabled")
-				fc := &crdv1.FelixConfiguration{}
+				fc := &v3.FelixConfiguration{}
 				err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 				Expect(err).ShouldNot(HaveOccurred())
 				Expect(fc.Spec.NFTablesMode).NotTo(BeNil())
-				Expect(*fc.Spec.NFTablesMode).To(Equal(crdv1.NFTablesModeDisabled))
+				Expect(*fc.Spec.NFTablesMode).To(Equal(v3.NFTablesMode(v3.NFTablesModeDisabled)))
 			})
 		})
 
@@ -1157,7 +1171,7 @@ var _ = Describe("Testing core-controller installation", func() {
 						Endpoints: []discoveryv1.Endpoint{
 							{Addresses: []string{"5.6.7.8", "5.6.7.9", "5.6.7.10"}},
 						},
-						Ports: []discoveryv1.EndpointPort{{Port: ptr.Int32ToPtr(6443)}},
+						Ports: []discoveryv1.EndpointPort{{Port: ptr.To(int32(6443))}},
 					})
 			}
 
@@ -1198,7 +1212,7 @@ var _ = Describe("Testing core-controller installation", func() {
 					}
 					Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
 				})
-				table.DescribeTable("should fail if requirements are not met",
+				DescribeTable("should fail if requirements are not met",
 					func(funcs []func(), expectedErrorSubstring string) {
 						for _, f := range funcs {
 							f()
@@ -1208,14 +1222,14 @@ var _ = Describe("Testing core-controller installation", func() {
 						Expect(err).Should(HaveOccurred())
 						Expect(err.Error()).To(ContainSubstring(expectedErrorSubstring))
 					},
-					table.Entry("kubernetes service endpoint is already defined",
+					Entry("kubernetes service endpoint is already defined",
 						[]func(){createK8sSvcEpConfigMap, createK8sService, createEndpointSlice},
 						"kubernetes service endpoint is defined by the kubernetes-service-endpoints ConfigMap",
 					),
-					table.Entry("kubernetes service not found",
+					Entry("kubernetes service not found",
 						[]func(){createEndpointSlice}, "failed to get kubernetes service",
 					),
-					table.Entry("kubernetes endpoint slices not found",
+					Entry("kubernetes endpoint slices not found",
 						[]func(){createK8sService}, "failed to get kubernetes endpoint slices",
 					),
 				)
@@ -1229,11 +1243,11 @@ var _ = Describe("Testing core-controller installation", func() {
 					Expect(err).ShouldNot(HaveOccurred())
 
 					By("Checking that the FelixConfiguration has NFTablesMode Enabled")
-					fc := &crdv1.FelixConfiguration{}
+					fc := &v3.FelixConfiguration{}
 					err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 					Expect(err).ShouldNot(HaveOccurred())
 					Expect(fc.Spec.NFTablesMode).ToNot(BeNil())
-					Expect(*fc.Spec.NFTablesMode).To(Equal(crdv1.NFTablesModeEnabled))
+					Expect(*fc.Spec.NFTablesMode).To(Equal(v3.NFTablesMode(v3.NFTablesModeEnabled)))
 				})
 
 				It("should push env vars to ebpf-bootstrap", func() {
@@ -1254,7 +1268,7 @@ var _ = Describe("Testing core-controller installation", func() {
 					Expect(install.Spec.BPFNetworkBootstrapEnabled()).To(BeTrue())
 
 					By("Checking that the FelixConfiguration has BPF Enabled")
-					fc := &crdv1.FelixConfiguration{}
+					fc := &v3.FelixConfiguration{}
 					err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 					Expect(err).ShouldNot(HaveOccurred())
 					Expect(fc.Spec.BPFEnabled).ToNot(BeNil())
@@ -1293,7 +1307,7 @@ var _ = Describe("Testing core-controller installation", func() {
 							Endpoints: []discoveryv1.Endpoint{
 								{Addresses: []string{"5.6.7.8", "5.6.7.9", "5.6.7.10"}},
 							},
-							Ports: []discoveryv1.EndpointPort{{Port: ptr.Int32ToPtr(6443)}},
+							Ports: []discoveryv1.EndpointPort{{Port: ptr.To(int32(6443))}},
 						})).NotTo(HaveOccurred())
 					Expect(c.Create(
 						ctx,
@@ -1303,7 +1317,7 @@ var _ = Describe("Testing core-controller installation", func() {
 							Endpoints: []discoveryv1.Endpoint{
 								{Addresses: []string{"fd00::1", "fd00::2", "fd00::3"}},
 							},
-							Ports: []discoveryv1.EndpointPort{{Port: ptr.Int32ToPtr(6443)}},
+							Ports: []discoveryv1.EndpointPort{{Port: ptr.To(int32(6443))}},
 						})).NotTo(HaveOccurred())
 
 					By("r.Reconcile()")
@@ -1327,11 +1341,11 @@ var _ = Describe("Testing core-controller installation", func() {
 
 		It("should push 'CALICO_CGROUP_PATH' env var to ebpf-bootstrap if specified in FelixConfiguration", func() {
 			customPath := "/foo/bar/path"
-			fc := &crdv1.FelixConfiguration{
+			fc := &v3.FelixConfiguration{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "default",
 				},
-				Spec: crdv1.FelixConfigurationSpec{
+				Spec: v3.FelixConfigurationSpec{
 					CgroupV2Path: customPath,
 				},
 			}
@@ -1360,7 +1374,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 
 			// We should get a felix configuration with the health port defaulted (but nothing else).
-			fc := &crdv1.FelixConfiguration{}
+			fc := &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(fc.Spec.HealthPort).NotTo(BeNil())
@@ -1376,13 +1390,136 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(*fc.Spec.BPFEnabled).To(BeFalse())
 		})
 
+		It("should reconcile namespace, role binding and pull secrets", func() {
+			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
+			result, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(result.RequeueAfter).To(Equal(0 * time.Second))
+
+			namespace := corev1.Namespace{
+				TypeMeta: metav1.TypeMeta{Kind: "Namespace", APIVersion: "v1"},
+			}
+			Expect(c.Get(ctx, client.ObjectKey{
+				Name: common.CalicoNamespace,
+			}, &namespace)).NotTo(HaveOccurred())
+			Expect(namespace.Labels["pod-security.kubernetes.io/enforce"]).To(Equal("privileged"))
+			Expect(namespace.Labels["pod-security.kubernetes.io/enforce-version"]).To(Equal("latest"))
+
+			// Expect operator role binding to be created
+			rb := rbacv1.RoleBinding{
+				ObjectMeta: metav1.ObjectMeta{},
+			}
+			Expect(c.Get(ctx, client.ObjectKey{
+				Name:      render.TigeraOperatorSecrets,
+				Namespace: common.CalicoNamespace,
+			}, &rb)).NotTo(HaveOccurred())
+			Expect(rb.OwnerReferences).To(HaveLen(1))
+			ownerRoleBinding := rb.OwnerReferences[0]
+			Expect(ownerRoleBinding.Kind).To(Equal("Installation"))
+
+			// Expect pull secrets to be created
+			pullSecrets := corev1.Secret{
+				TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
+			}
+			Expect(c.Get(ctx, client.ObjectKey{
+				Name:      "tigera-pull-secret",
+				Namespace: common.CalicoNamespace,
+			}, &pullSecrets)).NotTo(HaveOccurred())
+			Expect(pullSecrets.OwnerReferences).To(HaveLen(1))
+			pullSecret := pullSecrets.OwnerReferences[0]
+			Expect(pullSecret.Kind).To(Equal("Installation"))
+		})
+
+		It("should not patch FelixConfig and BGPConfig when ClusterRouteMode not set", func() {
+			cr.Spec.CalicoNetwork = &operator.CalicoNetworkSpec{}
+			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
+			_, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			fc := &v3.FelixConfiguration{}
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(fc.Spec.ProgramClusterRoutes).To(BeNil())
+
+			bgpConfig := &v3.BGPConfiguration{}
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, bgpConfig)
+			Expect(err).Should(HaveOccurred())
+		})
+
+		It("should correctly patch FelixConfig and BGPConfig with ClusterRouteMode set to BIRD", func() {
+			bird := operator.ClusterRoutingModeBIRD
+			cr.Spec.CalicoNetwork = &operator.CalicoNetworkSpec{ClusterRoutingMode: &bird}
+			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
+			_, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			fc := &v3.FelixConfiguration{}
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(fc.Spec.ProgramClusterRoutes).NotTo(BeNil())
+			Expect(*fc.Spec.ProgramClusterRoutes).To(Equal("Disabled"))
+
+			bgpConfig := &v3.BGPConfiguration{}
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, bgpConfig)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(bgpConfig.Spec.ProgramClusterRoutes).NotTo(BeNil())
+			Expect(*bgpConfig.Spec.ProgramClusterRoutes).To(Equal("Enabled"))
+		})
+
+		It("should correctly patch FelixConfig and BGPConfig with ClusterRouteMode set to Felix", func() {
+			felix := operator.ClusterRoutingModeFelix
+			cr.Spec.CalicoNetwork = &operator.CalicoNetworkSpec{ClusterRoutingMode: &felix}
+			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
+			_, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			fc := &v3.FelixConfiguration{}
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(fc.Spec.ProgramClusterRoutes).NotTo(BeNil())
+			Expect(*fc.Spec.ProgramClusterRoutes).To(Equal("Enabled"))
+
+			bgpConfig := &v3.BGPConfiguration{}
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, bgpConfig)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(bgpConfig.Spec.ProgramClusterRoutes).NotTo(BeNil())
+			Expect(*bgpConfig.Spec.ProgramClusterRoutes).To(Equal("Disabled"))
+		})
+
+		It("should create the default BGPConfig and FelixConfig with ClusterRoutingMode set", func() {
+			bgpConfig := &v3.BGPConfiguration{}
+			err := c.Get(ctx, types.NamespacedName{Name: "default"}, bgpConfig)
+			Expect(err).Should(HaveOccurred())
+
+			fc := &v3.FelixConfiguration{}
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
+			Expect(err).Should(HaveOccurred())
+
+			felix := operator.ClusterRoutingModeFelix
+			cr.Spec.CalicoNetwork = &operator.CalicoNetworkSpec{ClusterRoutingMode: &felix}
+			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
+			_, err = r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(fc.Spec.ProgramClusterRoutes).NotTo(BeNil())
+			Expect(*fc.Spec.ProgramClusterRoutes).To(Equal("Enabled"))
+
+			bgpConfig = &v3.BGPConfiguration{}
+			err = c.Get(ctx, types.NamespacedName{Name: "default"}, bgpConfig)
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(bgpConfig.Spec.ProgramClusterRoutes).NotTo(BeNil())
+			Expect(*bgpConfig.Spec.ProgramClusterRoutes).To(Equal("Disabled"))
+		})
+
 		It("should set vxlanVNI to 10000 when provider is DockerEE", func() {
 			cr.Spec.KubernetesProvider = operator.ProviderDockerEE
 			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
 
-			fc := &crdv1.FelixConfiguration{}
+			fc := &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 
@@ -1397,13 +1534,13 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
-			fc := &crdv1.FelixConfiguration{}
+			fc := &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(fc.Spec.VXLANPort).NotTo(BeNil())
 			Expect(*fc.Spec.VXLANPort).To(Equal(8472))
 			Expect(fc.Spec.NFTablesMode).NotTo(BeNil())
-			Expect(*fc.Spec.NFTablesMode).To(Equal(crdv1.NFTablesModeDisabled))
+			Expect(*fc.Spec.NFTablesMode).To(Equal(v3.NFTablesMode(v3.NFTablesModeDisabled)))
 		})
 
 		It("should set bpfHostConntrackByPass to false when provider is DockerEE and BPF enabled", func() {
@@ -1414,7 +1551,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
 
-			fc := &crdv1.FelixConfiguration{}
+			fc := &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 
@@ -1431,7 +1568,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
 
-			fc := &crdv1.FelixConfiguration{}
+			fc := &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 
@@ -1449,7 +1586,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
 
-			fc := &crdv1.FelixConfiguration{}
+			fc := &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 
@@ -1470,7 +1607,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
 
-			fc := &crdv1.FelixConfiguration{}
+			fc := &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 
@@ -1489,7 +1626,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			_, err = r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
 
-			fc = &crdv1.FelixConfiguration{}
+			fc = &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 
@@ -1519,7 +1656,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			_, err = r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
 
-			fc := &crdv1.FelixConfiguration{}
+			fc := &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 
@@ -1537,7 +1674,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 
 			// We should get a felix configuration with Rancher's DNS service.
-			fc := &crdv1.FelixConfiguration{}
+			fc := &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(fc.Spec.DNSTrustedServers).NotTo(BeNil())
@@ -1551,11 +1688,11 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 
 			// Check that FelixConfiguration is created with RouteTableRange
-			fc := &crdv1.FelixConfiguration{}
+			fc := &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(fc.Spec.RouteTableRange).NotTo(BeNil())
-			Expect(*fc.Spec.RouteTableRange).To(Equal(crdv1.RouteTableRange{Min: 65, Max: 99}))
+			Expect(*fc.Spec.RouteTableRange).To(Equal(v3.RouteTableRange{Min: 65, Max: 99}))
 		})
 
 		It("should Reconcile with GKE CNI config", func() {
@@ -1565,20 +1702,20 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 
 			// Check that FelixConfiguration is created with RouteTableRange
-			fc := &crdv1.FelixConfiguration{}
+			fc := &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(fc.Spec.RouteTableRange).NotTo(BeNil())
-			Expect(*fc.Spec.RouteTableRange).To(Equal(crdv1.RouteTableRange{Min: 10, Max: 250}))
+			Expect(*fc.Spec.RouteTableRange).To(Equal(v3.RouteTableRange{Min: 10, Max: 250}))
 		})
 
 		It("should Reconcile with AWS CNI and not change existing FelixConfig", func() {
-			fc := &crdv1.FelixConfiguration{
+			fc := &v3.FelixConfiguration{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "default",
 				},
-				Spec: crdv1.FelixConfigurationSpec{
-					RouteTableRange:   &crdv1.RouteTableRange{Min: 15, Max: 55},
+				Spec: v3.FelixConfigurationSpec{
+					RouteTableRange:   &v3.RouteTableRange{Min: 15, Max: 55},
 					LogSeverityScreen: "Error",
 				},
 			}
@@ -1590,20 +1727,20 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 
 			// Check that FelixConfiguration has not changed
-			fc = &crdv1.FelixConfiguration{}
+			fc = &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(fc.Spec.RouteTableRange).NotTo(BeNil())
-			Expect(*fc.Spec.RouteTableRange).To(Equal(crdv1.RouteTableRange{Min: 15, Max: 55}))
+			Expect(*fc.Spec.RouteTableRange).To(Equal(v3.RouteTableRange{Min: 15, Max: 55}))
 			Expect(fc.Spec.LogSeverityScreen).To(Equal("Error"))
 		})
 
 		It("should Reconcile with AWS CNI and update existing FelixConfig", func() {
-			fc := &crdv1.FelixConfiguration{
+			fc := &v3.FelixConfiguration{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "default",
 				},
-				Spec: crdv1.FelixConfigurationSpec{
+				Spec: v3.FelixConfigurationSpec{
 					LogSeverityScreen: "Error",
 				},
 			}
@@ -1615,20 +1752,20 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 
 			// Check that FelixConfiguration is created with RouteTableRange
-			fc = &crdv1.FelixConfiguration{}
+			fc = &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(fc.Spec.RouteTableRange).NotTo(BeNil())
-			Expect(*fc.Spec.RouteTableRange).To(Equal(crdv1.RouteTableRange{Min: 65, Max: 99}))
+			Expect(*fc.Spec.RouteTableRange).To(Equal(v3.RouteTableRange{Min: 65, Max: 99}))
 			Expect(fc.Spec.LogSeverityScreen).To(Equal("Error"))
 		})
 
 		It("should Reconcile with FelixConfig natPortRange set", func() {
-			fc := &crdv1.FelixConfiguration{
+			fc := &v3.FelixConfiguration{
 				ObjectMeta: metav1.ObjectMeta{
 					Name: "default",
 				},
-				Spec: crdv1.FelixConfigurationSpec{
+				Spec: v3.FelixConfigurationSpec{
 					NATPortRange: &numorstring.Port{MinPort: 15, MaxPort: 55},
 				},
 			}
@@ -1640,7 +1777,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 
 			// Check that FelixConfiguration has not changed
-			fc = &crdv1.FelixConfiguration{}
+			fc = &v3.FelixConfiguration{}
 			err = c.Get(ctx, types.NamespacedName{Name: "default"}, fc)
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(fc.Spec.NATPortRange).NotTo(BeNil())
@@ -1956,7 +2093,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(cr.Status.Conditions[2].ObservedGeneration).To(Equal(int64(2)))
 		})
 
-		It("should render allow-tigera policy when tier and tier watch are ready", func() {
+		It("should render calico-system policy when tier and tier watch are ready", func() {
 			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
 
 			_, err := r.Reconcile(ctx, reconcile.Request{})
@@ -1965,16 +2102,16 @@ var _ = Describe("Testing core-controller installation", func() {
 			policies := v3.NetworkPolicyList{}
 			Expect(c.List(ctx, &policies)).ToNot(HaveOccurred())
 			Expect(policies.Items).To(HaveLen(2))
-			Expect(policies.Items[0].Name).To(Equal("allow-tigera.default-deny"))
-			Expect(policies.Items[1].Name).To(Equal("allow-tigera.kube-controller-access"))
+			Expect(policies.Items[0].Name).To(Equal("calico-system.default-deny"))
+			Expect(policies.Items[1].Name).To(Equal("calico-system.kube-controller-access"))
 
 			defaultDenyPolicy := policies.Items[0]
 			Expect(defaultDenyPolicy.Spec.Selector).To(Equal("k8s-app != 'calico-apiserver'"))
 		})
 
-		It("should omit allow-tigera policy and not degrade when tier is not ready", func() {
+		It("should omit calico-system policy and not degrade when tier is not ready", func() {
 			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
-			Expect(c.Delete(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+			Expect(c.Delete(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})).NotTo(HaveOccurred())
 
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
@@ -1984,7 +2121,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(policies.Items).To(HaveLen(0))
 		})
 
-		It("should omit allow-tigera policy and not degrade when tier watch is not ready", func() {
+		It("should omit calico-system policy and not degrade when tier watch is not ready", func() {
 			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
 			r.tierWatchReady = notReady
 
@@ -1996,12 +2133,12 @@ var _ = Describe("Testing core-controller installation", func() {
 			Expect(policies.Items).To(HaveLen(0))
 		})
 
-		It("should omit allow-tigera policy and not degrade when installation is calico", func() {
+		It("should omit calico-system policy and not degrade when installation is calico", func() {
 			cr.Spec.Variant = operator.Calico
 			cr.Status.Variant = operator.Calico
 			Expect(c.Create(ctx, cr)).NotTo(HaveOccurred())
 			r.enterpriseCRDsExist = false
-			Expect(c.Delete(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+			Expect(c.Delete(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})).NotTo(HaveOccurred())
 
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
@@ -2053,7 +2190,7 @@ var _ = Describe("Testing core-controller installation", func() {
 		BeforeEach(func() {
 			// The schema contains all objects that should be known to the fake client when the test runs.
 			scheme = runtime.NewScheme()
-			Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+			Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 			Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(schedv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -2083,7 +2220,7 @@ var _ = Describe("Testing core-controller installation", func() {
 					},
 				},
 			}
-			cs = kfake.NewSimpleClientset(objs...)
+			cs = kfake.NewClientset(objs...)
 
 			// Create an object we can use throughout the test to do the compliance reconcile loops.
 			mockStatus = &status.MockStatus{}
@@ -2094,6 +2231,8 @@ var _ = Describe("Testing core-controller installation", func() {
 			mockStatus.On("IsAvailable").Return(true)
 			mockStatus.On("OnCRFound").Return()
 			mockStatus.On("ClearDegraded")
+			mockStatus.On("SetWarning", mock.Anything, mock.Anything).Return()
+			mockStatus.On("ClearWarning", mock.Anything).Return()
 			mockStatus.On("AddCertificateSigningRequests", mock.Anything)
 			mockStatus.On("RemoveCertificateSigningRequests", mock.Anything)
 			mockStatus.On("ReadyToMonitor")
@@ -2121,6 +2260,7 @@ var _ = Describe("Testing core-controller installation", func() {
 				migrationChecked:     true,
 				clusterDomain:        dns.DefaultClusterDomain,
 				tierWatchReady:       ready,
+				migrationWatchReady:  &utils.ReadyFlag{},
 				newComponentHandler:  utils.NewComponentHandler,
 			}
 			r.typhaAutoscaler.start(ctx)
@@ -2128,7 +2268,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			cr = &operator.Installation{
 				ObjectMeta: metav1.ObjectMeta{Name: "default"},
 				Spec: operator.InstallationSpec{
-					Variant:            operator.TigeraSecureEnterprise,
+					Variant:            operator.CalicoEnterprise,
 					Registry:           "some.registry.org/",
 					KubernetesProvider: operator.ProviderEKS,
 					CNI: &operator.CNISpec{
@@ -2139,7 +2279,7 @@ var _ = Describe("Testing core-controller installation", func() {
 					},
 				},
 				Status: operator.InstallationStatus{
-					Variant: operator.TigeraSecureEnterprise,
+					Variant: operator.CalicoEnterprise,
 					Computed: &operator.InstallationSpec{
 						Registry: "my-reg",
 						// The test is provider agnostic.
@@ -2158,7 +2298,7 @@ var _ = Describe("Testing core-controller installation", func() {
 			prometheusTLS, err := certificateManager.GetOrCreateKeyPair(c, monitor.PrometheusClientTLSSecretName, common.OperatorNamespace(), []string{monitor.PrometheusClientTLSSecretName})
 			Expect(err).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, prometheusTLS.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
-			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})).NotTo(HaveOccurred())
 		})
 
 		AfterEach(func() {
@@ -2189,7 +2329,7 @@ var _ = Describe("Testing core-controller installation", func() {
 		BeforeEach(func() {
 			// The schema contains all objects that should be known to the fake client when the test runs.
 			scheme = runtime.NewScheme()
-			Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+			Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 			Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			Expect(schedv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -2217,7 +2357,7 @@ var _ = Describe("Testing core-controller installation", func() {
 					Spec:       appsv1.DeploymentSpec{Replicas: &replicas},
 				},
 			}
-			cs = kfake.NewSimpleClientset(objs...)
+			cs = kfake.NewClientset(objs...)
 
 			// Create an object we can use throughout the test to do the compliance reconcile loops.
 			mockStatus = &status.MockStatus{}
@@ -2228,6 +2368,8 @@ var _ = Describe("Testing core-controller installation", func() {
 			mockStatus.On("IsAvailable").Return(true)
 			mockStatus.On("OnCRFound").Return()
 			mockStatus.On("ClearDegraded")
+			mockStatus.On("SetWarning", mock.Anything, mock.Anything).Return()
+			mockStatus.On("ClearWarning", mock.Anything).Return()
 			mockStatus.On("AddCertificateSigningRequests", mock.Anything)
 			mockStatus.On("RemoveCertificateSigningRequests", mock.Anything)
 			mockStatus.On("ReadyToMonitor")
@@ -2254,6 +2396,7 @@ var _ = Describe("Testing core-controller installation", func() {
 				enterpriseCRDsExist:  true,
 				migrationChecked:     true,
 				tierWatchReady:       ready,
+				migrationWatchReady:  &utils.ReadyFlag{},
 				newComponentHandler: func(logr.Logger, client.Client, *runtime.Scheme, metav1.Object) utils.ComponentHandler {
 					return componentHandler
 				},
@@ -2268,7 +2411,7 @@ var _ = Describe("Testing core-controller installation", func() {
 
 			Expect(c.Create(ctx, prometheusTLS.Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
 			Expect(c.Create(ctx, certificateManager.KeyPair().Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
-			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+			Expect(c.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})).NotTo(HaveOccurred())
 
 			// We start off with a 'standard' installation, with nothing special
 			Expect(c.Create(
@@ -2276,12 +2419,12 @@ var _ = Describe("Testing core-controller installation", func() {
 				&operator.Installation{
 					ObjectMeta: metav1.ObjectMeta{Name: "default"},
 					Spec: operator.InstallationSpec{
-						Variant:               operator.TigeraSecureEnterprise,
+						Variant:               operator.CalicoEnterprise,
 						Registry:              "some.registry.org/",
 						CertificateManagement: &operator.CertificateManagement{CACert: prometheusTLS.GetCertificatePEM()},
 					},
 					Status: operator.InstallationStatus{
-						Variant: operator.TigeraSecureEnterprise,
+						Variant: operator.CalicoEnterprise,
 						Computed: &operator.InstallationSpec{
 							Registry: "my-reg",
 							// The test is provider agnostic.
@@ -2292,14 +2435,14 @@ var _ = Describe("Testing core-controller installation", func() {
 
 			// In most clusters, the IP pool controller is responsible for creating IP pools. The Installation controller waits for this,
 			// so we need to create those pools here.
-			pool := crdv1.IPPool{
+			pool := v3.IPPool{
 				ObjectMeta: metav1.ObjectMeta{Name: "default-pool-v4"},
-				Spec: crdv1.IPPoolSpec{
+				Spec: v3.IPPoolSpec{
 					CIDR:         "192.168.0.0/16",
 					NATOutgoing:  true,
 					BlockSize:    26,
 					NodeSelector: "all()",
-					VXLANMode:    crdv1.VXLANModeAlways,
+					VXLANMode:    v3.VXLANModeAlways,
 				},
 			}
 			Expect(c.Create(ctx, &pool)).NotTo(HaveOccurred())
@@ -2352,3 +2495,269 @@ func (f *fakeComponentHandler) CreateOrUpdateOrDelete(ctx context.Context, compo
 	f.objectsToDelete = append(f.objectsToDelete, d...)
 	return nil
 }
+
+var _ = Describe("updateMutatingAdmissionPolicies", func() {
+	var (
+		c                client.Client
+		ctx              context.Context
+		cancel           context.CancelFunc
+		r                ReconcileInstallation
+		scheme           *runtime.Scheme
+		mockStatus       *status.MockStatus
+		componentHandler *fakeComponentHandler
+		log              logr.Logger
+		installation     *operator.Installation
+	)
+
+	BeforeEach(func() {
+		log = logr.Discard()
+		ctx, cancel = context.WithCancel(context.Background())
+
+		scheme = runtime.NewScheme()
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
+		Expect(operator.SchemeBuilder.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(admissionv1beta1.SchemeBuilder.AddToScheme(scheme)).NotTo(HaveOccurred())
+
+		c = ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
+
+		mockStatus = &status.MockStatus{}
+		mockStatus.On("SetDegraded", mock.Anything, mock.Anything, mock.Anything, mock.Anything).Return()
+
+		componentHandler = newFakeComponentHandler()
+		installation = &operator.Installation{
+			ObjectMeta: metav1.ObjectMeta{Name: "default"},
+			Spec: operator.InstallationSpec{
+				Variant: operator.Calico,
+			},
+		}
+	})
+
+	AfterEach(func() {
+		cancel()
+	})
+
+	It("should create MAPs when manageCRDs=true, v3CRDs=true, k8s>=1.32", func() {
+		r = ReconcileInstallation{
+			client:            c,
+			scheme:            scheme,
+			status:            mockStatus,
+			manageCRDs:        true,
+			v3CRDs:            true,
+			kubernetesVersion: &common.VersionInfo{Major: 1, Minor: 32},
+			newComponentHandler: func(logr.Logger, client.Client, *runtime.Scheme, metav1.Object) utils.ComponentHandler {
+				return componentHandler
+			},
+		}
+
+		err := r.updateMutatingAdmissionPolicies(ctx, installation, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(componentHandler.objectsToCreate).To(HaveLen(4))
+
+		// Verify we got two MAPs and two MAPBs.
+		var mapCount, mapbCount int
+		for _, obj := range componentHandler.objectsToCreate {
+			switch obj.(type) {
+			case *admissionv1beta1.MutatingAdmissionPolicy:
+				mapCount++
+				Expect(obj.GetLabels()).To(HaveKeyWithValue(admission.ManagedMAPLabel, admission.ManagedMAPLabelValue))
+			case *admissionv1beta1.MutatingAdmissionPolicyBinding:
+				mapbCount++
+				Expect(obj.GetLabels()).To(HaveKeyWithValue(admission.ManagedMAPLabel, admission.ManagedMAPLabelValue))
+			}
+		}
+		Expect(mapCount).To(Equal(2))
+		Expect(mapbCount).To(Equal(2))
+	})
+
+	It("should not create MAPs when k8s<1.32 and should set degraded", func() {
+		r = ReconcileInstallation{
+			client:            c,
+			scheme:            scheme,
+			status:            mockStatus,
+			manageCRDs:        true,
+			v3CRDs:            true,
+			kubernetesVersion: &common.VersionInfo{Major: 1, Minor: 31},
+			newComponentHandler: func(logr.Logger, client.Client, *runtime.Scheme, metav1.Object) utils.ComponentHandler {
+				return componentHandler
+			},
+		}
+
+		err := r.updateMutatingAdmissionPolicies(ctx, installation, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(componentHandler.objectsToCreate).To(BeEmpty())
+		mockStatus.AssertCalled(GinkgoT(), "SetDegraded", operator.ResourceNotReady, mock.Anything, mock.Anything, mock.Anything)
+	})
+
+	It("should not create MAPs when v3CRDs=false", func() {
+		r = ReconcileInstallation{
+			client:            c,
+			scheme:            scheme,
+			status:            mockStatus,
+			manageCRDs:        true,
+			v3CRDs:            false,
+			kubernetesVersion: &common.VersionInfo{Major: 1, Minor: 32},
+			newComponentHandler: func(logr.Logger, client.Client, *runtime.Scheme, metav1.Object) utils.ComponentHandler {
+				return componentHandler
+			},
+		}
+
+		err := r.updateMutatingAdmissionPolicies(ctx, installation, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(componentHandler.objectsToCreate).To(BeEmpty())
+	})
+
+	It("should not create MAPs when manageCRDs=false", func() {
+		r = ReconcileInstallation{
+			client:            c,
+			scheme:            scheme,
+			status:            mockStatus,
+			manageCRDs:        false,
+			v3CRDs:            true,
+			kubernetesVersion: &common.VersionInfo{Major: 1, Minor: 32},
+			newComponentHandler: func(logr.Logger, client.Client, *runtime.Scheme, metav1.Object) utils.ComponentHandler {
+				return componentHandler
+			},
+		}
+
+		err := r.updateMutatingAdmissionPolicies(ctx, installation, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(componentHandler.objectsToCreate).To(BeEmpty())
+	})
+
+	It("should not create MAPs when kubernetesVersion is nil and should set degraded", func() {
+		r = ReconcileInstallation{
+			client:            c,
+			scheme:            scheme,
+			status:            mockStatus,
+			manageCRDs:        true,
+			v3CRDs:            true,
+			kubernetesVersion: nil,
+			newComponentHandler: func(logr.Logger, client.Client, *runtime.Scheme, metav1.Object) utils.ComponentHandler {
+				return componentHandler
+			},
+		}
+
+		err := r.updateMutatingAdmissionPolicies(ctx, installation, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(componentHandler.objectsToCreate).To(BeEmpty())
+		mockStatus.AssertCalled(GinkgoT(), "SetDegraded", operator.ResourceNotReady, mock.Anything, mock.Anything, mock.Anything)
+	})
+
+	It("should delete stale MAPs with managed label", func() {
+		// Pre-create a stale MAP with the managed label.
+		staleMAP := &admissionv1beta1.MutatingAdmissionPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "stale-policy",
+				Labels: map[string]string{admission.ManagedMAPLabel: admission.ManagedMAPLabelValue},
+			},
+		}
+		staleMAPB := &admissionv1beta1.MutatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "stale-binding",
+				Labels: map[string]string{admission.ManagedMAPLabel: admission.ManagedMAPLabelValue},
+			},
+		}
+		Expect(c.Create(ctx, staleMAP)).NotTo(HaveOccurred())
+		Expect(c.Create(ctx, staleMAPB)).NotTo(HaveOccurred())
+
+		r = ReconcileInstallation{
+			client:            c,
+			scheme:            scheme,
+			status:            mockStatus,
+			manageCRDs:        true,
+			v3CRDs:            true,
+			kubernetesVersion: &common.VersionInfo{Major: 1, Minor: 32},
+			newComponentHandler: func(logr.Logger, client.Client, *runtime.Scheme, metav1.Object) utils.ComponentHandler {
+				return componentHandler
+			},
+		}
+
+		err := r.updateMutatingAdmissionPolicies(ctx, installation, log)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Should have created the desired resources.
+		Expect(componentHandler.objectsToCreate).To(HaveLen(4))
+
+		// Should have marked the stale resources for deletion.
+		Expect(componentHandler.objectsToDelete).To(HaveLen(2))
+		deletedNames := map[string]bool{}
+		for _, obj := range componentHandler.objectsToDelete {
+			deletedNames[obj.GetName()] = true
+		}
+		Expect(deletedNames).To(HaveKey("stale-policy"))
+		Expect(deletedNames).To(HaveKey("stale-binding"))
+	})
+
+	It("should not delete MAPs that are in the desired set", func() {
+		// Pre-create the desired MAPs with the managed label (simulating a previous reconcile).
+		desiredMAP1 := &admissionv1beta1.MutatingAdmissionPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "policytypes.policy.projectcalico.org",
+				Labels: map[string]string{admission.ManagedMAPLabel: admission.ManagedMAPLabelValue},
+			},
+		}
+		desiredMAP2 := &admissionv1beta1.MutatingAdmissionPolicy{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "tierlabel.policy.projectcalico.org",
+				Labels: map[string]string{admission.ManagedMAPLabel: admission.ManagedMAPLabelValue},
+			},
+		}
+		desiredMAPB1 := &admissionv1beta1.MutatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "set-policytypes-binding",
+				Labels: map[string]string{admission.ManagedMAPLabel: admission.ManagedMAPLabelValue},
+			},
+		}
+		desiredMAPB2 := &admissionv1beta1.MutatingAdmissionPolicyBinding{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "set-tier-label-binding",
+				Labels: map[string]string{admission.ManagedMAPLabel: admission.ManagedMAPLabelValue},
+			},
+		}
+		Expect(c.Create(ctx, desiredMAP1)).NotTo(HaveOccurred())
+		Expect(c.Create(ctx, desiredMAP2)).NotTo(HaveOccurred())
+		Expect(c.Create(ctx, desiredMAPB1)).NotTo(HaveOccurred())
+		Expect(c.Create(ctx, desiredMAPB2)).NotTo(HaveOccurred())
+
+		r = ReconcileInstallation{
+			client:            c,
+			scheme:            scheme,
+			status:            mockStatus,
+			manageCRDs:        true,
+			v3CRDs:            true,
+			kubernetesVersion: &common.VersionInfo{Major: 1, Minor: 32},
+			newComponentHandler: func(logr.Logger, client.Client, *runtime.Scheme, metav1.Object) utils.ComponentHandler {
+				return componentHandler
+			},
+		}
+
+		err := r.updateMutatingAdmissionPolicies(ctx, installation, log)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Should have created the desired resources (update via passthrough).
+		Expect(componentHandler.objectsToCreate).To(HaveLen(4))
+
+		// Should NOT have deleted anything since existing resources match desired set.
+		Expect(componentHandler.objectsToDelete).To(BeEmpty())
+	})
+
+	It("should work with Enterprise variant", func() {
+		r = ReconcileInstallation{
+			client:            c,
+			scheme:            scheme,
+			status:            mockStatus,
+			manageCRDs:        true,
+			v3CRDs:            true,
+			kubernetesVersion: &common.VersionInfo{Major: 1, Minor: 32},
+			newComponentHandler: func(logr.Logger, client.Client, *runtime.Scheme, metav1.Object) utils.ComponentHandler {
+				return componentHandler
+			},
+		}
+
+		installation.Spec.Variant = operator.CalicoEnterprise
+
+		err := r.updateMutatingAdmissionPolicies(ctx, installation, log)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(componentHandler.objectsToCreate).To(HaveLen(4))
+	})
+})

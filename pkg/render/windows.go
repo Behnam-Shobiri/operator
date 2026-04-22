@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -77,7 +77,7 @@ func (c *windowsComponent) ResolveImages(is *operatorv1.ImageSet) error {
 		return imageName
 	}
 
-	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if c.cfg.Installation.Variant.IsEnterprise() {
 		c.cniImage = appendIfErr(components.GetReference(components.ComponentTigeraCNIWindows, reg, path, prefix, is))
 		c.nodeImage = appendIfErr(components.GetReference(components.ComponentTigeraNodeWindows, reg, path, prefix, is))
 	} else {
@@ -116,7 +116,7 @@ func (c *windowsComponent) Objects() ([]client.Object, []client.Object) {
 
 	objs := []client.Object{}
 
-	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if c.cfg.Installation.Variant.IsEnterprise() {
 		// Include Service for exposing node metrics.
 		objs = append(objs, c.nodeMetricsService())
 	}
@@ -218,6 +218,7 @@ func (c *windowsComponent) cniEnvVars() []corev1.EnvVar {
 
 	envVars := []corev1.EnvVar{
 		{Name: "SLEEP", Value: "false"},
+		{Name: "CNI_PLUGIN_TYPE", Value: string(c.cfg.Installation.CNI.Type)},
 		{Name: "CNI_BIN_DIR", Value: "/host/opt/cni/bin"},
 		{Name: "CNI_CONF_NAME", Value: "10-calico.conflist"},
 		{Name: "CNI_NET_DIR", Value: cniNetDir},
@@ -243,7 +244,7 @@ func (c *windowsComponent) cniEnvVars() []corev1.EnvVar {
 		},
 	}
 
-	envVars = append(envVars, c.cfg.K8sServiceEp.EnvVars(true, c.cfg.Installation.KubernetesProvider)...)
+	envVars = append(envVars, c.cfg.K8sServiceEp.EnvVars()...)
 
 	return envVars
 }
@@ -392,7 +393,7 @@ func (c *windowsComponent) windowsVolumes() []corev1.Volume {
 	}
 
 	// Override with Tigera-specific config.
-	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if c.cfg.Installation.Variant.IsEnterprise() {
 		// Add volume for calico logs.
 		calicoLogVol := corev1.Volume{
 			Name:         "var-log-calico",
@@ -412,6 +413,7 @@ func (c *windowsComponent) windowsVolumes() []corev1.Volume {
 func (c *windowsComponent) uninstallEnvVars() []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
 		{Name: "SLEEP", Value: "false"},
+		{Name: "CNI_PLUGIN_TYPE", Value: string(c.cfg.Installation.CNI.Type)},
 		{Name: "CNI_BIN_DIR", Value: "/host/opt/cni/bin"},
 		{Name: "CNI_CONF_NAME", Value: "10-calico.conflist"},
 		{Name: "CNI_NET_DIR", Value: "/host/etc/cni/net.d"},
@@ -539,6 +541,7 @@ func (c *windowsComponent) windowsEnvVars() []corev1.EnvVar {
 	}
 
 	windowsEnv := []corev1.EnvVar{
+		{Name: "CNI_PLUGIN_TYPE", Value: string(c.cfg.Installation.CNI.Type)},
 		{Name: "DATASTORE_TYPE", Value: "kubernetes"},
 		{Name: "WAIT_FOR_DATASTORE", Value: "true"},
 		{Name: "CLUSTER_TYPE", Value: clusterType},
@@ -656,7 +659,7 @@ func (c *windowsComponent) windowsEnvVars() []corev1.EnvVar {
 		windowsEnv = append(windowsEnv, corev1.EnvVar{Name: "FELIX_IPV6SUPPORT", Value: "false"})
 	}
 
-	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if c.cfg.Installation.Variant.IsEnterprise() {
 		// Add in Calico Enterprise specific configuration.
 		extraNodeEnv := []corev1.EnvVar{
 			{Name: "FELIX_PROMETHEUSREPORTERENABLED", Value: "true"},
@@ -694,13 +697,13 @@ func (c *windowsComponent) windowsEnvVars() []corev1.EnvVar {
 	// Configure provider specific environment variables here.
 	switch c.cfg.Installation.KubernetesProvider {
 	case operatorv1.ProviderOpenShift:
-		if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+		if c.cfg.Installation.Variant.IsEnterprise() {
 			// We need to configure a non-default trusted DNS server, since there's no kube-dns.
 			windowsEnv = append(windowsEnv, corev1.EnvVar{Name: "FELIX_DNSTRUSTEDSERVERS", Value: "k8s-service:openshift-dns/dns-default"})
 		}
 	case operatorv1.ProviderRKE2:
 		// For RKE2, configure a non-default trusted DNS server, as the DNS service is not named "kube-dns".
-		if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+		if c.cfg.Installation.Variant.IsEnterprise() {
 			windowsEnv = append(windowsEnv, corev1.EnvVar{Name: "FELIX_DNSTRUSTEDSERVERS", Value: "k8s-service:kube-system/rke2-coredns-rke2-coredns"})
 		}
 	}
@@ -709,7 +712,7 @@ func (c *windowsComponent) windowsEnvVars() []corev1.EnvVar {
 		windowsEnv = append(windowsEnv, corev1.EnvVar{Name: "FELIX_ROUTESOURCE", Value: "WorkloadIPs"})
 	}
 
-	windowsEnv = append(windowsEnv, c.cfg.K8sServiceEp.EnvVars(true, c.cfg.Installation.KubernetesProvider)...)
+	windowsEnv = append(windowsEnv, c.cfg.K8sServiceEp.EnvVars()...)
 
 	return windowsEnv
 }
@@ -723,7 +726,7 @@ func (c *windowsComponent) windowsVolumeMounts() []corev1.VolumeMount {
 		corev1.VolumeMount{MountPath: "/var/run/calico", Name: "var-run-calico"},
 		corev1.VolumeMount{MountPath: "/var/lib/calico", Name: "var-lib-calico"})
 
-	if c.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if c.cfg.Installation.Variant.IsEnterprise() {
 		extraNodeMounts := []corev1.VolumeMount{
 			{MountPath: "/var/log/calico", Name: "var-log-calico"},
 		}

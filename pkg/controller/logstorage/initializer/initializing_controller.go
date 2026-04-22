@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -57,7 +57,7 @@ const (
 
 // Add creates a new LogStorage Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	if !opts.EnterpriseCRDExists {
 		return nil
 	}
@@ -151,6 +151,17 @@ func FillDefaults(opr *operatorv1.LogStorage) {
 		opr.Spec.Nodes = &operatorv1.Nodes{Count: 1}
 	}
 
+	if opr.Spec.Kibana == nil {
+		opr.Spec.Kibana = &operatorv1.Kibana{}
+	}
+	if opr.Spec.Kibana.Spec == nil {
+		opr.Spec.Kibana.Spec = &operatorv1.KibanaSpec{}
+	}
+	if opr.Spec.Kibana.Spec.Replicas == nil {
+		var replicas int32 = 1
+		opr.Spec.Kibana.Spec.Replicas = &replicas
+	}
+
 	if opr.Spec.ComponentResources == nil {
 		limits := corev1.ResourceList{}
 		requests := corev1.ResourceList{}
@@ -166,6 +177,28 @@ func FillDefaults(opr *operatorv1.LogStorage) {
 			},
 		}
 	}
+}
+
+func validateLogStorage(spec *operatorv1.LogStorageSpec) error {
+	if err := validateReplicasForNodeCount(spec); err != nil {
+		return err
+	}
+
+	return validateComponentResources(spec)
+}
+
+func validateReplicasForNodeCount(spec *operatorv1.LogStorageSpec) error {
+	if spec.Nodes == nil || spec.Indices == nil || spec.Indices.Replicas == nil {
+		return nil
+	}
+
+	replicas := int(*spec.Indices.Replicas)
+	nodeCount := int(spec.Nodes.Count)
+	if replicas > 0 && nodeCount <= replicas {
+		return fmt.Errorf("LogStorage spec.indices.replicas (%d) must be less than spec.nodes.count (%d); replica shards cannot be allocated when there are not enough nodes. For a single-node Elasticsearch cluster, set spec.indices.replicas to 0", replicas, nodeCount)
+	}
+
+	return nil
 }
 
 func validateComponentResources(spec *operatorv1.LogStorageSpec) error {
@@ -189,7 +222,7 @@ func (r *LogStorageInitializer) Reconcile(ctx context.Context, request reconcile
 	reqLogger.Info("Reconciling LogStorage")
 
 	ls := &operatorv1.LogStorage{}
-	key := utils.DefaultTSEEInstanceKey
+	key := utils.DefaultEnterpriseInstanceKey
 	err := r.client.Get(ctx, key, ls)
 	if errors.IsNotFound(err) {
 		r.status.OnCRNotFound()
@@ -204,7 +237,7 @@ func (r *LogStorageInitializer) Reconcile(ctx context.Context, request reconcile
 	r.status.OnCRFound()
 
 	// Get Installation resource.
-	_, install, err := utils.GetInstallation(context.Background(), r.client)
+	_, installationSpec, err := utils.GetInstallationSpec(context.Background(), r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotFound, "Installation not found", err, reqLogger)
@@ -215,7 +248,7 @@ func (r *LogStorageInitializer) Reconcile(ctx context.Context, request reconcile
 	}
 
 	// Check if there is a management cluster connection. ManagementClusterConnection is a managed cluster only resource.
-	if err = r.client.Get(ctx, utils.DefaultTSEEInstanceKey, &operatorv1.ManagementClusterConnection{}); err == nil {
+	if err = r.client.Get(ctx, utils.DefaultEnterpriseInstanceKey, &operatorv1.ManagementClusterConnection{}); err == nil {
 		// LogStorage isn't valid for managed clusters.
 		r.setConditionDegraded(ctx, ls, reqLogger)
 		r.status.SetDegraded(operatorv1.InvalidConfigurationError, "LogStorage is not valid for a managed cluster", nil, reqLogger)
@@ -232,15 +265,14 @@ func (r *LogStorageInitializer) Reconcile(ctx context.Context, request reconcile
 
 	// Default and validate the object.
 	FillDefaults(ls)
-	err = validateComponentResources(&ls.Spec)
-	if err != nil {
+	if err := validateLogStorage(&ls.Spec); err != nil {
 		// Invalid - mark it as such and return.
 		r.setConditionDegraded(ctx, ls, reqLogger)
 		r.status.SetDegraded(operatorv1.ResourceValidationError, "An error occurred while validating LogStorage", err, reqLogger)
 		return reconcile.Result{}, err
 	}
 
-	pullSecrets, err := utils.GetNetworkingPullSecrets(install, r.client)
+	pullSecrets, err := utils.GetInstallationPullSecrets(installationSpec, r.client)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceReadError, "An error occurring while retrieving the pull secrets", err, reqLogger)
 		return reconcile.Result{}, err
@@ -250,7 +282,7 @@ func (r *LogStorageInitializer) Reconcile(ctx context.Context, request reconcile
 	hdler := utils.NewComponentHandler(reqLogger, r.client, r.scheme, ls)
 	components := []render.Component{render.NewSetup(&render.SetUpConfiguration{
 		OpenShift:       r.provider.IsOpenShift(),
-		Installation:    install,
+		Installation:    installationSpec,
 		PullSecrets:     pullSecrets,
 		Namespace:       render.ElasticsearchNamespace,
 		PSS:             r.elasticsearchPSS(),
@@ -261,7 +293,7 @@ func (r *LogStorageInitializer) Reconcile(ctx context.Context, request reconcile
 	if !r.multiTenant {
 		components = append(components, render.NewSetup(&render.SetUpConfiguration{
 			OpenShift:       r.provider.IsOpenShift(),
-			Installation:    install,
+			Installation:    installationSpec,
 			PullSecrets:     pullSecrets,
 			Namespace:       kibana.Namespace,
 			PSS:             render.PSSBaseline,

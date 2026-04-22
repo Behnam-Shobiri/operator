@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,30 +23,26 @@ import (
 	"strings"
 	"time"
 
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega"
+	"github.com/openshift/library-go/pkg/crypto"
 	"github.com/stretchr/testify/mock"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/kubernetes/scheme"
-	"k8s.io/client-go/testing"
-
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
-
-	"github.com/onsi/ginkgo"
-	"github.com/onsi/gomega"
-
-	"github.com/openshift/library-go/pkg/crypto"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/testing"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 	operator "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/controller/status"
-
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 // ExpectResourceCreated asserts that the given object is created,
@@ -169,8 +165,15 @@ func (n nodeListWatch) Watch(options metav1.ListOptions) (watch.Interface, error
 	return n.cs.CoreV1().Nodes().Watch(context.Background(), options)
 }
 
-// Mock a cache.ListWatcher for nodes to use in the test as there is no other suitable
-// mock available in the fake packages.
+// IsWatchListSemanticsUnSupported signals to the reflector that this ListerWatcher
+// does not support watch-list semantics. Without this, the reflector in client-go
+// v0.35.0+ hangs waiting for bookmark events that the fake clientset doesn't send.
+func (n nodeListWatch) IsWatchListSemanticsUnSupported() bool {
+	return true
+}
+
+// Mock a cache.ListWatcher for typha deployments to use in the test as there is no
+// other suitable mock available in the fake packages.
 // Ref: https://github.com/kubernetes/client-go/issues/352#issuecomment-614740790
 type typhaListWatch struct {
 	cs kubernetes.Interface
@@ -188,6 +191,12 @@ func (t typhaListWatch) Watch(options metav1.ListOptions) (watch.Interface, erro
 	return t.cs.AppsV1().Deployments("calico-system").Watch(context.Background(), options)
 }
 
+// IsWatchListSemanticsUnSupported signals to the reflector that this ListerWatcher
+// does not support watch-list semantics.
+func (t typhaListWatch) IsWatchListSemanticsUnSupported() bool {
+	return true
+}
+
 func CreateNode(c kubernetes.Interface, name string, labels map[string]string, annotations map[string]string) *corev1.Node {
 	node := &corev1.Node{
 		TypeMeta: metav1.TypeMeta{Kind: "Node", APIVersion: "v1"},
@@ -202,9 +211,8 @@ func CreateNode(c kubernetes.Interface, name string, labels map[string]string, a
 		node.Annotations = annotations
 	}
 
-	var err error
-	node, err = c.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
-	gomega.Expect(err).To(gomega.BeNil())
+	node, err := c.CoreV1().Nodes().Create(context.Background(), node, metav1.CreateOptions{})
+	gomega.Expect(err).NotTo(gomega.HaveOccurred())
 	return node
 }
 
@@ -225,13 +233,13 @@ func AssertNodesUnchanged(c kubernetes.Interface, nodes ...*corev1.Node) error {
 	return nil
 }
 
-// DeleteAllowTigeraTierAndExpectWait deletes the tier resource and expects the Reconciler issues a degraded status, waiting for
+// DeleteCalicoSystemTierAndExpectWait deletes the tier resource and expects the Reconciler issues a degraded status, waiting for
 // the tier to become available before progressing its status further. Assumes that mockStatus has any required initial status
 // progression expectations set, and that the Reconciler utilizes the mockStatus object. Assumes the tier resource has been created.
-func DeleteAllowTigeraTierAndExpectWait(ctx context.Context, c client.Client, r reconcile.Reconciler, mockStatus *status.MockStatus) {
-	err := c.Delete(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})
+func DeleteCalicoSystemTierAndExpectWait(ctx context.Context, c client.Client, r reconcile.Reconciler, mockStatus *status.MockStatus) {
+	err := c.Delete(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})
 	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
-	mockStatus.On("SetDegraded", operator.ResourceNotReady, "Waiting for allow-tigera tier to be created, see the 'tiers' TigeraStatus for more information", "tiers.projectcalico.org \"allow-tigera\" not found", mock.Anything).Return()
+	mockStatus.On("SetDegraded", operator.ResourceNotReady, "Waiting for calico-system tier to be created, see the 'tiers' TigeraStatus for more information", "tiers.projectcalico.org \"calico-system\" not found", mock.Anything).Return()
 	_, err = r.Reconcile(ctx, reconcile.Request{})
 	gomega.Expect(err).ShouldNot(gomega.HaveOccurred())
 	mockStatus.AssertExpectations(ginkgo.GinkgoT())

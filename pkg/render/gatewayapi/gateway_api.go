@@ -1,4 +1,4 @@
-// Copyright (c) 2024-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2024-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@ import (
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rcomp "github.com/tigera/operator/pkg/render/common/components"
 	rmeta "github.com/tigera/operator/pkg/render/common/meta"
@@ -38,6 +37,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	apiextenv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
 	"k8s.io/utils/set"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -111,11 +111,31 @@ var (
 			},
 		},
 	}
+
+	// Owning Gateway name and namespace are exposed via pod labels set by EnvoyProxy.
+	// These allow the l7-log-collector to know which Gateway it is collecting logs for
+	// without needing to query the Kubernetes API.
+	OwningGatewayNameEnvVar = corev1.EnvVar{
+		Name: "OWNING_GATEWAY_NAME",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "metadata.labels['gateway.envoyproxy.io/owning-gateway-name']",
+			},
+		},
+	}
+	OwningGatewayNamespaceEnvVar = corev1.EnvVar{
+		Name: "OWNING_GATEWAY_NAMESPACE",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{
+				FieldPath: "metadata.labels['gateway.envoyproxy.io/owning-gateway-namespace']",
+			},
+		},
+	}
 )
 
 func GatewayAPIResourcesGetter() func() *gatewayAPIResources {
 	var lock sync.Mutex
-	var resources = &gatewayAPIResources{}
+	resources := &gatewayAPIResources{}
 	const yamlDelimiter = "\n---\n"
 	return func() *gatewayAPIResources {
 		lock.Lock()
@@ -277,8 +297,8 @@ func GatewayAPIResourcesGetter() func() *gatewayAPIResources {
 			if resources.namespace == nil {
 				panic("missing Namespace from gateway API YAML")
 			}
-			if len(resources.k8sCRDs) != 11 {
-				panic(fmt.Sprintf("missing/extra k8s CRDs from gateway API YAML (%v != 11)", len(resources.k8sCRDs)))
+			if len(resources.k8sCRDs) != 12 {
+				panic(fmt.Sprintf("missing/extra k8s CRDs from gateway API YAML (%v != 12)", len(resources.k8sCRDs)))
 			}
 			if len(resources.envoyCRDs) != 8 {
 				panic(fmt.Sprintf("missing/extra envoy CRDs from gateway API YAML (%v != 8)", len(resources.envoyCRDs)))
@@ -347,10 +367,8 @@ func GatewayAPIResourcesGetter() func() *gatewayAPIResources {
 
 var GatewayAPIResources = GatewayAPIResourcesGetter()
 
-func GatewayAPICRDs(provider operatorv1.Provider) ([]client.Object, []client.Object) {
+func K8SGatewayAPICRDs(provider operatorv1.Provider) (essentialCRDs, optionalCRDs []client.Object) {
 	resources := GatewayAPIResources()
-	essentialCRDs := make([]client.Object, 0, len(resources.k8sCRDs)+len(resources.envoyCRDs))
-	optionalCRDs := make([]client.Object, 0, len(resources.k8sCRDs)+len(resources.envoyCRDs))
 	for _, crd := range resources.k8sCRDs {
 		if provider.IsOpenShift() {
 			// OpenShift 4.19+ restricts the Gateway CRDs that we can install, so report
@@ -367,6 +385,14 @@ func GatewayAPICRDs(provider operatorv1.Provider) ([]client.Object, []client.Obj
 			essentialCRDs = append(essentialCRDs, crd.DeepCopyObject().(client.Object))
 		}
 	}
+	return
+}
+
+// GatewayAPICRDs returns the k8s GatewayAPI CRDs and the Envoy CRDs together,
+// necessary for the deployment of Calico Gateway API.
+func GatewayAPICRDs(provider operatorv1.Provider) (essentialCRDs, optionalCRDs []client.Object) {
+	resources := GatewayAPIResources()
+	essentialCRDs, optionalCRDs = K8SGatewayAPICRDs(provider)
 	for _, crd := range resources.envoyCRDs {
 		essentialCRDs = append(essentialCRDs, crd.DeepCopyObject().(client.Object))
 	}
@@ -404,7 +430,7 @@ func (pr *gatewayAPIImplementationComponent) ResolveImages(is *operatorv1.ImageS
 	prefix := pr.cfg.Installation.ImagePrefix
 
 	var err error
-	if pr.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if pr.cfg.Installation.Variant.IsEnterprise() {
 		pr.envoyGatewayImage, err = components.GetReference(components.ComponentGatewayAPIEnvoyGateway, reg, path, prefix, is)
 		if err != nil {
 			return err
@@ -503,7 +529,7 @@ func (pr *gatewayAPIImplementationComponent) Objects() ([]client.Object, []clien
 	}
 
 	// Add WAF HTTP Filter RBAC resources for Enterprise variant
-	if pr.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if pr.cfg.Installation.Variant.IsEnterprise() {
 		objs = append(objs,
 			pr.wafHttpFilterServiceAccount(),
 			pr.wafHttpFilterClusterRole(),
@@ -684,7 +710,7 @@ func (pr *gatewayAPIImplementationComponent) envoyProxyConfig(className string, 
 	if envoyProxy.Spec.Provider == nil {
 		envoyProxy.Spec.Provider = &envoyapi.EnvoyProxyProvider{}
 	}
-	envoyProxy.Spec.Provider.Type = envoyapi.ProviderTypeKubernetes
+	envoyProxy.Spec.Provider.Type = envoyapi.EnvoyProxyProviderTypeKubernetes
 	if envoyProxy.Spec.Provider.Kubernetes == nil {
 		envoyProxy.Spec.Provider.Kubernetes = &envoyapi.EnvoyProxyKubernetesProvider{}
 	}
@@ -735,7 +761,7 @@ func (pr *gatewayAPIImplementationComponent) envoyProxyConfig(className string, 
 	applyEnvoyProxyServiceOverrides(envoyProxy, classSpec.GatewayService)
 
 	// Setup WAF HTTP Filter and l7 Log collector on Enterprise.
-	if pr.cfg.Installation.Variant == operatorv1.TigeraSecureEnterprise {
+	if pr.cfg.Installation.Variant.IsEnterprise() {
 		// The WAF HTTP filter is not supported when the envoy proxy is deployed as a DaemonSet
 		// as there is no support for init containers in a DaemonSet.
 		if envoyProxy.Spec.Provider.Kubernetes.EnvoyDeployment != nil {
@@ -751,7 +777,7 @@ func (pr *gatewayAPIImplementationComponent) envoyProxyConfig(className string, 
 					"-socketPath",
 					"/var/run/waf-http-filter/extproc.sock",
 				},
-				RestartPolicy: ptr.ToPtr[corev1.ContainerRestartPolicy](corev1.ContainerRestartPolicyAlways),
+				RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
 				VolumeMounts: []corev1.VolumeMount{
 					{
 						Name:      wafFilterName,
@@ -785,8 +811,11 @@ func (pr *gatewayAPIImplementationComponent) envoyProxyConfig(className string, 
 						Name:  "ENVOY_ACCESS_LOG_PATH",
 						Value: "/access_logs/access.log",
 					},
+					// Owning Gateway info from pod labels (set by EnvoyProxy)
+					OwningGatewayNameEnvVar,
+					OwningGatewayNamespaceEnvVar,
 				},
-				RestartPolicy: ptr.ToPtr[corev1.ContainerRestartPolicy](corev1.ContainerRestartPolicyAlways),
+				RestartPolicy: ptr.To(corev1.ContainerRestartPolicyAlways),
 				VolumeMounts: []corev1.VolumeMount{
 					{
 						Name:      "access-logs",
@@ -833,7 +862,6 @@ func (pr *gatewayAPIImplementationComponent) envoyProxyConfig(className string, 
 			accessLogsName := "access-logs"
 			// Add or update Container volume mount
 			wafSocketVolumeMount := corev1.VolumeMount{
-
 				Name:      wafFilterName,
 				MountPath: "/var/run/waf-http-filter",
 			}
@@ -847,7 +875,6 @@ func (pr *gatewayAPIImplementationComponent) envoyProxyConfig(className string, 
 			hasAccessLogsVolumeMount := false
 
 			for i, volumeMount := range envoyProxy.Spec.Provider.Kubernetes.EnvoyDeployment.Container.VolumeMounts {
-
 				switch volumeMount.Name {
 				case wafSocketVolumeMount.Name:
 					hasWAFFilterSocketVolumeMount = true
@@ -875,7 +902,7 @@ func (pr *gatewayAPIImplementationComponent) envoyProxyConfig(className string, 
 				VolumeSource: corev1.VolumeSource{
 					HostPath: &corev1.HostPathVolumeSource{
 						Path: "/var/log/calico",
-						Type: ptr.ToPtr(corev1.HostPathDirectoryOrCreate),
+						Type: ptr.To(corev1.HostPathDirectoryOrCreate),
 					},
 				},
 				Name: "var-log-calico",
@@ -986,7 +1013,7 @@ func (pr *gatewayAPIImplementationComponent) envoyProxyConfig(className string, 
 						},
 					},
 					Format: &envoyapi.ProxyAccessLogFormat{
-						Type: "JSON",
+						Type: ptr.To(envoyapi.ProxyAccessLogFormatTypeJSON),
 						JSON: map[string]string{
 							"reporter":                         "gateway",
 							"start_time":                       "%START_TIME%",
@@ -1092,7 +1119,9 @@ func (pr *gatewayAPIImplementationComponent) wafHttpFilterServiceAccount() *core
 	}
 }
 
-// wafHttpFilterClusterRole creates the ClusterRole for WAF HTTP Filter
+// wafHttpFilterClusterRole creates the ClusterRole for WAF HTTP Filter and L7 Log Collector.
+// The L7 Log Collector sidecar shares this ServiceAccount and needs additional permissions
+// to watch Gateway API resources for log enrichment.
 func (pr *gatewayAPIImplementationComponent) wafHttpFilterClusterRole() *rbacv1.ClusterRole {
 	return &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{Kind: "ClusterRole", APIVersion: "rbac.authorization.k8s.io/v1"},
@@ -1109,6 +1138,12 @@ func (pr *gatewayAPIImplementationComponent) wafHttpFilterClusterRole() *rbacv1.
 				APIGroups: []string{"authentication.k8s.io"},
 				Resources: []string{"tokenreviews"},
 				Verbs:     []string{"create"},
+			},
+			// Gateway API resources for L7 Log Collector enrichment
+			{
+				APIGroups: []string{"gateway.networking.k8s.io"},
+				Resources: []string{"gateways", "httproutes", "grpcroutes"},
+				Verbs:     []string{"get", "list", "watch"},
 			},
 		},
 	}

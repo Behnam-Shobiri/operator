@@ -1,4 +1,4 @@
-// Copyright (c) 2023-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2023-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -54,7 +54,7 @@ type TenantController struct {
 	elasticExternal bool
 }
 
-func AddTenantController(mgr manager.Manager, opts options.AddOptions) error {
+func AddTenantController(mgr manager.Manager, opts options.ControllerOptions) error {
 	if !opts.MultiTenant {
 		return nil
 	}
@@ -137,7 +137,7 @@ func (r *TenantController) Reconcile(ctx context.Context, request reconcile.Requ
 		}
 	}
 	// Get Installation resource.
-	_, installation, err := utils.GetInstallation(context.Background(), r.client)
+	_, installationSpec, err := utils.GetInstallationSpec(context.Background(), r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(operatorv1.ResourceNotFound, "Installation not found", err, logc)
@@ -154,7 +154,7 @@ func (r *TenantController) Reconcile(ctx context.Context, request reconcile.Requ
 		certificatemanager.WithLogger(logc),
 		certificatemanager.WithTenant(tenant),
 	}
-	cm, err := certificatemanager.Create(r.client, installation, r.clusterDomain, tenant.Namespace, opts...)
+	cm, err := certificatemanager.Create(r.client, installationSpec, r.clusterDomain, tenant.Namespace, opts...)
 	if err != nil {
 		r.status.SetDegraded(operatorv1.ResourceCreateError, "Unable to create CA", err, logc)
 		return reconcile.Result{}, err

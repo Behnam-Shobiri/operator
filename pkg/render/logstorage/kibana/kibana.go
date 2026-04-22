@@ -1,4 +1,4 @@
-// Copyright (c) 2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2025-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -55,7 +55,7 @@ const (
 	BasePath     = ObjectName
 	ServiceName  = "tigera-secure-kb-http"
 	DefaultRoute = "/app/kibana#/dashboards?%s&title=%s"
-	PolicyName   = networkpolicy.TigeraComponentPolicyPrefix + "kibana-access"
+	PolicyName   = networkpolicy.CalicoComponentPolicyPrefix + "kibana-access"
 	Port         = 5601
 
 	TLSAnnotationHash = "hash.operator.tigera.io/kb-secrets"
@@ -64,9 +64,7 @@ const (
 	FlowsDashboardName = "Calico Flow Logs"
 )
 
-var (
-	EntityRule = networkpolicy.CreateEntityRule(Namespace, CRName, Port)
-)
+var EntityRule = networkpolicy.CreateEntityRule(Namespace, CRName, Port)
 
 // Kibana renders the components necessary for kibana and elasticsearch
 func Kibana(cfg *Configuration) render.Component {
@@ -152,10 +150,16 @@ func (k *kibana) Objects() ([]client.Object, []client.Object) {
 		// - securityContext.runAsNonRoot=true
 		// - securityContext.seccompProfile.type to "RuntimeDefault" or "Localhost"
 		toCreate = append(toCreate, render.CreateNamespace(Namespace, k.cfg.Installation.KubernetesProvider, render.PSSBaseline, k.cfg.Installation.Azure))
-		toCreate = append(toCreate, k.allowTigeraPolicy())
-		toCreate = append(toCreate, networkpolicy.AllowTigeraDefaultDeny(Namespace))
+		toCreate = append(toCreate, k.calicoSystemPolicy())
+		toCreate = append(toCreate, networkpolicy.CalicoSystemDefaultDeny(Namespace))
 		toCreate = append(toCreate, render.CreateOperatorSecretsRoleBinding(Namespace))
 		toCreate = append(toCreate, k.serviceAccount())
+
+		// allow-tigera Tier was renamed to calico-system
+		toDelete = append(toDelete,
+			networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("kibana-access", Namespace),
+			networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("default-deny", Namespace),
+		)
 
 		if k.cfg.Installation.KubernetesProvider.IsOpenShift() {
 			toCreate = append(toCreate, k.clusterRole(), k.clusterRoleBinding())
@@ -232,6 +236,22 @@ func (k *kibana) kibanaCR() *kbv1.Kibana {
 		// Telemetry is unwanted for the majority of our customers and if enabled can cause blocked flows. This flag
 		// can still be overwritten in the Kibana Settings if the user desires it.
 		"telemetry.optIn": false,
+		// Disabling all the fleet egress is a difficult task. It does not seem to adhere to the doocumented settings.
+		// A combination of settings is required.
+		"xpack.fleet.enabled":        false,
+		"xpack.fleet.agents.enabled": false,
+		"xpack.fleet.isAirGapped":    true,
+		"xpack.fleet.packages":       []string{},
+		"xpack.fleet.registryUrl":    "http://localhost:5601",
+		// Setting this to false will prevent it from connecting to endpoints outside of this cluster.
+		// See: https://www.elastic.co/guide/en/kibana/8.19/settings.html
+		"newsfeed.enabled": false,
+		// Setting this to localhost will prevent AI features from connecting to endpoints outside of this cluster.
+		// No other way of disabling AI is possible at this time. We will still get this log, but at least it
+		// prevents us from seeing denied traffic in the service graph:
+		// "[INFO ][plugins.observabilityAIAssistant] Knowledge base index does not exist. Aborting updating index assets"
+		// "[ERROR][plugins.taskManager] Failed to poll for work: Response aborted while reading the body"
+		"xpack.productDocBase.artifactRepositoryUrl": "http://localhost:5601",
 	}
 
 	var initContainers []corev1.Container
@@ -284,8 +304,9 @@ func (k *kibana) kibanaCR() *kbv1.Kibana {
 	}
 
 	count := int32(1)
-	if k.cfg.Installation.ControlPlaneReplicas != nil {
-		count = *k.cfg.Installation.ControlPlaneReplicas
+	if k.cfg.LogStorage != nil && k.cfg.LogStorage.Spec.Kibana != nil &&
+		k.cfg.LogStorage.Spec.Kibana.Spec != nil && k.cfg.LogStorage.Spec.Kibana.Spec.Replicas != nil {
+		count = *k.cfg.LogStorage.Spec.Kibana.Spec.Replicas
 	}
 
 	tolerations := k.cfg.Installation.ControlPlaneTolerations
@@ -360,7 +381,7 @@ func (k *kibana) kibanaCR() *kbv1.Kibana {
 		},
 	}
 
-	if k.cfg.Installation.ControlPlaneReplicas != nil && *k.cfg.Installation.ControlPlaneReplicas > 1 {
+	if count > 1 {
 		kibana.Spec.PodTemplate.Spec.Affinity = podaffinity.NewPodAntiAffinity(CRName, []string{Namespace})
 	}
 
@@ -411,7 +432,7 @@ func (k *kibana) clusterRoleBinding() *rbacv1.ClusterRoleBinding {
 }
 
 // Allow access to Kibana
-func (k *kibana) allowTigeraPolicy() *v3.NetworkPolicy {
+func (k *kibana) calicoSystemPolicy() *v3.NetworkPolicy {
 	egressRules := []v3.Rule{
 		{
 			Action:      v3.Allow,
@@ -425,7 +446,7 @@ func (k *kibana) allowTigeraPolicy() *v3.NetworkPolicy {
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.KubeAPIServerServiceSelectorEntityRule,
+			Destination: networkpolicy.KubeAPIServerEntityRule,
 		},
 		{
 			Action:      v3.Allow,
@@ -445,7 +466,7 @@ func (k *kibana) allowTigeraPolicy() *v3.NetworkPolicy {
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
+			Tier:     networkpolicy.CalicoTierName,
 			Selector: networkpolicy.KubernetesAppSelector(CRName),
 			Types:    []v3.PolicyType{v3.PolicyTypeIngress, v3.PolicyTypeEgress},
 			Ingress: []v3.Rule{

@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"time"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
 	kerror "k8s.io/apimachinery/pkg/api/errors"
@@ -42,6 +42,7 @@ import (
 	"github.com/tigera/operator/pkg/common"
 	"github.com/tigera/operator/pkg/components"
 	"github.com/tigera/operator/pkg/controller/certificatemanager"
+	"github.com/tigera/operator/pkg/controller/options"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
 	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
@@ -71,7 +72,7 @@ var _ = Describe("apiserver controller tests", func() {
 	BeforeEach(func() {
 		// Set up the scheme
 		scheme = runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).ShouldNot(HaveOccurred())
 		Expect(appsv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(rbacv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 		Expect(admregv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
@@ -92,12 +93,12 @@ var _ = Describe("apiserver controller tests", func() {
 				Generation: 2,
 			},
 			Status: operatorv1.InstallationStatus{
-				Variant:  operatorv1.TigeraSecureEnterprise,
+				Variant:  operatorv1.CalicoEnterprise,
 				Computed: &operatorv1.InstallationSpec{},
 			},
 			Spec: operatorv1.InstallationSpec{
 				ControlPlaneReplicas: &replicas,
-				Variant:              operatorv1.TigeraSecureEnterprise,
+				Variant:              operatorv1.CalicoEnterprise,
 				Registry:             "some.registry.org/",
 			},
 		}
@@ -106,10 +107,8 @@ var _ = Describe("apiserver controller tests", func() {
 		certificateManager, err := certificatemanager.Create(cli, nil, "cluster.local", common.OperatorNamespace(), certificatemanager.AllowCACreation())
 		Expect(err).NotTo(HaveOccurred())
 		Expect(cli.Create(context.Background(), certificateManager.KeyPair().Secret(common.OperatorNamespace()))).NotTo(HaveOccurred())
-		Expect(cli.Create(ctx, &operatorv1.APIServer{
-			ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure"},
-		})).ToNot(HaveOccurred())
-		Expect(cli.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+		Expect(cli.Create(ctx, &operatorv1.APIServer{ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure"}})).ToNot(HaveOccurred())
+		Expect(cli.Create(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})).NotTo(HaveOccurred())
 		cryptoCA, err := tls.MakeCA("byo-ca")
 		Expect(err).NotTo(HaveOccurred())
 		apiSecret, err = secret.CreateTLSSecret(cryptoCA, "calico-apiserver-certs", common.OperatorNamespace(), "key.key", "cert.crt", time.Hour, nil, dns.GetServiceDNSNames(render.APIServerServiceName, "calico-system", dns.DefaultClusterDomain)...)
@@ -148,6 +147,8 @@ var _ = Describe("apiserver controller tests", func() {
 		mockStatus.On("IsAvailable").Return(true)
 		mockStatus.On("OnCRFound").Return()
 		mockStatus.On("ClearDegraded")
+		mockStatus.On("SetWarning", mock.Anything, mock.Anything).Return()
+		mockStatus.On("ClearWarning", mock.Anything).Return()
 		mockStatus.On("AddCertificateSigningRequests", mock.Anything)
 		mockStatus.On("RemoveCertificateSigningRequests", mock.Anything)
 		mockStatus.On("RemoveDeployments", mock.Anything)
@@ -165,10 +166,13 @@ var _ = Describe("apiserver controller tests", func() {
 			r := ReconcileAPIServer{
 				client:              cli,
 				scheme:              scheme,
-				provider:            operatorv1.ProviderNone,
-				enterpriseCRDsExist: true,
 				status:              mockStatus,
 				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
 			}
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
@@ -223,10 +227,13 @@ var _ = Describe("apiserver controller tests", func() {
 			r := ReconcileAPIServer{
 				client:              cli,
 				scheme:              scheme,
-				provider:            operatorv1.ProviderNone,
-				enterpriseCRDsExist: true,
 				status:              mockStatus,
 				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
 			}
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
@@ -273,11 +280,14 @@ var _ = Describe("apiserver controller tests", func() {
 			r := ReconcileAPIServer{
 				client:              cli,
 				scheme:              scheme,
-				provider:            operatorv1.ProviderNone,
-				enterpriseCRDsExist: true,
 				status:              mockStatus,
-				clusterDomain:       dns.DefaultClusterDomain,
 				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+					ClusterDomain:       dns.DefaultClusterDomain,
+				},
 			}
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
@@ -295,10 +305,13 @@ var _ = Describe("apiserver controller tests", func() {
 			r := ReconcileAPIServer{
 				client:              cli,
 				scheme:              scheme,
-				provider:            operatorv1.ProviderNone,
-				enterpriseCRDsExist: true,
 				status:              mockStatus,
 				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
 			}
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
@@ -308,16 +321,19 @@ var _ = Describe("apiserver controller tests", func() {
 			Expect(secret.GetOwnerReferences()).To(HaveLen(1))
 		})
 
-		It("should render allow-tigera policy when tier and tier watch are ready", func() {
+		It("should render calico-system policy when tier and tier watch are ready", func() {
 			Expect(cli.Create(ctx, installation)).To(BeNil())
 
 			r := ReconcileAPIServer{
 				client:              cli,
 				scheme:              scheme,
-				provider:            operatorv1.ProviderNone,
-				enterpriseCRDsExist: true,
 				status:              mockStatus,
 				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
 			}
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 			Expect(err).ShouldNot(HaveOccurred())
@@ -325,20 +341,23 @@ var _ = Describe("apiserver controller tests", func() {
 			policies := v3.NetworkPolicyList{}
 			Expect(cli.List(ctx, &policies)).ToNot(HaveOccurred())
 			Expect(policies.Items).To(HaveLen(1))
-			Expect(policies.Items[0].Name).To(Equal("allow-tigera.apiserver-access"))
+			Expect(policies.Items[0].Name).To(Equal("calico-system.apiserver-access"))
 		})
 
-		It("should omit allow-tigera policy and not degrade when tier is not ready", func() {
+		It("should omit calico-system policy and not degrade when tier is not ready", func() {
 			Expect(cli.Create(ctx, installation)).To(BeNil())
-			Expect(cli.Delete(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+			Expect(cli.Delete(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})).NotTo(HaveOccurred())
 
 			r := ReconcileAPIServer{
 				client:              cli,
 				scheme:              scheme,
-				provider:            operatorv1.ProviderNone,
-				enterpriseCRDsExist: true,
 				status:              mockStatus,
 				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
 			}
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 
@@ -348,16 +367,19 @@ var _ = Describe("apiserver controller tests", func() {
 			Expect(policies.Items).To(HaveLen(0))
 		})
 
-		It("should omit allow-tigera policy and not degrade when tier watch is not ready", func() {
+		It("should omit calico-system policy and not degrade when tier watch is not ready", func() {
 			Expect(cli.Create(ctx, installation)).To(BeNil())
 
 			r := ReconcileAPIServer{
 				client:              cli,
 				scheme:              scheme,
-				provider:            operatorv1.ProviderNone,
-				enterpriseCRDsExist: true,
 				status:              mockStatus,
 				tierWatchReady:      notReady,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
 			}
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 
@@ -367,19 +389,74 @@ var _ = Describe("apiserver controller tests", func() {
 			Expect(policies.Items).To(HaveLen(0))
 		})
 
-		It("should omit allow-tigera policy and not degrade when installation is calico", func() {
+		It("should render calico-system policy when installation is calico when tier and tier watch are ready", func() {
 			Expect(netv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
 			installation.Spec.Variant = operatorv1.Calico
 			installation.Status.Variant = operatorv1.Calico
 			Expect(cli.Create(ctx, installation)).To(BeNil())
-			Expect(cli.Delete(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
 
 			r := ReconcileAPIServer{
 				client:              cli,
 				scheme:              scheme,
-				provider:            operatorv1.ProviderNone,
-				enterpriseCRDsExist: false,
 				status:              mockStatus,
+				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{})
+
+			Expect(err).ShouldNot(HaveOccurred())
+			policies := v3.NetworkPolicyList{}
+			Expect(cli.List(ctx, &policies)).ToNot(HaveOccurred())
+			Expect(policies.Items).To(HaveLen(1))
+			Expect(policies.Items[0].Name).To(Equal("calico-system.apiserver-access"))
+		})
+
+		It("should omit calico-system policy and not degrade when installation is calico when tier is not ready", func() {
+			Expect(netv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+			installation.Spec.Variant = operatorv1.Calico
+			installation.Status.Variant = operatorv1.Calico
+			Expect(cli.Create(ctx, installation)).To(BeNil())
+			Expect(cli.Delete(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})).NotTo(HaveOccurred())
+
+			r := ReconcileAPIServer{
+				client:              cli,
+				scheme:              scheme,
+				status:              mockStatus,
+				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{})
+
+			Expect(err).ShouldNot(HaveOccurred())
+			policies := v3.NetworkPolicyList{}
+			Expect(cli.List(ctx, &policies)).ToNot(HaveOccurred())
+			Expect(policies.Items).To(HaveLen(0))
+		})
+
+		It("should omit calico-system policy and not degrade when installation is calico when tier watch is not ready", func() {
+			Expect(netv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
+			installation.Spec.Variant = operatorv1.Calico
+			installation.Status.Variant = operatorv1.Calico
+			Expect(cli.Create(ctx, installation)).To(BeNil())
+
+			r := ReconcileAPIServer{
+				client:              cli,
+				scheme:              scheme,
+				status:              mockStatus,
+				tierWatchReady:      notReady,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
 			}
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 
@@ -391,18 +468,21 @@ var _ = Describe("apiserver controller tests", func() {
 
 		It("should create the cert secrets in the correct namespace when migrating from calico to enterprise", func() {
 			Expect(netv1.SchemeBuilder.AddToScheme(scheme)).ShouldNot(HaveOccurred())
-			installation.Spec.Variant = operatorv1.TigeraSecureEnterprise
+			installation.Spec.Variant = operatorv1.CalicoEnterprise
 			installation.Status.Variant = operatorv1.Calico
 			Expect(cli.Create(ctx, installation)).To(BeNil())
-			Expect(cli.Delete(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "allow-tigera"}})).NotTo(HaveOccurred())
+			Expect(cli.Delete(ctx, &v3.Tier{ObjectMeta: metav1.ObjectMeta{Name: "calico-system"}})).NotTo(HaveOccurred())
 
 			r := ReconcileAPIServer{
 				client:              cli,
 				scheme:              scheme,
-				provider:            operatorv1.ProviderNone,
-				enterpriseCRDsExist: false,
 				status:              mockStatus,
 				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: false,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
 			}
 			_, err := r.Reconcile(ctx, reconcile.Request{})
 
@@ -438,10 +518,13 @@ var _ = Describe("apiserver controller tests", func() {
 			r := ReconcileAPIServer{
 				client:              cli,
 				scheme:              scheme,
-				provider:            operatorv1.ProviderNone,
-				enterpriseCRDsExist: true,
 				status:              mockStatus,
 				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
 			}
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{
 				Name:      "apiserver",
@@ -467,10 +550,13 @@ var _ = Describe("apiserver controller tests", func() {
 			r := ReconcileAPIServer{
 				client:              cli,
 				scheme:              scheme,
-				provider:            operatorv1.ProviderNone,
-				enterpriseCRDsExist: true,
 				status:              mockStatus,
 				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
 			}
 			Expect(cli.Create(ctx, ts)).NotTo(HaveOccurred())
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{
@@ -516,10 +602,13 @@ var _ = Describe("apiserver controller tests", func() {
 			r := ReconcileAPIServer{
 				client:              cli,
 				scheme:              scheme,
-				provider:            operatorv1.ProviderNone,
-				enterpriseCRDsExist: true,
 				status:              mockStatus,
 				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
 			}
 			_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{
 				Name:      "apiserver",
@@ -582,10 +671,13 @@ var _ = Describe("apiserver controller tests", func() {
 			r := ReconcileAPIServer{
 				client:              cli,
 				scheme:              scheme,
-				provider:            operatorv1.ProviderNone,
-				enterpriseCRDsExist: true,
 				status:              mockStatus,
 				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+				},
 			}
 			installation.Status.Conditions = []metav1.Condition{
 				{
@@ -683,30 +775,18 @@ var _ = Describe("apiserver controller tests", func() {
 				r := ReconcileAPIServer{
 					client:              cli,
 					scheme:              scheme,
-					provider:            operatorv1.ProviderNone,
-					enterpriseCRDsExist: true,
 					status:              mockStatus,
 					tierWatchReady:      ready,
-					multiTenant:         false,
+					migrationWatchReady: &utils.ReadyFlag{},
+					opts: options.ControllerOptions{
+						EnterpriseCRDExists: true,
+						DetectedProvider:    operatorv1.ProviderNone,
+					},
 				}
 
 				// Reconcile the API server
 				_, err = r.Reconcile(ctx, reconcile.Request{})
 				Expect(err).ShouldNot(HaveOccurred())
-
-				clusterConnectionInAppNs := corev1.Secret{
-					TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      render.VoltronTunnelSecretName,
-						Namespace: "calico-system",
-					},
-				}
-
-				// Ensure that the tunnel secret was copied in calico-system namespace
-				err = test.GetResource(cli, &clusterConnectionInAppNs)
-				Expect(kerror.IsNotFound(err)).Should(BeFalse())
-				Expect(clusterConnectionInAppNs.Data).Should(HaveKeyWithValue("tls.crt", []byte("certvalue")))
-				Expect(clusterConnectionInAppNs.Data).Should(HaveKeyWithValue("tls.key", []byte("keyvalue")))
 			})
 
 			It("Should reconcile multi-cluster setup for a management cluster for a single tenant", func() {
@@ -724,11 +804,13 @@ var _ = Describe("apiserver controller tests", func() {
 				r := ReconcileAPIServer{
 					client:              cli,
 					scheme:              scheme,
-					provider:            operatorv1.ProviderNone,
-					enterpriseCRDsExist: true,
 					status:              mockStatus,
 					tierWatchReady:      ready,
-					multiTenant:         false,
+					migrationWatchReady: &utils.ReadyFlag{},
+					opts: options.ControllerOptions{
+						EnterpriseCRDExists: true,
+						DetectedProvider:    operatorv1.ProviderNone,
+					},
 				}
 
 				// Reconcile the API server
@@ -742,20 +824,9 @@ var _ = Describe("apiserver controller tests", func() {
 						Namespace: "calico-system",
 					},
 				}
-				clusterConnectionInAppNs := corev1.Secret{
-					TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: "v1"},
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      render.VoltronTunnelSecretName,
-						Namespace: "calico-system",
-					},
-				}
 
 				// Ensure a deployment was created for the API server
 				err = test.GetResource(cli, &deployment)
-				Expect(kerror.IsNotFound(err)).Should(BeFalse())
-
-				// Ensure that the tunnel secret was copied in calico-system namespace
-				err = test.GetResource(cli, &clusterConnectionInAppNs)
 				Expect(kerror.IsNotFound(err)).Should(BeFalse())
 			})
 
@@ -763,11 +834,14 @@ var _ = Describe("apiserver controller tests", func() {
 				r := ReconcileAPIServer{
 					client:              cli,
 					scheme:              scheme,
-					provider:            operatorv1.ProviderNone,
-					enterpriseCRDsExist: true,
 					status:              mockStatus,
 					tierWatchReady:      ready,
-					multiTenant:         true,
+					migrationWatchReady: &utils.ReadyFlag{},
+					opts: options.ControllerOptions{
+						EnterpriseCRDExists: true,
+						DetectedProvider:    operatorv1.ProviderNone,
+						MultiTenant:         true,
+					},
 				}
 
 				// Reconcile the API server
@@ -797,6 +871,124 @@ var _ = Describe("apiserver controller tests", func() {
 				err = test.GetResource(cli, &clusterConnectionInAppNs)
 				Expect(kerror.IsNotFound(err)).Should(BeTrue())
 			})
+		})
+	})
+
+	Context("webhook tests", func() {
+		It("should create webhook deployment when UseV3CRDs is true", func() {
+			Expect(cli.Create(ctx, installation)).To(BeNil())
+
+			r := ReconcileAPIServer{
+				client:              cli,
+				scheme:              scheme,
+				status:              mockStatus,
+				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+					UseV3CRDs:           true,
+					ClusterDomain:       dns.DefaultClusterDomain,
+				},
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			d := appsv1.Deployment{
+				TypeMeta:   metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+				ObjectMeta: metav1.ObjectMeta{Name: "calico-webhooks", Namespace: common.CalicoNamespace},
+			}
+			Expect(test.GetResource(cli, &d)).To(BeNil())
+			Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
+			Expect(d.Spec.Template.Spec.Containers[0].Name).To(Equal("calico-webhooks"))
+		})
+
+		It("should create webhook deployment for OSS with UseV3CRDs", func() {
+			replicas := int32(2)
+			ossInstallation := &operatorv1.Installation{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "default",
+					Generation: 2,
+				},
+				Status: operatorv1.InstallationStatus{
+					Variant:  operatorv1.Calico,
+					Computed: &operatorv1.InstallationSpec{},
+				},
+				Spec: operatorv1.InstallationSpec{
+					ControlPlaneReplicas: &replicas,
+					Variant:              operatorv1.Calico,
+					Registry:             "some.registry.org/",
+				},
+			}
+			Expect(cli.Create(ctx, ossInstallation)).To(BeNil())
+
+			r := ReconcileAPIServer{
+				client:              cli,
+				scheme:              scheme,
+				status:              mockStatus,
+				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: false,
+					DetectedProvider:    operatorv1.ProviderNone,
+					UseV3CRDs:           true,
+					ClusterDomain:       dns.DefaultClusterDomain,
+				},
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			d := appsv1.Deployment{
+				TypeMeta:   metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+				ObjectMeta: metav1.ObjectMeta{Name: "calico-webhooks", Namespace: common.CalicoNamespace},
+			}
+			Expect(test.GetResource(cli, &d)).To(BeNil())
+			Expect(d.Spec.Template.Spec.Containers).To(HaveLen(1))
+			Expect(d.Spec.Template.Spec.Containers[0].Name).To(Equal("calico-webhooks"))
+		})
+
+		It("should not create webhook deployment when UseV3CRDs is false", func() {
+			Expect(cli.Create(ctx, installation)).To(BeNil())
+
+			r := ReconcileAPIServer{
+				client:              cli,
+				scheme:              scheme,
+				status:              mockStatus,
+				tierWatchReady:      ready,
+				migrationWatchReady: &utils.ReadyFlag{},
+				opts: options.ControllerOptions{
+					EnterpriseCRDExists: true,
+					DetectedProvider:    operatorv1.ProviderNone,
+					UseV3CRDs:           false,
+				},
+			}
+			_, err := r.Reconcile(ctx, reconcile.Request{})
+			Expect(err).ShouldNot(HaveOccurred())
+
+			d := appsv1.Deployment{
+				TypeMeta:   metav1.TypeMeta{Kind: "Deployment", APIVersion: "apps/v1"},
+				ObjectMeta: metav1.ObjectMeta{Name: "calico-webhooks", Namespace: common.CalicoNamespace},
+			}
+			err = test.GetResource(cli, &d)
+			Expect(kerror.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("should reject invalid CalicoWebhooksDeployment on APIServer CR", func() {
+			instance := &operatorv1.APIServer{
+				ObjectMeta: metav1.ObjectMeta{Name: "tigera-secure"},
+				Spec: operatorv1.APIServerSpec{
+					CalicoWebhooksDeployment: &operatorv1.CalicoWebhooksDeployment{
+						Metadata: &operatorv1.Metadata{
+							Labels: map[string]string{
+								"NoUppercaseOrSpecialCharsLike=Equals": "b",
+							},
+						},
+					},
+				},
+			}
+			err := validateAPIServerResource(instance)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("CalicoWebhooksDeployment"))
 		})
 	})
 })

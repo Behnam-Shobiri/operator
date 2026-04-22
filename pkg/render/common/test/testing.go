@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -44,13 +44,13 @@ func ExpectK8sServiceEpEnvVars(podSpec corev1.PodSpec, host, port string) {
 		ExpectWithOffset(1, c.Env).To(ContainElements(
 			corev1.EnvVar{Name: "KUBERNETES_SERVICE_HOST", Value: host},
 			corev1.EnvVar{Name: "KUBERNETES_SERVICE_PORT", Value: port},
-		), fmt.Sprintf("Container %s did not have KUBERENETES_SERVICE_... env vars", c.Name))
+		), fmt.Sprintf("Container %s did not have KUBERNETES_SERVICE_... env vars", c.Name))
 	}
 	for _, c := range podSpec.InitContainers {
 		ExpectWithOffset(1, c.Env).To(ContainElements(
 			corev1.EnvVar{Name: "KUBERNETES_SERVICE_HOST", Value: host},
 			corev1.EnvVar{Name: "KUBERNETES_SERVICE_PORT", Value: port},
-		), fmt.Sprintf("Init container %s did not have KUBERENETES_SERVICE_... env vars", c.Name))
+		), fmt.Sprintf("Init container %s did not have KUBERNETES_SERVICE_... env vars", c.Name))
 	}
 }
 
@@ -122,14 +122,14 @@ func ExpectResource(expected client.Object, resources []client.Object) error {
 			}
 		}
 	}
-	return notFoundError(name, ns, resources)
+	return notFoundError(name, ns, expected, resources)
 }
 
-func notFoundError(name, ns string, resources []client.Object) error {
+func notFoundError(name, ns string, o client.Object, resources []client.Object) error {
 	if ns == "" {
-		return fmt.Errorf("resource %s not found in:\n\n%s", name, itemList(resources))
+		return fmt.Errorf("%T %s not found in:\n\n%s", o, name, itemList(resources))
 	}
-	return fmt.Errorf("resource %s/%s not found in:\n\n%s", ns, name, itemList(resources))
+	return fmt.Errorf("%T %s/%s not found in:\n\n%s", o, ns, name, itemList(resources))
 }
 
 // itemList is a helper for printing out a nice error message when a resource is not found.
@@ -191,7 +191,7 @@ func GetResourceOfType[T client.Object](resources []client.Object, name, ns stri
 
 	// Return a nil instance of T and an error.
 	var n T
-	return n, notFoundError(name, ns, resources)
+	return n, notFoundError(name, ns, n, resources)
 }
 
 func GetGlobalResource(resources []client.Object, name, group, version, kind string) client.Object {

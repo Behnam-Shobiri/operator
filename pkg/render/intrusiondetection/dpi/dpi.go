@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ import (
 const (
 	DeepPacketInspectionNamespace            = "tigera-dpi"
 	DeepPacketInspectionName                 = "tigera-dpi"
-	DeepPacketInspectionPolicyName           = networkpolicy.TigeraComponentPolicyPrefix + DeepPacketInspectionName
+	DeepPacketInspectionPolicyName           = networkpolicy.CalicoComponentPolicyPrefix + DeepPacketInspectionName
 	DefaultMemoryLimit                       = "1Gi"
 	DefaultMemoryRequest                     = "100Mi"
 	DefaultCPULimit                          = "1"
@@ -118,7 +118,7 @@ func (d *dpiComponent) Objects() (objsToCreate, objsToDelete []client.Object) {
 	})
 
 	if d.cfg.HasNoDPIResource || d.cfg.HasNoLicense {
-		toDelete = append(toDelete, d.dpiAllowTigeraPolicy())
+		toDelete = append(toDelete, d.dpiCalicoSystemPolicy())
 		toDelete = append(toDelete, secret.ToRuntimeObjects(secret.CopyToNamespace(DeepPacketInspectionNamespace, d.cfg.PullSecrets...)...)...)
 		toDelete = append(toDelete,
 			d.dpiServiceAccount(),
@@ -127,7 +127,7 @@ func (d *dpiComponent) Objects() (objsToCreate, objsToDelete []client.Object) {
 			d.dpiDaemonset(),
 		)
 	} else {
-		toCreate = append(toCreate, d.dpiAllowTigeraPolicy())
+		toCreate = append(toCreate, d.dpiCalicoSystemPolicy())
 		toCreate = append(toCreate, secret.ToRuntimeObjects(secret.CopyToNamespace(DeepPacketInspectionNamespace)...)...)
 		toCreate = append(toCreate, secret.ToRuntimeObjects(secret.CopyToNamespace(DeepPacketInspectionNamespace, d.cfg.PullSecrets...)...)...)
 		toCreate = append(toCreate,
@@ -136,6 +136,9 @@ func (d *dpiComponent) Objects() (objsToCreate, objsToDelete []client.Object) {
 			d.dpiClusterRoleBinding(),
 			d.dpiDaemonset(),
 		)
+
+		// allow-tigera Tier was renamed to calico-system
+		toDelete = append(toDelete, networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("tigera-dpi", DeepPacketInspectionNamespace))
 	}
 	if d.cfg.ManagementCluster {
 		// We always want to create these permissions when a management
@@ -314,6 +317,7 @@ func (d *dpiComponent) dpiEnvVars() []corev1.EnvVar {
 		{Name: "DPI_TYPHACAFILE", Value: d.cfg.TyphaNodeTLS.TrustedBundle.MountPath()},
 		{Name: "DPI_TYPHACERTFILE", Value: d.cfg.TyphaNodeTLS.NodeSecret.VolumeMountCertificateFilePath()},
 		{Name: "DPI_TYPHAKEYFILE", Value: d.cfg.TyphaNodeTLS.NodeSecret.VolumeMountKeyFilePath()},
+		{Name: "LINSEED_URL", Value: relasticsearch.LinseedEndpoint(d.SupportedOSType(), d.cfg.ClusterDomain, render.LinseedNamespace(d.cfg.Tenant), d.cfg.ManagedCluster, false)},
 		{Name: "LINSEED_CLIENT_CERT", Value: d.cfg.DPICertSecret.VolumeMountCertificateFilePath()},
 		{Name: "LINSEED_CLIENT_KEY", Value: d.cfg.DPICertSecret.VolumeMountKeyFilePath()},
 		{Name: "LINSEED_TOKEN", Value: render.GetLinseedTokenPath(d.cfg.ManagedCluster)},
@@ -437,7 +441,10 @@ func (d *dpiComponent) dpiClusterRole() *rbacv1.ClusterRole {
 
 		Rules: []rbacv1.PolicyRule{
 			{
-				APIGroups: []string{"crd.projectcalico.org"},
+				APIGroups: []string{
+					"projectcalico.org",
+					"crd.projectcalico.org",
+				},
 				Resources: []string{
 					"deeppacketinspections",
 				},
@@ -445,7 +452,10 @@ func (d *dpiComponent) dpiClusterRole() *rbacv1.ClusterRole {
 			},
 			{
 				// Used to update the DPI resource status
-				APIGroups: []string{"crd.projectcalico.org"},
+				APIGroups: []string{
+					"projectcalico.org",
+					"crd.projectcalico.org",
+				},
 				Resources: []string{
 					"deeppacketinspections/status",
 				},
@@ -530,12 +540,12 @@ func (c *dpiComponent) externalLinseedRoleBinding() *rbacv1.RoleBinding {
 }
 
 // This policy uses service selectors.
-func (d *dpiComponent) dpiAllowTigeraPolicy() *v3.NetworkPolicy {
+func (d *dpiComponent) dpiCalicoSystemPolicy() *v3.NetworkPolicy {
 	egressRules := []v3.Rule{
 		{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.KubeAPIServerServiceSelectorEntityRule,
+			Destination: networkpolicy.KubeAPIServerEntityRule,
 		},
 	}
 	egressRules = networkpolicy.AppendServiceSelectorDNSEgressRules(egressRules, d.cfg.OpenShift)
@@ -562,7 +572,7 @@ func (d *dpiComponent) dpiAllowTigeraPolicy() *v3.NetworkPolicy {
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:    &networkpolicy.HighPrecedenceOrder,
-			Tier:     networkpolicy.TigeraComponentTierName,
+			Tier:     networkpolicy.CalicoTierName,
 			Selector: networkpolicy.KubernetesAppSelector(DeepPacketInspectionName),
 			Types:    []v3.PolicyType{v3.PolicyTypeEgress},
 			Egress:   egressRules,

@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -66,7 +66,7 @@ const (
 
 // Add creates a new authentication Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
-func Add(mgr manager.Manager, opts options.AddOptions) error {
+func Add(mgr manager.Manager, opts options.ControllerOptions) error {
 	if !opts.EnterpriseCRDExists {
 		// No need to start this controller.
 		return nil
@@ -82,10 +82,10 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 		return fmt.Errorf("failed to create %s: %w", controllerName, err)
 	}
 
-	go utils.WaitToAddTierWatch(networkpolicy.TigeraComponentTierName, c, opts.K8sClientset, log, tierWatchReady)
+	go utils.WaitToAddTierWatch(networkpolicy.CalicoTierName, c, opts.K8sClientset, log, tierWatchReady)
 	go utils.WaitToAddNetworkPolicyWatches(c, opts.K8sClientset, log, []types.NamespacedName{
 		{Name: render.DexPolicyName, Namespace: render.DexNamespace},
-		{Name: networkpolicy.TigeraComponentDefaultDenyPolicyName, Namespace: render.DexNamespace},
+		{Name: networkpolicy.CalicoComponentDefaultDenyPolicyName, Namespace: render.DexNamespace},
 	})
 
 	var secretProviderClasses []client.Object
@@ -106,7 +106,7 @@ func Add(mgr manager.Manager, opts options.AddOptions) error {
 }
 
 // newReconciler returns a new reconcile.Reconciler
-func newReconciler(mgr manager.Manager, opts options.AddOptions, tierWatchReady *utils.ReadyFlag) *ReconcileAuthentication {
+func newReconciler(mgr manager.Manager, opts options.ControllerOptions, tierWatchReady *utils.ReadyFlag) *ReconcileAuthentication {
 	r := &ReconcileAuthentication{
 		client:         mgr.GetClient(),
 		scheme:         mgr.GetScheme(),
@@ -230,7 +230,7 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 	}
 
 	// Query for the installation object.
-	variant, install, err := utils.GetInstallation(context.Background(), r.client)
+	variant, installationSpec, err := utils.GetInstallationSpec(context.Background(), r.client)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			r.status.SetDegraded(oprv1.ResourceNotFound, "Installation not found", err, reqLogger)
@@ -239,8 +239,8 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 		r.status.SetDegraded(oprv1.ResourceReadError, "Error querying installation", err, reqLogger)
 		return reconcile.Result{}, err
 	}
-	if variant != oprv1.TigeraSecureEnterprise {
-		r.status.SetDegraded(oprv1.ResourceNotReady, fmt.Sprintf("Waiting for network to be %s", oprv1.TigeraSecureEnterprise), nil, reqLogger)
+	if !variant.IsEnterprise() {
+		r.status.SetDegraded(oprv1.ResourceNotReady, "Waiting for network to be an enterprise variant", nil, reqLogger)
 		return reconcile.Result{}, nil
 	}
 
@@ -250,13 +250,13 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 		return reconcile.Result{RequeueAfter: utils.StandardRetry}, nil
 	}
 
-	// Ensure the allow-tigera tier exists, before rendering any network policies within it.
-	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.TigeraComponentTierName}, &v3.Tier{}); err != nil {
+	// Ensure the calico-system tier exists, before rendering any network policies within it.
+	if err := r.client.Get(ctx, client.ObjectKey{Name: networkpolicy.CalicoTierName}, &v3.Tier{}); err != nil {
 		if errors.IsNotFound(err) {
-			r.status.SetDegraded(oprv1.ResourceNotReady, "Waiting for allow-tigera tier to be created, see the 'tiers' TigeraStatus for more information", err, reqLogger)
+			r.status.SetDegraded(oprv1.ResourceNotReady, "Waiting for calico-system tier to be created, see the 'tiers' TigeraStatus for more information", err, reqLogger)
 			return reconcile.Result{}, nil
 		} else {
-			r.status.SetDegraded(oprv1.ResourceReadError, "Error querying allow-tigera tier", err, reqLogger)
+			r.status.SetDegraded(oprv1.ResourceReadError, "Error querying calico-system tier", err, reqLogger)
 			return reconcile.Result{}, err
 		}
 	}
@@ -273,7 +273,7 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 	}
 
 	// Secret used for TLS between dex and other components.
-	certificateManager, err := certificatemanager.Create(r.client, install, r.clusterDomain, common.OperatorNamespace())
+	certificateManager, err := certificatemanager.Create(r.client, installationSpec, r.clusterDomain, common.OperatorNamespace())
 	if err != nil {
 		r.status.SetDegraded(oprv1.ResourceCreateError, "Unable to create the Tigera CA", err, reqLogger)
 		return reconcile.Result{}, err
@@ -299,7 +299,7 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 		return reconcile.Result{}, err
 	}
 
-	pullSecrets, err := utils.GetNetworkingPullSecrets(install, r.client)
+	pullSecrets, err := utils.GetInstallationPullSecrets(installationSpec, r.client)
 	if err != nil {
 		r.status.SetDegraded(oprv1.ResourceReadError, "Error retrieving pull secrets", err, reqLogger)
 		return reconcile.Result{}, err
@@ -380,7 +380,7 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 	enableDex := utils.DexEnabled(authentication)
 
 	// DexConfig adds convenience methods around dex related objects in k8s and can be used to configure Dex.
-	dexCfg := render.NewDexConfig(install.CertificateManagement, authentication, idpSecret, secretProviderClass, r.clusterDomain)
+	dexCfg := render.NewDexConfig(installationSpec.CertificateManagement, authentication, idpSecret, secretProviderClass, r.clusterDomain)
 
 	// Create a component handler to manage the rendered component.
 	hlr := utils.NewComponentHandler(log, r.client, r.scheme, authentication)
@@ -388,7 +388,7 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 	dexComponentCfg := &render.DexComponentConfiguration{
 		PullSecrets:    pullSecrets,
 		OpenShift:      r.provider.IsOpenShift(),
-		Installation:   install,
+		Installation:   installationSpec,
 		DexConfig:      dexCfg,
 		ClusterDomain:  r.clusterDomain,
 		DeleteDex:      !enableDex,
@@ -428,6 +428,11 @@ func (r *ReconcileAuthentication) Reconcile(ctx context.Context, request reconci
 			return reconcile.Result{}, err
 		}
 	}
+
+	// Check BYO certificate expiry warnings.
+	certificatemanagement.CheckKeyPairWarnings(map[string]certificatemanagement.KeyPairInterface{
+		render.DexTLSSecretName: tlsKeyPair,
+	}, r.status)
 
 	// Clear the degraded bit if we've reached this far.
 	r.status.ClearDegraded()

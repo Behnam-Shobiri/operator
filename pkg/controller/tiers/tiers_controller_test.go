@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ package tiers
 import (
 	"context"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/stretchr/testify/mock"
 
@@ -32,6 +32,7 @@ import (
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/apis"
 	"github.com/tigera/operator/pkg/common"
+	"github.com/tigera/operator/pkg/controller/options"
 	"github.com/tigera/operator/pkg/controller/status"
 	"github.com/tigera/operator/pkg/controller/utils"
 	ctrlrfake "github.com/tigera/operator/pkg/ctrlruntime/client/fake"
@@ -48,7 +49,7 @@ var _ = Describe("tier controller tests", func() {
 	BeforeEach(func() {
 		// The schema contains all objects that should be known to the fake client when the test runs.
 		scheme = runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 		Expect(operatorv1.SchemeBuilder.AddToScheme(scheme)).NotTo(HaveOccurred())
 		Expect(appsv1.AddToScheme(scheme))
 
@@ -67,10 +68,12 @@ var _ = Describe("tier controller tests", func() {
 		r = ReconcileTiers{
 			client:             c,
 			scheme:             scheme,
-			provider:           operatorv1.ProviderNone,
 			status:             mockStatus,
 			tierWatchReady:     readyFlag,
 			policyWatchesReady: readyFlag,
+			opts: options.ControllerOptions{
+				DetectedProvider: operatorv1.ProviderNone,
+			},
 		}
 
 		// Create objects that are prerequisites of the reconcile loop.
@@ -79,11 +82,11 @@ var _ = Describe("tier controller tests", func() {
 			&operatorv1.Installation{
 				ObjectMeta: metav1.ObjectMeta{Name: "default"},
 				Spec: operatorv1.InstallationSpec{
-					Variant:  operatorv1.TigeraSecureEnterprise,
+					Variant:  operatorv1.CalicoEnterprise,
 					Registry: "some.registry.org/",
 				},
 				Status: operatorv1.InstallationStatus{
-					Variant: operatorv1.TigeraSecureEnterprise,
+					Variant: operatorv1.CalicoEnterprise,
 					Computed: &operatorv1.InstallationSpec{
 						Registry: "my-reg",
 						// The test is provider agnostic.
@@ -117,7 +120,7 @@ var _ = Describe("tier controller tests", func() {
 	})
 
 	// Validate that the tier is created. Policy coverage is handled in the render tests.
-	It("reconciles the allow-tigera tier", func() {
+	It("reconciles the calico-system tier", func() {
 		mockStatus.On("ReadyToMonitor")
 		mockStatus.On("ClearDegraded")
 
@@ -125,7 +128,7 @@ var _ = Describe("tier controller tests", func() {
 		Expect(err).ShouldNot(HaveOccurred())
 
 		tier := v3.Tier{}
-		Expect(c.Get(ctx, client.ObjectKey{Name: "allow-tigera"}, &tier)).To(BeNil())
+		Expect(c.Get(ctx, client.ObjectKey{Name: "calico-system"}, &tier)).To(BeNil())
 	})
 
 	It("waits for API server to be available before reconciling", func() {
@@ -137,10 +140,12 @@ var _ = Describe("tier controller tests", func() {
 		r = ReconcileTiers{
 			client:             c,
 			scheme:             scheme,
-			provider:           operatorv1.ProviderNone,
 			status:             mockStatus,
 			tierWatchReady:     readyFlag,
 			policyWatchesReady: readyFlag,
+			opts: options.ControllerOptions{
+				DetectedProvider: operatorv1.ProviderNone,
+			},
 		}
 
 		_, err = r.Reconcile(ctx, reconcile.Request{})
@@ -149,25 +154,28 @@ var _ = Describe("tier controller tests", func() {
 		mockStatus.AssertExpectations(GinkgoT())
 	})
 
-	It("should require license", func() {
+	It("should not require license", func() {
 		Expect(c.Delete(ctx, &v3.LicenseKey{ObjectMeta: metav1.ObjectMeta{Name: "default"}})).ToNot(HaveOccurred())
 		mockStatus = &status.MockStatus{}
 		r = ReconcileTiers{
 			client:             c,
 			scheme:             scheme,
-			provider:           operatorv1.ProviderNone,
 			status:             mockStatus,
 			tierWatchReady:     readyFlag,
 			policyWatchesReady: readyFlag,
+			opts: options.ControllerOptions{
+				DetectedProvider: operatorv1.ProviderNone,
+			},
 		}
-		mockStatus.On("OnCRFound").Return()
-		mockStatus.On("SetDegraded", operatorv1.ResourceNotFound, "License not found", "licensekeies.projectcalico.org \"default\" not found", mock.Anything).Return()
+		mockStatus.On("OnCRFound")
+		mockStatus.On("ReadyToMonitor")
+		mockStatus.On("ClearDegraded")
 		_, err := r.Reconcile(ctx, reconcile.Request{})
 		Expect(err).ShouldNot(HaveOccurred())
 		mockStatus.AssertExpectations(GinkgoT())
 	})
 
-	It("should require license with tiers feature", func() {
+	It("should not require license with tiers feature", func() {
 		license := &v3.LicenseKey{
 			ObjectMeta: metav1.ObjectMeta{Name: "default"},
 			Status: v3.LicenseKeyStatus{
@@ -182,13 +190,16 @@ var _ = Describe("tier controller tests", func() {
 		r = ReconcileTiers{
 			client:             c,
 			scheme:             scheme,
-			provider:           operatorv1.ProviderNone,
 			status:             mockStatus,
 			tierWatchReady:     readyFlag,
 			policyWatchesReady: readyFlag,
+			opts: options.ControllerOptions{
+				DetectedProvider: operatorv1.ProviderNone,
+			},
 		}
-		mockStatus.On("OnCRFound").Return()
-		mockStatus.On("SetDegraded", operatorv1.ResourceValidationError, "Feature is not active - License does not support feature: tiers", mock.Anything, mock.Anything).Return()
+		mockStatus.On("OnCRFound")
+		mockStatus.On("ReadyToMonitor")
+		mockStatus.On("ClearDegraded")
 		_, err := r.Reconcile(ctx, reconcile.Request{})
 		Expect(err).ShouldNot(HaveOccurred())
 		mockStatus.AssertExpectations(GinkgoT())

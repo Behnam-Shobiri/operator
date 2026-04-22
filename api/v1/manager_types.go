@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2026 Tigera, Inc. All rights reserved.
 /*
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -67,8 +67,8 @@ type ManagerDeploymentPodSpec struct {
 // ManagerDeploymentContainer is a Manager Deployment container.
 type ManagerDeploymentContainer struct {
 	// Name is an enum which identifies the Manager Deployment container by name.
-	// Supported values are: tigera-voltron, tigera-manager, tigera-ui-apis, and tigera-es-proxy (deprecated).
-	// +kubebuilder:validation:Enum=tigera-voltron;tigera-manager;tigera-es-proxy;tigera-ui-apis
+	// Supported values are: calico-voltron, calico-manager, calico-ui-apis, calico-dashboard-api, tigera-voltron (deprecated), tigera-manager (deprecated), tigera-ui-apis (deprecated), tigera-es-proxy (deprecated)
+	// +kubebuilder:validation:Enum=calico-voltron;calico-manager;calico-ui-apis;calico-dashboard-api;tigera-voltron;tigera-manager;tigera-ui-apis
 	Name string `json:"name"`
 
 	// Resources allows customization of limits and requests for compute resources such as cpu and memory.
@@ -76,13 +76,23 @@ type ManagerDeploymentContainer struct {
 	// If omitted, the Manager Deployment will use its default value for this container's resources.
 	// +optional
 	Resources *v1.ResourceRequirements `json:"resources,omitempty"`
+
+	// ReadinessProbe allows customization of the readiness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	ReadinessProbe *ProbeOverride `json:"readinessProbe,omitempty"`
+
+	// LivenessProbe allows customization of the liveness probe timing parameters.
+	// The probe handler is set by the operator and cannot be overridden.
+	// +optional
+	LivenessProbe *ProbeOverride `json:"livenessProbe,omitempty"`
 }
 
 // ManagerDeploymentInitContainer is a Manager Deployment init container.
 type ManagerDeploymentInitContainer struct {
 	// Name is an enum which identifies the Manager Deployment init container by name.
-	// Supported values are: manager-tls-key-cert-provisioner, internal-manager-tls-key-cert-provisioner, tigera-voltron-linseed-tls-key-cert-provisioner
-	// +kubebuilder:validation:Enum=manager-tls-key-cert-provisioner;internal-manager-tls-key-cert-provisioner;tigera-voltron-linseed-tls-key-cert-provisioner
+	// Supported values are: manager-tls-key-cert-provisioner, internal-manager-tls-key-cert-provisioner, calico-voltron-linseed-tls-key-cert-provisioner, tigera-voltron-linseed-tls-key-cert-provisioner (deprecated)
+	// +kubebuilder:validation:Enum=manager-tls-key-cert-provisioner;internal-manager-tls-key-cert-provisioner;calico-voltron-linseed-tls-key-cert-provisioner;tigera-voltron-linseed-tls-key-cert-provisioner
 	Name string `json:"name"`
 
 	// Resources allows customization of limits and requests for compute resources such as cpu and memory.
@@ -110,6 +120,8 @@ type ManagerStatus struct {
 
 // Manager installs the Calico Enterprise manager graphical user interface. At most one instance
 // of this resource is supported. It must be named "tigera-secure".
+//
+// +kubebuilder:validation:XValidation:rule="self.metadata.name == 'tigera-secure'",message="resource name must be 'tigera-secure'"
 type Manager struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

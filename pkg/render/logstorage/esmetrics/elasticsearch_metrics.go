@@ -1,4 +1,4 @@
-// Copyright (c) 2021-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2021-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -22,13 +22,13 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	v3 "github.com/tigera/api/pkg/apis/projectcalico/v3"
 
 	operatorv1 "github.com/tigera/operator/api/v1"
 	"github.com/tigera/operator/pkg/components"
-	"github.com/tigera/operator/pkg/ptr"
 	"github.com/tigera/operator/pkg/render"
 	rcomponents "github.com/tigera/operator/pkg/render/common/components"
 	relasticsearch "github.com/tigera/operator/pkg/render/common/elasticsearch"
@@ -46,7 +46,7 @@ const (
 	ElasticsearchMetricsServerTLSSecret = "tigera-ee-elasticsearch-metrics-tls"
 	ElasticsearchMetricsName            = "tigera-elasticsearch-metrics"
 	ElasticsearchMetricsRoleName        = "tigera-elasticsearch-metrics"
-	ElasticsearchMetricsPolicyName      = networkpolicy.TigeraComponentPolicyPrefix + "elasticsearch-metrics"
+	ElasticsearchMetricsPolicyName      = networkpolicy.CalicoComponentPolicyPrefix + "elasticsearch-metrics"
 	ElasticsearchMetricsPort            = 9081
 )
 
@@ -92,14 +92,18 @@ func (e *elasticsearchMetrics) ResolveImages(is *operatorv1.ImageSet) error {
 
 func (e *elasticsearchMetrics) Objects() (objsToCreate, objsToDelete []client.Object) {
 	toCreate := []client.Object{
-		e.allowTigeraPolicy(),
+		e.calicoSystemPolicy(),
 	}
 	toCreate = append(toCreate, secret.ToRuntimeObjects(secret.CopyToNamespace(render.ElasticsearchNamespace, e.cfg.ESMetricsCredsSecret)...)...)
 	toCreate = append(toCreate, e.metricsService(), e.metricsDeployment(), e.serviceAccount())
 
+	// allow-tigera Tier was renamed to calico-system
+	objsToDelete = append(objsToDelete, networkpolicy.DeprecatedAllowTigeraNetworkPolicyObject("elasticsearch-metrics", render.ElasticsearchNamespace))
+
 	if e.cfg.Installation.KubernetesProvider.IsOpenShift() {
 		toCreate = append(toCreate, e.metricsRole(), e.metricsRoleBinding())
 	}
+
 	return toCreate, objsToDelete
 }
 
@@ -216,7 +220,7 @@ func (e *elasticsearchMetrics) metricsDeployment() *appsv1.Deployment {
 			Namespace: render.ElasticsearchNamespace,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.Int32ToPtr(1),
+			Replicas: ptr.To(int32(1)),
 			Template: *relasticsearch.DecorateAnnotations(&corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: annotations,
@@ -271,7 +275,7 @@ func (e *elasticsearchMetrics) metricsDeployment() *appsv1.Deployment {
 	return d
 }
 
-func (e *elasticsearchMetrics) allowTigeraPolicy() *v3.NetworkPolicy {
+func (e *elasticsearchMetrics) calicoSystemPolicy() *v3.NetworkPolicy {
 	egressRules := []v3.Rule{
 		{
 			Action:      v3.Allow,
@@ -285,7 +289,7 @@ func (e *elasticsearchMetrics) allowTigeraPolicy() *v3.NetworkPolicy {
 		v3.Rule{
 			Action:      v3.Allow,
 			Protocol:    &networkpolicy.TCPProtocol,
-			Destination: networkpolicy.KubeAPIServerServiceSelectorEntityRule,
+			Destination: networkpolicy.KubeAPIServerEntityRule,
 		},
 	)
 
@@ -297,7 +301,7 @@ func (e *elasticsearchMetrics) allowTigeraPolicy() *v3.NetworkPolicy {
 		},
 		Spec: v3.NetworkPolicySpec{
 			Order:                  &networkpolicy.HighPrecedenceOrder,
-			Tier:                   networkpolicy.TigeraComponentTierName,
+			Tier:                   networkpolicy.CalicoTierName,
 			Selector:               networkpolicy.KubernetesAppSelector(ElasticsearchMetricsName),
 			ServiceAccountSelector: "",
 			Types:                  []v3.PolicyType{v3.PolicyTypeIngress, v3.PolicyTypeEgress},

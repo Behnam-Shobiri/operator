@@ -1,4 +1,4 @@
-// Copyright (c) 2022-2025 Tigera, Inc. All rights reserved.
+// Copyright (c) 2022-2026 Tigera, Inc. All rights reserved.
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,7 +21,7 @@ import (
 	glog "log"
 	"reflect"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -76,7 +76,7 @@ func allCalicoComponents(
 	if bgpLayout != nil {
 		objs = append(objs, bgpLayout)
 	}
-	secretsAndConfigMaps := render.NewPassthrough(objs...)
+	secretsAndConfigMaps := render.NewCreationPassthrough(objs...)
 
 	nodeCfg := &render.NodeConfiguration{
 		K8sServiceEp:            k8sServiceEp,
@@ -186,7 +186,7 @@ var _ = Describe("Rendering tests", func() {
 			},
 		}
 		scheme := runtime.NewScheme()
-		Expect(apis.AddToScheme(scheme)).NotTo(HaveOccurred())
+		Expect(apis.AddToScheme(scheme, false)).NotTo(HaveOccurred())
 
 		cli := ctrlrfake.DefaultFakeClientBuilder(scheme).Build()
 		certificateManager, err := certificatemanager.Create(cli, nil, clusterDomain, common.OperatorNamespace(), certificatemanager.AllowCACreation())
@@ -201,7 +201,7 @@ var _ = Describe("Rendering tests", func() {
 	})
 
 	AfterEach(func() {
-		if CurrentGinkgoTestDescription().Failed {
+		if CurrentSpecReport().Failed() {
 			err := logWriter.Flush()
 			Expect(err).NotTo(HaveOccurred())
 			fmt.Printf("Logs:\n%s\n", logBuffer.String())
@@ -236,7 +236,7 @@ var _ = Describe("Rendering tests", func() {
 		// - 1 Service to expose calico/node metrics.
 		// - 1 Service to expose Windows calico/node metrics.
 		var nodeMetricsPort int32 = 9081
-		instance.Variant = operatorv1.TigeraSecureEnterprise
+		instance.Variant = operatorv1.CalicoEnterprise
 		instance.NodeMetricsPort = &nodeMetricsPort
 		c, err := allCalicoComponents(k8sServiceEp, instance, nil, nil, nil, typhaNodeTLS, nil, nil, false, "", dns.DefaultClusterDomain, 9094, 0, nil, nil)
 		Expect(err).To(BeNil(), "Expected Calico to create successfully %s", err)
@@ -248,7 +248,7 @@ var _ = Describe("Rendering tests", func() {
 		// - X Same as default config for EE
 		// - pass in InternalManagerTLSSecret
 		var nodeMetricsPort int32 = 9081
-		instance.Variant = operatorv1.TigeraSecureEnterprise
+		instance.Variant = operatorv1.CalicoEnterprise
 		instance.NodeMetricsPort = &nodeMetricsPort
 
 		c, err := allCalicoComponents(k8sServiceEp, instance, &operatorv1.ManagementCluster{}, nil, nil, typhaNodeTLS, internalManagerKeyPair, nil, false, "", dns.DefaultClusterDomain, 9094, 0, nil, nil)
